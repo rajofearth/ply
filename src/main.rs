@@ -1,3 +1,4 @@
+mod chrome;
 mod folder_table;
 mod listing;
 mod preview;
@@ -10,22 +11,18 @@ use std::time::Duration;
 
 use gpui::{
     AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement, ParentElement,
-    Render, SharedString, Styled, Task, Window, WindowOptions, actions, div, px,
-    prelude::FluentBuilder,
+    Render, SharedString, Styled, Task, Window, WindowOptions, actions, px,
 };
-use gpui_component::alert::Alert;
-use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{InputEvent, InputState};
+use gpui_component::label::Label;
 use gpui_component::list::ListItem;
-use gpui_component::resizable::{h_resizable, resizable_panel};
-use gpui_component::switch::Switch;
-use gpui_component::table::{DataTable, TableEvent, TableState};
+use gpui_component::table::{TableEvent, TableState};
 use gpui_component::tree::{TreeEvent, TreeItem, TreeState, tree};
-use gpui_component::{ActiveTheme, Root, Sizable, TitleBar, h_flex, v_flex};
+use gpui_component::{ActiveTheme, Icon, IconName, Root, Sizable, TitleBar, h_flex, v_flex};
 
 use folder_table::FolderDelegate;
 use listing::{Entry, EntryKind, Snapshot, list_dir, parent_in_workspace};
-use preview::{Preview, build_preview, preview_el};
+use preview::{Preview, build_preview};
 use watch::FolderWatch;
 
 actions!(
@@ -41,31 +38,31 @@ actions!(
     ]
 );
 
-enum LoadState<T> {
+pub(crate) enum LoadState<T> {
     Idle,
     Loading,
     Ready(T),
     Failed { message: SharedString },
 }
 
-struct Ply {
-    workspace: PathBuf,
-    current_folder: PathBuf,
-    listing: LoadState<Snapshot>,
+pub(crate) struct Ply {
+    pub(crate) workspace: PathBuf,
+    pub(crate) current_folder: PathBuf,
+    pub(crate) listing: LoadState<Snapshot>,
     last_listed_folder: Option<PathBuf>,
     last_fingerprint: Vec<listing::EntryFingerprint>,
     list_generation: u64,
     preview_generation: u64,
     list_task: Option<Task<()>>,
     preview_task: Option<Task<()>>,
-    preview: Preview,
-    selected: Option<Entry>,
-    show_hidden: bool,
-    banner: Option<SharedString>,
-    table: Entity<TableState<FolderDelegate>>,
-    tree: Entity<TreeState>,
+    pub(crate) preview: Preview,
+    pub(crate) selected: Option<Entry>,
+    pub(crate) show_hidden: bool,
+    pub(crate) banner: Option<SharedString>,
+    pub(crate) table: Entity<TableState<FolderDelegate>>,
+    pub(crate) tree: Entity<TreeState>,
     tree_roots: Vec<TreeItem>,
-    filter: Entity<InputState>,
+    pub(crate) filter: Entity<InputState>,
     watch: Option<FolderWatch>,
     focus: FocusHandle,
 }
@@ -184,7 +181,7 @@ impl Ply {
         self.arm_watch(cx);
     }
 
-    fn set_current_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    pub(crate) fn set_current_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if !path.starts_with(&self.workspace) {
             self.banner = Some("That folder is outside the Workspace.".into());
             cx.notify();
@@ -240,10 +237,14 @@ impl Ply {
         .detach();
     }
 
-    fn reload_listing(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn reload_listing(&mut self, cx: &mut Context<Self>) {
         self.list_generation += 1;
         let generation = self.list_generation;
         self.listing = LoadState::Loading;
+        self.table.update(cx, |table, cx| {
+            table.delegate_mut().set_loading(true);
+            cx.notify();
+        });
         let folder = self.current_folder.clone();
         let show_hidden = self.show_hidden;
         self.list_task = Some(cx.spawn(async move |this, cx| {
@@ -261,6 +262,10 @@ impl Ply {
                             && snapshot.fingerprint == this.last_fingerprint
                         {
                             this.listing = LoadState::Ready(snapshot);
+                            this.table.update(cx, |table, cx| {
+                                table.delegate_mut().set_loading(false);
+                                cx.notify();
+                            });
                             return;
                         }
                         this.last_listed_folder = Some(listed);
@@ -277,6 +282,10 @@ impl Ply {
                         let message: SharedString = err.to_string().into();
                         this.banner = Some(format!("Could not list folder: {message}").into());
                         this.listing = LoadState::Failed { message };
+                        this.table.update(cx, |table, cx| {
+                            table.delegate_mut().set_loading(false);
+                            cx.notify();
+                        });
                         cx.notify();
                     }
                 }
@@ -353,7 +362,7 @@ impl Ply {
         cx.notify();
     }
 
-    fn pick_workspace(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn pick_workspace(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             let picked = cx
                 .background_spawn(async { rfd::FileDialog::new().pick_folder() })
@@ -371,10 +380,6 @@ impl Ply {
 
 impl Render for Ply {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let banner = self.banner.clone();
-        let preview = preview_el(&self.preview, cx);
-        let path_label = self.current_folder.display().to_string();
-
         v_flex()
             .size_full()
             .bg(cx.theme().background)
@@ -386,68 +391,71 @@ impl Render for Ply {
                 this.show_hidden = !this.show_hidden;
                 this.reload_listing(cx);
             }))
-            .on_action(cx.listener(|this, _: &GoToParent, _, cx| {
+            .on_action(cx.listener(|this, _: &GoToParent, window, cx| {
+                if this.typing_in_filter(window, cx) {
+                    return;
+                }
                 if let Some(parent) = parent_in_workspace(&this.current_folder, &this.workspace) {
                     this.set_current_folder(parent, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &CopyPath, _, cx| this.copy_path(cx)))
+            .on_action(cx.listener(|this, _: &CopyPath, window, cx| {
+                if this.typing_in_filter(window, cx) {
+                    return;
+                }
+                this.copy_path(cx);
+            }))
             .on_action(cx.listener(|this, _: &Reveal, _, cx| this.reveal_selected(cx)))
-            .on_action(cx.listener(|this, _: &OpenSelection, _, cx| this.open_selected(cx)))
-            .child(TitleBar::new().child("Ply"))
-            .child(toolbar(self, cx))
-            .when_some(banner, |this, msg| {
-                this.child(Alert::warning("banner", msg).banner())
-            })
-            .child(
-                div()
-                    .px_2()
-                    .py_px()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(path_label),
-            )
-            .child(
-                h_resizable("ply-panes")
-                    .child(
-                        resizable_panel()
-                            .size(px(240.))
-                            .size_range(px(160.)..px(420.))
-                            .child(
-                                div()
-                                    .size_full()
-                                    .bg(theme::sidebar_bg(cx))
-                                    .child(self.render_tree(cx)),
-                            ),
-                    )
-                    .child(
-                        resizable_panel().child(
-                            v_flex().size_full().bg(theme::pane_bg(cx)).child(
-                                div().flex_1().child(DataTable::new(&self.table).stripe(true)),
-                            ),
-                        ),
-                    )
-                    .child(
-                        resizable_panel()
-                            .size(px(320.))
-                            .size_range(px(200.)..px(640.))
-                            .child(preview),
-                    ),
-            )
-            .flex_1()
+            .on_action(cx.listener(|this, _: &OpenSelection, window, cx| {
+                if this.typing_in_filter(window, cx) {
+                    return;
+                }
+                this.open_selected(cx);
+            }))
+            .child(self.render_chrome(cx))
     }
 }
 
 impl Ply {
-    fn render_tree(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_tree(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
-        tree(&self.tree, move |ix, entry, selected, _window, _cx| {
+        let current_id = tree_pane::path_id(&self.current_folder);
+        tree(&self.tree, move |ix, entry, _selected, _window, cx| {
             let id = entry.item().id.clone();
             let label = entry.item().label.clone();
+            let is_current = id.as_ref() == current_id;
+            let expanded = entry.is_expanded();
+            let chevron = if expanded {
+                IconName::ChevronDown
+            } else {
+                IconName::ChevronRight
+            };
+            let folder = if expanded {
+                IconName::FolderOpen
+            } else {
+                IconName::Folder
+            };
             ListItem::new(ix)
-                .selected(selected)
-                .pl(px(12.) + px(14.) * entry.depth() as f32)
-                .child(label)
+                .selected(is_current)
+                .pl(px(8.) + px(16.) * entry.depth() as f32)
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(
+                            Icon::new(chevron)
+                                .small()
+                                .text_color(cx.theme().muted_foreground),
+                        )
+                        .child(
+                            Icon::new(folder).small().text_color(if is_current {
+                                cx.theme().primary
+                            } else {
+                                cx.theme().muted_foreground
+                            }),
+                        )
+                        .child(Label::new(label)),
+                )
                 .on_click({
                     let view = view.clone();
                     move |_, _, cx| {
@@ -464,60 +472,9 @@ impl Ply {
     }
 }
 
-fn toolbar(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
-    h_flex()
-        .w_full()
-        .px_2()
-        .py_1()
-        .gap_1()
-        .items_center()
-        .border_b_1()
-        .border_color(cx.theme().border)
-        .child(
-            Button::new("open-folder")
-                .ghost()
-                .label("Open Folder")
-                .on_click(cx.listener(|this, _, _, cx| this.pick_workspace(cx))),
-        )
-        .child(
-            Button::new("refresh")
-                .ghost()
-                .label("Refresh")
-                .on_click(cx.listener(|this, _, _, cx| this.reload_listing(cx))),
-        )
-        .child(
-            Button::new("up")
-                .ghost()
-                .label("Up")
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if let Some(parent) = parent_in_workspace(&this.current_folder, &this.workspace)
-                    {
-                        this.set_current_folder(parent, cx);
-                    }
-                })),
-        )
-        .child({
-            let view = cx.entity();
-            Switch::new("hidden")
-                .checked(ply.show_hidden)
-                .on_click(move |checked, _, cx| {
-                    view.update(cx, |this, cx| {
-                        this.show_hidden = *checked;
-                        this.reload_listing(cx);
-                    });
-                })
-        })
-        .child(div().text_sm().child("Hidden"))
-        .child(div().flex_1())
-        .child(
-            div()
-                .w(px(220.))
-                .child(gpui_component::input::Input::new(&ply.filter).small()),
-        )
-}
-
 fn main() {
-    gpui_platform::application().run(move |cx| {
+    let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
+    app.run(move |cx| {
         gpui_component::init(cx);
         theme::apply(cx);
 
@@ -526,9 +483,9 @@ fn main() {
             gpui::KeyBinding::new("ctrl-o", OpenFolder, None),
             gpui::KeyBinding::new("ctrl-h", ToggleHidden, None),
             gpui::KeyBinding::new("alt-up", GoToParent, None),
-            gpui::KeyBinding::new("backspace", GoToParent, None),
-            gpui::KeyBinding::new("ctrl-c", CopyPath, None),
-            gpui::KeyBinding::new("enter", OpenSelection, None),
+            gpui::KeyBinding::new("backspace", GoToParent, Some("PlyList")),
+            gpui::KeyBinding::new("ctrl-c", CopyPath, Some("PlyList")),
+            gpui::KeyBinding::new("enter", OpenSelection, Some("PlyList")),
         ]);
 
         cx.spawn(async move |cx| {
@@ -538,12 +495,9 @@ fn main() {
                         origin: gpui::point(px(80.), px(80.)),
                         size: gpui::size(px(1280.), px(800.)),
                     })),
-                    titlebar: Some(gpui::TitlebarOptions {
-                        title: Some("Ply".into()),
-                        ..Default::default()
-                    }),
                     app_id: Some("app.ply.explorer".into()),
-                    ..Default::default()
+                    window_decorations: Some(gpui::WindowDecorations::Client),
+                    ..TitleBar::window_options()
                 },
                 |window, cx| {
                     let view = cx.new(|cx| Ply::new(window, cx));

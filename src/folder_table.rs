@@ -1,6 +1,9 @@
-use gpui::{App, Context, IntoElement, SharedString, Window};
+use gpui::{App, Context, IntoElement, ParentElement, SharedString, Styled, Window, div};
+use gpui_component::label::Label;
 use gpui_component::menu::PopupMenu;
 use gpui_component::table::{Column, ColumnSort, TableDelegate, TableState};
+use gpui_component::tag::Tag;
+use gpui_component::{ActiveTheme, Icon, IconName, Sizable, h_flex, v_flex};
 
 use crate::listing::{format_mtime, format_size, sort_snapshot, Entry, EntryKind, Snapshot};
 use crate::{CopyPath, OpenSelection, Refresh, Reveal};
@@ -10,6 +13,7 @@ pub struct FolderDelegate {
     columns: Vec<Column>,
     filter: String,
     visible: Vec<usize>,
+    loading: bool,
 }
 
 impl FolderDelegate {
@@ -24,12 +28,18 @@ impl FolderDelegate {
             ],
             filter: String::new(),
             visible: Vec::new(),
+            loading: false,
         }
     }
 
     pub fn set_snapshot(&mut self, snapshot: Snapshot) {
         self.snapshot = snapshot;
+        self.loading = false;
         self.refilter();
+    }
+
+    pub fn set_loading(&mut self, loading: bool) {
+        self.loading = loading;
     }
 
     pub fn set_filter(&mut self, filter: String) {
@@ -53,6 +63,14 @@ impl FolderDelegate {
         self.visible
             .get(row_ix)
             .and_then(|i| self.snapshot.entries.get(*i))
+    }
+
+    pub fn visible_len(&self) -> usize {
+        self.visible.len()
+    }
+
+    pub fn total_len(&self) -> usize {
+        self.snapshot.entries.len()
     }
 }
 
@@ -110,27 +128,68 @@ impl TableDelegate for FolderDelegate {
         row_ix: usize,
         col_ix: usize,
         _: &mut Window,
-        _: &mut Context<TableState<Self>>,
+        cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let Some(entry) = self.entry(row_ix) else {
-            return SharedString::from("");
+            return div().into_any_element();
         };
         match self.columns[col_ix].key.as_ref() {
-            "name" => SharedString::from(entry.name.clone()),
-            "kind" => SharedString::from(match entry.kind {
-                EntryKind::Directory => "Folder",
-                EntryKind::File => "File",
-                EntryKind::Symlink { .. } => "Link",
-            }),
+            "name" => {
+                let icon = match entry.kind {
+                    EntryKind::Directory => IconName::Folder,
+                    EntryKind::File => IconName::File,
+                    EntryKind::Symlink { .. } => IconName::File,
+                };
+                let mut name = Label::new(entry.name.clone());
+                if !self.filter.is_empty() {
+                    name = name.highlights(self.filter.clone());
+                }
+                h_flex()
+                    .gap_1p5()
+                    .items_center()
+                    .child(
+                        Icon::new(icon)
+                            .small()
+                            .text_color(cx.theme().muted_foreground),
+                    )
+                    .child(name)
+                    .into_any_element()
+            }
+            "kind" => match entry.kind {
+                EntryKind::Directory => Tag::info().small().child("Folder").into_any_element(),
+                EntryKind::File => Tag::secondary().small().child("File").into_any_element(),
+                EntryKind::Symlink { .. } => {
+                    Tag::secondary().small().child("Link").into_any_element()
+                }
+            },
             "size" => {
                 if entry.is_directory() {
-                    SharedString::from("—")
+                    SharedString::from("—").into_any_element()
                 } else {
-                    SharedString::from(format_size(entry.size))
+                    SharedString::from(format_size(entry.size)).into_any_element()
                 }
             }
-            "modified" => SharedString::from(format_mtime(entry.modified)),
-            _ => SharedString::from(""),
+            "modified" => SharedString::from(format_mtime(entry.modified)).into_any_element(),
+            _ => div().into_any_element(),
         }
+    }
+
+    fn loading(&self, _: &App) -> bool {
+        self.loading
+    }
+
+    fn render_empty(
+        &mut self,
+        _: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .text_color(cx.theme().muted_foreground)
+            .child(Icon::new(IconName::Inbox).large())
+            .child(Label::new("No entries").secondary("This folder is empty or the filter hid everything"))
     }
 }
