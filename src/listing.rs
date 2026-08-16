@@ -298,10 +298,12 @@ mod tests {
         assert_eq!(entry_kind_label(&file_entry("a.png")), "PNG Image");
         assert_eq!(entry_kind_label(&file_entry("clip.mp4")), "MPEG Video");
         assert_eq!(entry_kind_label(&file_entry("notes.txt")), "Text Document");
-        assert_eq!(entry_kind_label(&file_entry("resume.docx")), "Word Document");
+        assert_eq!(
+            entry_kind_label(&file_entry("resume.docx")),
+            "Word Document"
+        );
         assert_eq!(entry_kind_label(&file_entry("app.exe")), "Application");
         assert_eq!(entry_kind_label(&file_entry("mix.m3u")), "Playlist");
         assert_eq!(entry_kind_label(&file_entry("data.bin.bak")), "File");
     }
 }
-

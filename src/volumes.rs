@@ -299,15 +299,7 @@ fn classify_mount(path: &Path) -> VolumeKind {
         let ft = fstype.to_ascii_lowercase();
         if matches!(
             ft.as_str(),
-            "nfs"
-                | "nfs4"
-                | "cifs"
-                | "smb"
-                | "smb3"
-                | "smbfs"
-                | "fuse.sshfs"
-                | "fuse.davfs"
-                | "9p"
+            "nfs" | "nfs4" | "cifs" | "smb" | "smb3" | "smbfs" | "fuse.sshfs" | "fuse.davfs" | "9p"
         ) || ft.contains("nfs")
             || ft.contains("cifs")
             || ft.contains("smb")
@@ -354,7 +346,8 @@ fn discover_volumes_windows() -> Vec<Volume> {
 
     if volumes.is_empty() {
         if let Some(home) = dirs::home_dir() {
-            let (free_bytes, total_bytes) = space_windows(&home).unwrap_or_else(|| space_for(&home));
+            let (free_bytes, total_bytes) =
+                space_windows(&home).unwrap_or_else(|| space_for(&home));
             let id = home.to_string_lossy().into_owned();
             volumes.push(Volume {
                 id,
@@ -392,14 +385,8 @@ fn space_windows(path: &Path) -> Option<(u64, u64)> {
     let mut free_avail: u64 = 0;
     let mut total: u64 = 0;
     let mut free_total: u64 = 0;
-    let ok = unsafe {
-        GetDiskFreeSpaceExW(
-            wide.as_ptr(),
-            &mut free_avail,
-            &mut total,
-            &mut free_total,
-        )
-    };
+    let ok =
+        unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut free_avail, &mut total, &mut free_total) };
     if ok == 0 {
         return None;
     }
@@ -464,10 +451,7 @@ mod tests {
     #[test]
     fn discover_returns_at_least_one_volume() {
         let volumes = discover_volumes();
-        assert!(
-            !volumes.is_empty(),
-            "expected at least home or root volume"
-        );
+        assert!(!volumes.is_empty(), "expected at least home or root volume");
         for v in &volumes {
             assert!(v.path.is_dir(), "{:?} should exist", v.path);
             assert!(!v.id.is_empty());
@@ -489,4 +473,3 @@ mod tests {
         assert_eq!(unescape_mount(r"/mnt/My\040Disk"), "/mnt/My Disk");
     }
 }
-

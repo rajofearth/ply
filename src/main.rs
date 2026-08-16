@@ -1,29 +1,23 @@
 mod chrome;
-mod folder_table;
 mod listing;
-mod preview;
+mod sidebar;
 mod theme;
-mod tree_pane;
 mod volumes;
 mod watch;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gpui::{
-    AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement, ParentElement,
-    Render, SharedString, Styled, Task, Window, WindowOptions, actions, px,
+    AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement, Modifiers,
+    ParentElement, Render, SharedString, Styled, Task, Window, WindowOptions, actions, px,
 };
 use gpui_component::input::{InputEvent, InputState};
-use gpui_component::label::Label;
-use gpui_component::list::ListItem;
-use gpui_component::table::{TableEvent, TableState};
-use gpui_component::tree::{TreeEvent, TreeItem, TreeState, tree};
-use gpui_component::{ActiveTheme, Icon, IconName, Root, Sizable, TitleBar, h_flex, v_flex};
+use gpui_component::{ActiveTheme, Root, TitleBar, v_flex};
 
-use folder_table::FolderDelegate;
-use listing::{Entry, EntryKind, Snapshot, list_dir, parent_in_workspace};
-use preview::{Preview, build_preview};
+use listing::{Entry, EntryKind, Snapshot, list_dir, parent_in_workspace, sort_snapshot};
+use sidebar::SidebarTree;
+use volumes::{Volume, default_quick_access, discover_volumes};
 use watch::FolderWatch;
 
 actions!(
@@ -32,12 +26,26 @@ actions!(
         Refresh,
         OpenFolder,
         ToggleHidden,
-        GoToParent,
+        GoHome,
+        GoBack,
+        GoForward,
         CopyPath,
         Reveal,
-        OpenSelection
+        OpenSelection,
+        ShowProperties,
+        CloseProperties,
+        ToggleTheme,
+        ToggleViewList,
+        ToggleViewGrid,
     ]
 );
+
+/// How the Current Folder listing is laid out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ViewMode {
+    List,
+    Grid,
+}
 
 pub(crate) enum LoadState<T> {
     Idle,
@@ -47,92 +55,99 @@ pub(crate) enum LoadState<T> {
 }
 
 pub(crate) struct Ply {
+    /// Home shows drives and quick access instead of a Current Folder listing.
+    pub(crate) at_home: bool,
+    /// Root the current browse session is confined to (a volume or a picked folder).
     pub(crate) workspace: PathBuf,
     pub(crate) current_folder: PathBuf,
+    history_back: Vec<PathBuf>,
+    history_forward: Vec<PathBuf>,
+    pub(crate) view_mode: ViewMode,
+    pub(crate) volumes: Vec<Volume>,
+    pub(crate) quick_access: Vec<PathBuf>,
     pub(crate) listing: LoadState<Snapshot>,
+    pub(crate) selected: Vec<PathBuf>,
+    anchor_ix: Option<usize>,
+    pub(crate) filter: Entity<InputState>,
+    pub(crate) filter_text: String,
+    pub(crate) properties: Option<Entry>,
+    pub(crate) tree: SidebarTree,
+    pub(crate) show_hidden: bool,
+    pub(crate) banner: Option<SharedString>,
+    pub(crate) sort_key: &'static str,
+    pub(crate) sort_ascending: bool,
     last_listed_folder: Option<PathBuf>,
     last_fingerprint: Vec<listing::EntryFingerprint>,
     list_generation: u64,
-    preview_generation: u64,
     list_task: Option<Task<()>>,
-    preview_task: Option<Task<()>>,
-    pub(crate) preview: Preview,
-    pub(crate) selected: Option<Entry>,
-    pub(crate) show_hidden: bool,
-    pub(crate) banner: Option<SharedString>,
-    pub(crate) table: Entity<TableState<FolderDelegate>>,
-    pub(crate) tree: Entity<TreeState>,
-    tree_roots: Vec<TreeItem>,
-    pub(crate) filter: Entity<InputState>,
     watch: Option<FolderWatch>,
-    focus: FocusHandle,
+    pub(crate) focus: FocusHandle,
 }
 
 impl Ply {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let workspace = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        let current_folder = workspace.clone();
-        let table = cx.new(|cx| TableState::new(FolderDelegate::new(), window, cx));
-        let tree_roots = vec![tree_pane::workspace_item(&workspace)];
-        let tree = cx.new(|cx| TreeState::new(cx).items(tree_roots.clone()));
-        let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter this folder…"));
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter"));
         cx.subscribe(&filter, |this, _, event: &InputEvent, cx| {
             if let InputEvent::Change = event {
-                let q = this.filter.read(cx).value().to_string();
-                this.table.update(cx, |table, cx| {
-                    table.delegate_mut().set_filter(q);
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
-        cx.subscribe(&table, |this, table, event: &TableEvent, cx| {
-            if let TableEvent::SelectRow(ix) | TableEvent::DoubleClickedRow(ix) = event {
-                let selected = table.read(cx).delegate().entry(*ix).cloned();
-                if let Some(entry) = selected {
-                    this.select_entry(entry, cx);
-                }
-                if matches!(event, TableEvent::DoubleClickedRow(_)) {
-                    this.open_selected(cx);
-                }
-            }
-        })
-        .detach();
-        cx.subscribe(&tree, |this, _, event: &TreeEvent, cx| {
-            if let TreeEvent::Expanded(id) = event {
-                if let Some(path) = tree_pane::path_from_tree_id(id.as_ref()) {
-                    this.ensure_tree_children(path, cx);
-                }
+                this.filter_text = this.filter.read(cx).value().to_string();
+                this.selected.clear();
+                this.anchor_ix = None;
+                cx.notify();
             }
         })
         .detach();
 
+        let focus = cx.focus_handle();
+        focus.focus(window, cx);
+
         let mut ply = Self {
-            workspace: workspace.clone(),
-            current_folder,
+            at_home: true,
+            workspace: home.clone(),
+            current_folder: home,
+            history_back: Vec::new(),
+            history_forward: Vec::new(),
+            view_mode: ViewMode::List,
+            volumes: Vec::new(),
+            quick_access: Vec::new(),
             listing: LoadState::Idle,
+            selected: Vec::new(),
+            anchor_ix: None,
+            filter,
+            filter_text: String::new(),
+            properties: None,
+            tree: SidebarTree::default(),
+            show_hidden: false,
+            banner: None,
+            sort_key: "name",
+            sort_ascending: true,
             last_listed_folder: None,
             last_fingerprint: Vec::new(),
             list_generation: 0,
-            preview_generation: 0,
             list_task: None,
-            preview_task: None,
-            preview: Preview::None,
-            selected: None,
-            show_hidden: false,
-            banner: None,
-            table,
-            tree,
-            tree_roots,
-            filter,
             watch: None,
-            focus: cx.focus_handle(),
+            focus,
         };
-        ply.ensure_tree_children(workspace, cx);
-        ply.reload_listing(cx);
-        ply.arm_watch(cx);
+        ply.refresh_volumes(cx);
         ply.start_watch_poll(cx);
         ply
+    }
+
+    /// Re-read mounts and quick access folders off the UI thread (Home is live).
+    pub(crate) fn refresh_volumes(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let discovered = cx
+                .background_spawn(async { (discover_volumes(), default_quick_access()) })
+                .await;
+            this.update(cx, |this, cx| {
+                let (volumes, quick_access) = discovered;
+                this.volumes = volumes;
+                this.quick_access = quick_access;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn start_watch_poll(&mut self, cx: &mut Context<Self>) {
@@ -167,85 +182,201 @@ impl Ply {
         }
     }
 
-    fn set_workspace(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        self.workspace = path.clone();
-        self.current_folder = path.clone();
-        self.selected = None;
-        self.preview = Preview::None;
-        self.tree_roots = vec![tree_pane::workspace_item(&path)];
-        let roots = self.tree_roots.clone();
-        self.tree.update(cx, |tree, cx| {
-            tree.set_items(roots, cx);
-        });
-        self.ensure_tree_children(path, cx);
+    // -- Navigation ---------------------------------------------------------
+
+    /// Leave browsing and show drives + quick access again.
+    pub(crate) fn go_home(&mut self, cx: &mut Context<Self>) {
+        self.at_home = true;
+        self.watch = None;
+        self.list_task = None;
+        self.listing = LoadState::Idle;
+        self.last_listed_folder = None;
+        self.last_fingerprint.clear();
+        self.history_back.clear();
+        self.history_forward.clear();
+        self.selected.clear();
+        self.anchor_ix = None;
+        self.properties = None;
+        self.banner = None;
+        self.refresh_volumes(cx);
+        cx.notify();
+    }
+
+    /// The volume (or picked folder) that should bound browsing for `path`.
+    fn workspace_for(&self, path: &Path) -> PathBuf {
+        self.volumes
+            .iter()
+            .map(|volume| volume.path.as_path())
+            .filter(|root| path.starts_with(root))
+            .max_by_key(|root| root.as_os_str().len())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| path.to_path_buf())
+    }
+
+    /// Open `path` as a fresh browse session rooted at `root`.
+    pub(crate) fn enter_root(&mut self, root: PathBuf, path: PathBuf, cx: &mut Context<Self>) {
+        self.at_home = false;
+        self.workspace = root;
+        self.current_folder = path;
+        self.history_back.clear();
+        self.history_forward.clear();
+        self.selected.clear();
+        self.anchor_ix = None;
+        self.properties = None;
+        self.banner = None;
+        self.reveal_in_sidebar(cx);
         self.reload_listing(cx);
         self.arm_watch(cx);
     }
 
-    pub(crate) fn set_current_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if !path.starts_with(&self.workspace) {
-            self.banner = Some("That folder is outside the Workspace.".into());
+    /// Set the Current Folder, entering a new Workspace when `path` is outside this one.
+    pub(crate) fn navigate_to(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if !path.is_dir() {
+            self.banner = Some(format!("Not a folder: {}", path.display()).into());
             cx.notify();
             return;
         }
-        if path == self.current_folder {
+        if !self.at_home && path.starts_with(&self.workspace) {
+            if path == self.current_folder {
+                return;
+            }
+            self.history_back.push(self.current_folder.clone());
+            self.history_forward.clear();
+            self.current_folder = path;
+            self.selected.clear();
+            self.anchor_ix = None;
+            self.properties = None;
+            self.reveal_in_sidebar(cx);
+            self.reload_listing(cx);
+            self.arm_watch(cx);
             return;
         }
-        self.current_folder = path;
-        self.selected = None;
-        self.preview = Preview::None;
+        let root = self.workspace_for(&path);
+        self.enter_root(root, path, cx);
+    }
+
+    /// Back through history, then up to the parent, then out to Home.
+    pub(crate) fn go_back(&mut self, cx: &mut Context<Self>) {
+        if self.at_home {
+            return;
+        }
+        if let Some(previous) = self.history_back.pop() {
+            self.history_forward.push(self.current_folder.clone());
+            self.current_folder = previous;
+            self.selected.clear();
+            self.anchor_ix = None;
+            self.properties = None;
+            self.reveal_in_sidebar(cx);
+            self.reload_listing(cx);
+            self.arm_watch(cx);
+            return;
+        }
+        match parent_in_workspace(&self.current_folder, &self.workspace) {
+            Some(parent) => {
+                self.current_folder = parent;
+                self.selected.clear();
+                self.anchor_ix = None;
+                self.properties = None;
+                self.reveal_in_sidebar(cx);
+                self.reload_listing(cx);
+                self.arm_watch(cx);
+            }
+            None => self.go_home(cx),
+        }
+    }
+
+    pub(crate) fn go_forward(&mut self, cx: &mut Context<Self>) {
+        let Some(next) = self.history_forward.pop() else {
+            return;
+        };
+        self.history_back.push(self.current_folder.clone());
+        self.current_folder = next;
+        self.selected.clear();
+        self.anchor_ix = None;
+        self.properties = None;
+        self.reveal_in_sidebar(cx);
         self.reload_listing(cx);
         self.arm_watch(cx);
     }
 
-    fn ensure_tree_children(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if !path.starts_with(&self.workspace) {
-            return;
+    pub(crate) fn can_go_back(&self) -> bool {
+        !self.at_home
+    }
+
+    pub(crate) fn can_go_forward(&self) -> bool {
+        !self.history_forward.is_empty()
+    }
+
+    // -- Sidebar tree -------------------------------------------------------
+
+    fn reveal_in_sidebar(&mut self, cx: &mut Context<Self>) {
+        let root = self.workspace.clone();
+        let current = self.current_folder.clone();
+        self.tree.reveal(&root, &current);
+        self.load_pending_sidebar_children(cx);
+    }
+
+    pub(crate) fn toggle_sidebar_row(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.tree.toggle(&path);
+        self.load_pending_sidebar_children(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn expand_sidebar_row(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.tree.set_expanded(&path, true);
+        self.load_pending_sidebar_children(cx);
+    }
+
+    /// List children for every open row that has none yet.
+    fn load_pending_sidebar_children(&mut self, cx: &mut Context<Self>) {
+        for path in self.tree.expanded_paths() {
+            if self.tree.needs_children(&path) {
+                // Claim the row so a second pass does not spawn a duplicate list.
+                self.tree.set_children(&path, Vec::new());
+                self.spawn_sidebar_children(path, cx);
+            }
         }
-        let id = tree_pane::path_id(&path);
-        if !tree_pane::item_needs_load(&self.tree_roots, &id) {
-            return;
-        }
+    }
+
+    fn spawn_sidebar_children(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let show_hidden = self.show_hidden;
         let folder = path.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(async move { tree_pane::list_folder_children(&folder, show_hidden) })
+                .background_spawn(async move { sidebar::list_child_folders(&folder, show_hidden) })
                 .await;
             this.update(cx, |this, cx| {
-                let id = tree_pane::path_id(&path);
-                if !tree_pane::item_needs_load(&this.tree_roots, &id) {
-                    return;
-                }
                 match result {
-                    Ok(snapshot) => {
-                        let children = tree_pane::items_from_dir_snapshot(&snapshot);
-                        if tree_pane::set_children(&mut this.tree_roots, &id, children) {
-                            let roots = this.tree_roots.clone();
-                            this.tree.update(cx, |tree, cx| {
-                                tree.set_items(roots, cx);
-                            });
-                        }
-                    }
+                    Ok(children) => this.tree.set_children(&path, children),
                     Err(err) => {
+                        this.tree.set_expanded(&path, false);
                         this.banner = Some(format!("Could not list folder: {err}").into());
-                        cx.notify();
                     }
                 }
+                cx.notify();
             })
             .ok();
         })
         .detach();
     }
 
+    // -- Listing ------------------------------------------------------------
+
+    pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.tree.forget_children();
+        self.load_pending_sidebar_children(cx);
+        if self.at_home {
+            self.refresh_volumes(cx);
+        } else {
+            self.reload_listing(cx);
+        }
+    }
+
     pub(crate) fn reload_listing(&mut self, cx: &mut Context<Self>) {
         self.list_generation += 1;
         let generation = self.list_generation;
         self.listing = LoadState::Loading;
-        self.table.update(cx, |table, cx| {
-            table.delegate_mut().set_loading(true);
-            cx.notify();
-        });
+        cx.notify();
         let folder = self.current_folder.clone();
         let show_hidden = self.show_hidden;
         self.list_task = Some(cx.spawn(async move |this, cx| {
@@ -259,34 +390,20 @@ impl Ply {
                 match result {
                     Ok(snapshot) => {
                         let listed = this.current_folder.clone();
-                        if this.last_listed_folder.as_ref() == Some(&listed)
-                            && snapshot.fingerprint == this.last_fingerprint
-                        {
-                            this.listing = LoadState::Ready(snapshot);
-                            this.table.update(cx, |table, cx| {
-                                table.delegate_mut().set_loading(false);
-                                cx.notify();
-                            });
-                            return;
-                        }
+                        let unchanged = this.last_listed_folder.as_ref() == Some(&listed)
+                            && snapshot.fingerprint == this.last_fingerprint;
                         this.last_listed_folder = Some(listed);
                         this.last_fingerprint = snapshot.fingerprint.clone();
-                        this.listing = LoadState::Ready(snapshot.clone());
-                        this.table.update(cx, |table, cx| {
-                            table.delegate_mut().set_snapshot(snapshot);
-                            cx.notify();
-                        });
-                        this.banner = None;
+                        this.listing = LoadState::Ready(this.sorted(snapshot));
+                        if !unchanged {
+                            this.banner = None;
+                        }
                         cx.notify();
                     }
                     Err(err) => {
                         let message: SharedString = err.to_string().into();
                         this.banner = Some(format!("Could not list folder: {message}").into());
                         this.listing = LoadState::Failed { message };
-                        this.table.update(cx, |table, cx| {
-                            table.delegate_mut().set_loading(false);
-                            cx.notify();
-                        });
                         cx.notify();
                     }
                 }
@@ -295,37 +412,125 @@ impl Ply {
         }));
     }
 
-    fn select_entry(&mut self, entry: Entry, cx: &mut Context<Self>) {
-        self.selected = Some(entry.clone());
-        self.load_preview(entry, cx);
+    fn sorted(&self, snapshot: Snapshot) -> Snapshot {
+        sort_snapshot(snapshot, self.sort_key, self.sort_ascending)
     }
 
-    fn load_preview(&mut self, entry: Entry, cx: &mut Context<Self>) {
-        self.preview_generation += 1;
-        let generation = self.preview_generation;
-        self.preview = Preview::Loading;
+    /// Sort by `key`, flipping direction when it is already the sort column.
+    pub(crate) fn sort_by(&mut self, key: &'static str, cx: &mut Context<Self>) {
+        if self.sort_key == key {
+            self.sort_ascending = !self.sort_ascending;
+        } else {
+            self.sort_key = key;
+            self.sort_ascending = true;
+        }
+        if let LoadState::Ready(snapshot) = std::mem::replace(&mut self.listing, LoadState::Loading)
+        {
+            self.listing = LoadState::Ready(self.sorted(snapshot));
+        }
         cx.notify();
-        self.preview_task = Some(cx.spawn(async move |this, cx| {
-            let preview = cx
-                .background_spawn(async move { build_preview(entry) })
-                .await;
-            this.update(cx, |this, cx| {
-                if this.preview_generation != generation {
-                    return;
-                }
-                this.preview = preview;
-                cx.notify();
-            })
-            .ok();
-        }));
     }
 
-    fn open_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(entry) = self.selected.clone() else {
+    pub(crate) fn toggle_hidden(&mut self, cx: &mut Context<Self>) {
+        self.show_hidden = !self.show_hidden;
+        self.tree.forget_children();
+        self.load_pending_sidebar_children(cx);
+        if !self.at_home {
+            self.reload_listing(cx);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn set_view_mode(&mut self, mode: ViewMode, cx: &mut Context<Self>) {
+        self.view_mode = mode;
+        cx.notify();
+    }
+
+    /// Entries of the Current Folder after the filter, in sort order.
+    pub(crate) fn visible_entries(&self) -> Vec<&Entry> {
+        let LoadState::Ready(snapshot) = &self.listing else {
+            return Vec::new();
+        };
+        let needle = self.filter_text.trim().to_lowercase();
+        snapshot
+            .entries
+            .iter()
+            .filter(|entry| needle.is_empty() || entry.name.to_lowercase().contains(&needle))
+            .collect()
+    }
+
+    pub(crate) fn total_entries(&self) -> usize {
+        match &self.listing {
+            LoadState::Ready(snapshot) => snapshot.entries.len(),
+            _ => 0,
+        }
+    }
+
+    // -- Selection ----------------------------------------------------------
+
+    pub(crate) fn is_selected(&self, path: &Path) -> bool {
+        self.selected.iter().any(|p| p == path)
+    }
+
+    /// Click selection: plain replaces, Ctrl/Cmd toggles, Shift extends from the anchor.
+    pub(crate) fn select_at(&mut self, ix: usize, modifiers: Modifiers, cx: &mut Context<Self>) {
+        let paths: Vec<PathBuf> = self
+            .visible_entries()
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect();
+        let Some(path) = paths.get(ix).cloned() else {
             return;
         };
+        if modifiers.shift {
+            let anchor = self.anchor_ix.unwrap_or(ix);
+            let (lo, hi) = if anchor <= ix {
+                (anchor, ix)
+            } else {
+                (ix, anchor)
+            };
+            self.selected = paths[lo..=hi.min(paths.len() - 1)].to_vec();
+        } else if modifiers.control || modifiers.platform {
+            if let Some(pos) = self.selected.iter().position(|p| *p == path) {
+                self.selected.remove(pos);
+            } else {
+                self.selected.push(path);
+            }
+            self.anchor_ix = Some(ix);
+        } else {
+            self.selected = vec![path];
+            self.anchor_ix = Some(ix);
+        }
+        cx.notify();
+    }
+
+    /// Entries behind `selected`, in listing order.
+    pub(crate) fn selected_entries(&self) -> Vec<Entry> {
+        let LoadState::Ready(snapshot) = &self.listing else {
+            return Vec::new();
+        };
+        snapshot
+            .entries
+            .iter()
+            .filter(|entry| self.is_selected(&entry.path))
+            .cloned()
+            .collect()
+    }
+
+    fn primary_selection(&self) -> Option<Entry> {
+        let last = self.selected.last()?;
+        self.selected_entries()
+            .into_iter()
+            .find(|entry| &entry.path == last)
+            .or_else(|| self.selected_entries().into_iter().next())
+    }
+
+    // -- Entry commands -----------------------------------------------------
+
+    pub(crate) fn open_entry(&mut self, entry: Entry, cx: &mut Context<Self>) {
         match entry.kind {
-            EntryKind::Directory => self.set_current_folder(entry.path, cx),
+            EntryKind::Directory => self.navigate_to(entry.path, cx),
+            EntryKind::Symlink { .. } if entry.path.is_dir() => self.navigate_to(entry.path, cx),
             EntryKind::File | EntryKind::Symlink { .. } => {
                 if let Err(err) = open::that(&entry.path) {
                     self.banner = Some(format!("Open failed: {err}").into());
@@ -335,8 +540,14 @@ impl Ply {
         }
     }
 
-    fn reveal_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(entry) = self.selected.clone() else {
+    pub(crate) fn open_selection(&mut self, cx: &mut Context<Self>) {
+        if let Some(entry) = self.primary_selection() {
+            self.open_entry(entry, cx);
+        }
+    }
+
+    pub(crate) fn reveal_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(entry) = self.primary_selection() else {
             return;
         };
         #[cfg(windows)]
@@ -345,24 +556,52 @@ impl Ply {
             .spawn()
             .map(|_| ());
         #[cfg(not(windows))]
-        let result = open::that(&entry.path);
-        if let Err(err) = result {
-            self.banner = Some(format!("Reveal failed: {err}").into());
-            cx.notify();
+        let result = open::that(entry.path.parent().unwrap_or(&entry.path));
+        match result {
+            Ok(()) => self.banner = Some("Revealed in the system file manager.".into()),
+            Err(err) => self.banner = Some(format!("Reveal failed: {err}").into()),
         }
-    }
-
-    fn copy_path(&mut self, cx: &mut Context<Self>) {
-        let Some(entry) = &self.selected else {
-            return;
-        };
-        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-            entry.path.to_string_lossy().into_owned(),
-        ));
-        self.banner = Some("Path copied.".into());
         cx.notify();
     }
 
+    pub(crate) fn copy_path(&mut self, cx: &mut Context<Self>) {
+        let selected = self.selected_entries();
+        if selected.is_empty() {
+            return;
+        }
+        let joined = selected
+            .iter()
+            .map(|entry| entry.path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(joined));
+        self.banner = Some(
+            if selected.len() == 1 {
+                "Path copied.".to_string()
+            } else {
+                format!("{} paths copied.", selected.len())
+            }
+            .into(),
+        );
+        cx.notify();
+    }
+
+    pub(crate) fn show_properties(&mut self, entry: Option<Entry>, cx: &mut Context<Self>) {
+        self.properties = entry.or_else(|| self.primary_selection());
+        cx.notify();
+    }
+
+    pub(crate) fn close_properties(&mut self, cx: &mut Context<Self>) {
+        self.properties = None;
+        cx.notify();
+    }
+
+    pub(crate) fn dismiss_banner(&mut self, cx: &mut Context<Self>) {
+        self.banner = None;
+        cx.notify();
+    }
+
+    /// Pick any folder and browse it as its own Workspace root.
     pub(crate) fn pick_workspace(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             let picked = cx
@@ -370,7 +609,7 @@ impl Ply {
                 .await;
             this.update(cx, |this, cx| {
                 if let Some(path) = picked {
-                    this.set_workspace(path, cx);
+                    this.enter_root(path.clone(), path, cx);
                 }
             })
             .ok();
@@ -380,96 +619,39 @@ impl Ply {
 }
 
 impl Render for Ply {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .size_full()
+            .relative()
+            .key_context("Ply")
+            .track_focus(&self.focus)
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .track_focus(&self.focus)
-            .on_action(cx.listener(|this, _: &Refresh, _, cx| this.reload_listing(cx)))
+            .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
             .on_action(cx.listener(|this, _: &OpenFolder, _, cx| this.pick_workspace(cx)))
-            .on_action(cx.listener(|this, _: &ToggleHidden, _, cx| {
-                this.show_hidden = !this.show_hidden;
-                this.reload_listing(cx);
-            }))
-            .on_action(cx.listener(|this, _: &GoToParent, window, cx| {
-                if this.typing_in_filter(window, cx) {
-                    return;
-                }
-                if let Some(parent) = parent_in_workspace(&this.current_folder, &this.workspace) {
-                    this.set_current_folder(parent, cx);
-                }
-            }))
-            .on_action(cx.listener(|this, _: &CopyPath, window, cx| {
-                if this.typing_in_filter(window, cx) {
-                    return;
-                }
-                this.copy_path(cx);
-            }))
-            .on_action(cx.listener(|this, _: &Reveal, _, cx| this.reveal_selected(cx)))
-            .on_action(cx.listener(|this, _: &OpenSelection, window, cx| {
-                if this.typing_in_filter(window, cx) {
-                    return;
-                }
-                this.open_selected(cx);
-            }))
-            .child(self.render_chrome(cx))
-    }
-}
-
-impl Ply {
-    pub(crate) fn render_tree(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let view = cx.entity();
-        let current_id = tree_pane::path_id(&self.current_folder);
-        tree(&self.tree, move |ix, entry, _selected, _window, cx| {
-            let id = entry.item().id.clone();
-            let label = entry.item().label.clone();
-            let is_current = id.as_ref() == current_id;
-            let expanded = entry.is_expanded();
-            let chevron = if expanded {
-                IconName::ChevronDown
-            } else {
-                IconName::ChevronRight
-            };
-            let folder = if expanded {
-                IconName::FolderOpen
-            } else {
-                IconName::Folder
-            };
-            ListItem::new(ix)
-                .selected(is_current)
-                .pl(px(8.) + px(16.) * entry.depth() as f32)
-                .child(
-                    h_flex()
-                        .gap_1()
-                        .items_center()
-                        .child(
-                            Icon::new(chevron)
-                                .small()
-                                .text_color(cx.theme().muted_foreground),
-                        )
-                        .child(
-                            Icon::new(folder).small().text_color(if is_current {
-                                cx.theme().primary
-                            } else {
-                                cx.theme().muted_foreground
-                            }),
-                        )
-                        .child(Label::new(label)),
-                )
-                .on_click({
-                    let view = view.clone();
-                    move |_, _, cx| {
-                        view.update(cx, |this, cx| {
-                            let Some(path) = tree_pane::path_from_tree_id(id.as_ref()) else {
-                                return;
-                            };
-                            this.set_current_folder(path.clone(), cx);
-                            this.ensure_tree_children(path, cx);
-                        });
-                    }
-                })
-        })
+            .on_action(cx.listener(|this, _: &ToggleHidden, _, cx| this.toggle_hidden(cx)))
+            .on_action(cx.listener(|this, _: &GoHome, _, cx| this.go_home(cx)))
+            .on_action(cx.listener(|this, _: &GoBack, _, cx| this.go_back(cx)))
+            .on_action(cx.listener(|this, _: &GoForward, _, cx| this.go_forward(cx)))
+            .on_action(cx.listener(|this, _: &CopyPath, _, cx| this.copy_path(cx)))
+            .on_action(cx.listener(|this, _: &Reveal, _, cx| this.reveal_selection(cx)))
+            .on_action(cx.listener(|this, _: &OpenSelection, _, cx| this.open_selection(cx)))
+            .on_action(
+                cx.listener(|this, _: &ShowProperties, _, cx| this.show_properties(None, cx)),
+            )
+            .on_action(cx.listener(|this, _: &CloseProperties, _, cx| this.close_properties(cx)))
+            .on_action(cx.listener(|_, _: &ToggleTheme, window, cx| theme::toggle(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &ToggleViewList, _, cx| {
+                    this.set_view_mode(ViewMode::List, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &ToggleViewGrid, _, cx| {
+                    this.set_view_mode(ViewMode::Grid, cx)
+                }),
+            )
+            .child(self.render_chrome(window, cx))
     }
 }
 
@@ -480,13 +662,21 @@ fn main() {
         theme::apply(cx);
 
         cx.bind_keys([
-            gpui::KeyBinding::new("f5", Refresh, None),
-            gpui::KeyBinding::new("ctrl-o", OpenFolder, None),
-            gpui::KeyBinding::new("ctrl-h", ToggleHidden, None),
-            gpui::KeyBinding::new("alt-up", GoToParent, None),
-            gpui::KeyBinding::new("backspace", GoToParent, Some("PlyList")),
-            gpui::KeyBinding::new("ctrl-c", CopyPath, Some("PlyList")),
-            gpui::KeyBinding::new("enter", OpenSelection, Some("PlyList")),
+            gpui::KeyBinding::new("f5", Refresh, Some("Ply")),
+            gpui::KeyBinding::new("ctrl-o", OpenFolder, Some("Ply")),
+            gpui::KeyBinding::new("ctrl-h", ToggleHidden, Some("Ply && !PlyFilter")),
+            gpui::KeyBinding::new("d", ToggleTheme, Some("Ply && !PlyFilter")),
+            gpui::KeyBinding::new("alt-left", GoBack, Some("Ply")),
+            gpui::KeyBinding::new("alt-up", GoBack, Some("Ply")),
+            gpui::KeyBinding::new("backspace", GoBack, Some("Ply && !PlyFilter")),
+            gpui::KeyBinding::new("alt-right", GoForward, Some("Ply")),
+            gpui::KeyBinding::new("alt-home", GoHome, Some("Ply")),
+            gpui::KeyBinding::new("ctrl-c", CopyPath, Some("Ply && !PlyFilter")),
+            gpui::KeyBinding::new("enter", OpenSelection, Some("Ply && !PlyFilter")),
+            gpui::KeyBinding::new("alt-enter", ShowProperties, Some("Ply && !PlyFilter")),
+            gpui::KeyBinding::new("escape", CloseProperties, Some("Ply && !PlyFilter")),
+            gpui::KeyBinding::new("ctrl-1", ToggleViewList, Some("Ply")),
+            gpui::KeyBinding::new("ctrl-2", ToggleViewGrid, Some("Ply")),
         ]);
 
         cx.spawn(async move |cx| {
