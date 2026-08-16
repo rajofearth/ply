@@ -4,6 +4,7 @@ mod listing;
 mod preview;
 mod theme;
 mod tree_pane;
+mod volumes;
 mod watch;
 
 use std::path::PathBuf;

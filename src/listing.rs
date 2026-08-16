@@ -187,6 +187,40 @@ pub fn format_size(n: u64) -> String {
     }
 }
 
+/// Short label for the Kind column (Folder, JPEG Image, Text Document, …).
+pub fn entry_kind_label(entry: &Entry) -> String {
+    match &entry.kind {
+        EntryKind::Directory => "Folder".into(),
+        EntryKind::Symlink { .. } => "Link".into(),
+        EntryKind::File => {
+            let ext = entry
+                .path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            match ext.as_str() {
+                "jpg" | "jpeg" => "JPEG Image".into(),
+                "png" => "PNG Image".into(),
+                "gif" => "GIF Image".into(),
+                "webp" | "bmp" | "tif" | "tiff" | "heic" | "avif" => "Image".into(),
+                "mp4" | "mpeg" | "mpg" | "m4v" | "mov" | "mkv" | "webm" | "avi" => {
+                    "MPEG Video".into()
+                }
+                "txt" | "md" | "markdown" | "log" | "csv" | "tsv" | "json" | "toml" | "yaml"
+                | "yml" | "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "html" | "css" | "xml" => {
+                    "Text Document".into()
+                }
+                "doc" | "docx" | "odt" | "rtf" => "Word Document".into(),
+                "exe" | "msi" | "com" | "bat" | "cmd" | "ps1" | "app" | "appimage" | "bin"
+                | "run" | "sh" | "deb" | "rpm" => "Application".into(),
+                "m3u" | "m3u8" | "pls" | "xspf" | "wpl" => "Playlist".into(),
+                _ => "File".into(),
+            }
+        }
+    }
+}
+
 /// ISO-like UTC timestamp (`YYYY-MM-DD HH:MM`), not raw unix seconds.
 pub fn format_mtime(t: Option<SystemTime>) -> String {
     let Some(t) = t else {
@@ -218,3 +252,56 @@ fn civil_from_unix_days(unix_days: i64) -> (i32, u32, u32) {
     let y = if m <= 2 { y + 1 } else { y };
     (y as i32, m, d)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file_entry(name: &str) -> Entry {
+        Entry {
+            path: PathBuf::from(name),
+            name: name.into(),
+            kind: EntryKind::File,
+            size: 0,
+            modified: None,
+            hidden: false,
+        }
+    }
+
+    #[test]
+    fn entry_kind_label_by_extension() {
+        assert_eq!(
+            entry_kind_label(&Entry {
+                path: PathBuf::from("docs"),
+                name: "docs".into(),
+                kind: EntryKind::Directory,
+                size: 0,
+                modified: None,
+                hidden: false,
+            }),
+            "Folder"
+        );
+        assert_eq!(
+            entry_kind_label(&Entry {
+                path: PathBuf::from("link"),
+                name: "link".into(),
+                kind: EntryKind::Symlink {
+                    target: PathBuf::from("x")
+                },
+                size: 0,
+                modified: None,
+                hidden: false,
+            }),
+            "Link"
+        );
+        assert_eq!(entry_kind_label(&file_entry("photo.JPEG")), "JPEG Image");
+        assert_eq!(entry_kind_label(&file_entry("a.png")), "PNG Image");
+        assert_eq!(entry_kind_label(&file_entry("clip.mp4")), "MPEG Video");
+        assert_eq!(entry_kind_label(&file_entry("notes.txt")), "Text Document");
+        assert_eq!(entry_kind_label(&file_entry("resume.docx")), "Word Document");
+        assert_eq!(entry_kind_label(&file_entry("app.exe")), "Application");
+        assert_eq!(entry_kind_label(&file_entry("mix.m3u")), "Playlist");
+        assert_eq!(entry_kind_label(&file_entry("data.bin.bak")), "File");
+    }
+}
+
