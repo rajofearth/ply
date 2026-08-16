@@ -1001,6 +1001,7 @@ impl Ply {
                     .id("properties-backdrop")
                     .absolute()
                     .inset_0()
+                    .occlude()
                     .bg(cx.theme().overlay)
                     .on_click(cx.listener(|this, _, _, cx| this.close_properties(cx))),
             )
@@ -1014,6 +1015,7 @@ impl Ply {
                     .child(
                         v_flex()
                             .id("properties-card")
+                            .occlude()
                             .w(px(440.))
                             .p(px(16.))
                             .gap(px(12.))
