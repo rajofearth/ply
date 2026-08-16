@@ -412,8 +412,19 @@ impl Ply {
         }));
     }
 
+    /// Sort by the active column, keeping folders above files like Explorer does.
     fn sorted(&self, snapshot: Snapshot) -> Snapshot {
-        sort_snapshot(snapshot, self.sort_key, self.sort_ascending)
+        let sorted = sort_snapshot(snapshot, self.sort_key, self.sort_ascending);
+        let (mut entries, files): (Vec<Entry>, Vec<Entry>) = sorted
+            .entries
+            .into_iter()
+            .partition(|entry| entry.is_directory());
+        entries.extend(files);
+        let fingerprint = entries.iter().map(Entry::fingerprint).collect();
+        Snapshot {
+            entries,
+            fingerprint,
+        }
     }
 
     /// Sort by `key`, flipping direction when it is already the sort column.
