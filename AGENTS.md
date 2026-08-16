@@ -2,9 +2,8 @@
 
 ## Cursor Cloud specific instructions
 
-Ply is a **native GPUI desktop app** (a read-only file explorer), not a web/server app. It
-was originally developed on Windows (see `README.md`), so a few Linux-specific caveats apply
-when building, running, or testing in the Cloud environment.
+Ply is a **native GPUI desktop app** (a read-only File Explorer shell), not a web/server app.
+It was originally developed on Windows (see `README.md`); Linux Cloud agents need the notes below.
 
 ### Toolchain
 - Nightly Rust is required and is pinned via `rust-toolchain.toml` (uses `std::hint::cold_path`);
@@ -26,11 +25,18 @@ when building, running, or testing in the Cloud environment.
   - `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json` (forces software Vulkan)
 - Full run command:
   `DISPLAY=:1 XDG_RUNTIME_DIR=/tmp/xdg-runtime VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json cargo run --features gpui_platform/x11`
-- The app defaults its Workspace to the home directory. Use double-click on a folder row (or a
-  Tree click) to navigate; single-click a file to preview it. See `README.md` for keybindings.
+- Keep the window at ~1280×800 when automating clicks; a collapsed/tiny window makes hit-testing fail.
+
+### UI shell (post File Explorer redesign)
+- Boots on **Home**: drive cards with capacity bars, Devices & network, Quick access pins.
+- Opening a drive/pin browses the real filesystem (read-only). No separate Preview pane — use
+  **Properties** (`Alt+Enter` or context menu) for metadata.
+- Useful keys: `d` theme, `Ctrl+1`/`Ctrl+2` list/grid, `Alt+Home` Home, `Enter` open selection,
+  `F5` refresh. Filter lives in the status bar.
+- Folder watches ignore Access/atime events (readdir used to cause an infinite reload loop).
 
 ### Lint / test / build
-- Format check: `cargo fmt --check` (repo currently has some pre-existing formatting diffs).
-- Lint: `cargo clippy` (currently emits pre-existing warnings only).
-- Tests: `cargo test` — there are currently **no** unit/integration tests in the repo (0 tests).
-- Build (dev): `cargo build --features gpui_platform/x11`.
+- Format: `cargo fmt --check`
+- Lint: `cargo clippy`
+- Tests: `cargo test --features gpui_platform/x11` (unit tests for listing/sidebar/volumes/watch)
+- Build (dev): `cargo build --features gpui_platform/x11`
