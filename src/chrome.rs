@@ -3,8 +3,8 @@
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    AnyElement, ClickEvent, Context, FontWeight, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div,
+    AnyElement, ClickEvent, Context, FocusHandle, FontWeight, InteractiveElement, IntoElement,
+    MouseButton, ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div,
     prelude::FluentBuilder, px, relative,
 };
 use gpui_component::alert::Alert;
@@ -811,7 +811,7 @@ impl Ply {
             )
             .on_click(self.row_click(ix, cx))
             .on_mouse_down(MouseButton::Right, self.row_right_click(ix, cx))
-            .context_menu(entry_context_menu)
+            .context_menu(entry_context_menu(self.focus.clone()))
     }
 
     fn grid_body(&self, entries: &[&Entry], cx: &mut Context<Self>) -> impl IntoElement {
@@ -873,7 +873,7 @@ impl Ply {
             )
             .on_click(self.row_click(ix, cx))
             .on_mouse_down(MouseButton::Right, self.row_right_click(ix, cx))
-            .context_menu(entry_context_menu)
+            .context_menu(entry_context_menu(self.focus.clone()))
     }
 
     /// Single click selects (Ctrl/Shift aware), double click opens.
@@ -1104,12 +1104,19 @@ impl Ply {
     }
 }
 
-fn entry_context_menu(menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>) -> PopupMenu {
-    menu.menu("Open", Box::new(OpenSelection))
-        .menu("Copy path", Box::new(CopyPath))
-        .menu("Reveal", Box::new(Reveal))
-        .separator()
-        .menu("Properties", Box::new(ShowProperties))
+/// Read-only entry menu. Deferred menu elements dispatch outside the row's
+/// element tree, so the menu is pointed back at Ply's focus handle.
+fn entry_context_menu(
+    focus: FocusHandle,
+) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+    move |menu, _, _| {
+        menu.action_context(focus.clone())
+            .menu("Open", Box::new(OpenSelection))
+            .menu("Copy path", Box::new(CopyPath))
+            .menu("Reveal", Box::new(Reveal))
+            .separator()
+            .menu("Properties", Box::new(ShowProperties))
+    }
 }
 
 fn entry_icon(entry: &Entry) -> IconName {
