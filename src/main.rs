@@ -495,7 +495,7 @@ impl Ply {
             "main.rs:reload_listing",
             "reload_listing start",
             &format!(
-                r#"{{"at_home":{},"current_folder":"{}","list_generation_next":{}}}"#,
+                r#"{{"at_home":{},"current_folder":"{}","list_generation_next":{},"runId":"post-fix"}}"#,
                 self.at_home,
                 self.current_folder.display(),
                 self.list_generation + 1
@@ -504,8 +504,14 @@ impl Ply {
         // #endregion
         self.list_generation += 1;
         let generation = self.list_generation;
-        self.listing = LoadState::Loading;
-        cx.notify();
+        // Keep prior Ready entries visible while refreshing the *same* folder so a
+        // no-op watch reload does not flash Loading / require a notify when unchanged.
+        let keep_showing = matches!(self.listing, LoadState::Ready(_))
+            && self.last_listed_folder.as_ref() == Some(&self.current_folder);
+        if !keep_showing {
+            self.listing = LoadState::Loading;
+            cx.notify();
+        }
         let folder = self.current_folder.clone();
         let show_hidden = self.show_hidden;
         self.list_task = Some(cx.spawn(async move |this, cx| {
@@ -539,13 +545,18 @@ impl Ply {
                         if !unchanged {
                             this.banner = None;
                         }
+                        // Drop notify noise from our own readdir so the watch poll
+                        // cannot schedule another reload from Access/atime events.
+                        if let Some(watch) = this.watch.as_ref() {
+                            watch.acknowledge();
+                        }
                         // #region agent log
                         agent_debug_log(
                             "C",
                             "main.rs:reload_listing",
                             "listing ready",
                             &format!(
-                                r#"{{"at_home":{},"current_folder":"{}","entry_count":{},"unchanged":{}}}"#,
+                                r#"{{"at_home":{},"current_folder":"{}","entry_count":{},"unchanged":{},"runId":"post-fix"}}"#,
                                 this.at_home,
                                 this.current_folder.display(),
                                 entry_count,
@@ -553,7 +564,10 @@ impl Ply {
                             ),
                         );
                         // #endregion
-                        cx.notify();
+                        // ADR 0002: skip notify when Snapshot fingerprint is unchanged.
+                        if !unchanged {
+                            cx.notify();
+                        }
                     }
                     Err(err) => {
                         let message: SharedString = err.to_string().into();
@@ -571,6 +585,9 @@ impl Ply {
                         // #endregion
                         this.banner = Some(format!("Could not list folder: {message}").into());
                         this.listing = LoadState::Failed { message };
+                        if let Some(watch) = this.watch.as_ref() {
+                            watch.acknowledge();
+                        }
                         cx.notify();
                     }
                 }
