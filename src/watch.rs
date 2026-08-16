@@ -25,10 +25,9 @@ fn is_substantive_change(kind: EventKind) -> bool {
         | EventKind::Modify(ModifyKind::Name(_))
         | EventKind::Modify(ModifyKind::Any)
         | EventKind::Modify(ModifyKind::Other) => true,
-        EventKind::Modify(ModifyKind::Metadata(meta)) => !matches!(
-            meta,
-            MetadataKind::AccessTime | MetadataKind::Extended
-        ),
+        EventKind::Modify(ModifyKind::Metadata(meta)) => {
+            !matches!(meta, MetadataKind::AccessTime | MetadataKind::Extended)
+        }
         EventKind::Access(_) | EventKind::Other => false,
     }
 }

@@ -136,7 +136,9 @@ impl Ply {
                             .icon(IconName::Building2)
                             .selected(self.at_home)
                             .tooltip_with_action("Home", &GoHome, None)
-                            .on_click(cx.listener(|this, _, _, cx| this.go_home(cx))),
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.go_home_ui(window, cx)),
+                            ),
                     )
                     .child(
                         div()
@@ -225,7 +227,7 @@ impl Ply {
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.focus.focus(window, cx);
                         if path.as_os_str().is_empty() {
-                            this.go_home(cx);
+                            this.go_home_ui(window, cx);
                         } else {
                             this.navigate_to(path.clone(), cx);
                         }
@@ -457,7 +459,7 @@ impl Ply {
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.focus.focus(window, cx);
                         match target.clone() {
-                            RowTarget::Home => this.go_home(cx),
+                            RowTarget::Home => this.go_home_ui(window, cx),
                             RowTarget::Root(path) => {
                                 this.expand_sidebar_row(path.clone(), cx);
                                 this.enter_root(path.clone(), path, cx);
@@ -476,16 +478,27 @@ impl Ply {
     fn home_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut sections = v_flex().w_full().p(px(16.)).gap(px(18.));
 
-        let mut cards: Vec<AnyElement> = Vec::new();
-        for volume in &self.volumes {
-            cards.push(self.drive_card(volume, cx).into_any_element());
+        let drives: Vec<&Volume> = self
+            .volumes
+            .iter()
+            .filter(|v| v.kind == VolumeKind::Drive)
+            .collect();
+        let devices: Vec<&Volume> = self
+            .volumes
+            .iter()
+            .filter(|v| matches!(v.kind, VolumeKind::Device | VolumeKind::Network))
+            .collect();
+
+        let mut drive_cards: Vec<AnyElement> = Vec::new();
+        for volume in &drives {
+            drive_cards.push(self.drive_card(volume, cx).into_any_element());
         }
         sections = sections.child(
             v_flex()
                 .w_full()
                 .gap(px(10.))
-                .child(section_label("This PC", cx))
-                .child(if cards.is_empty() {
+                .child(section_label("Drives", cx))
+                .child(if drive_cards.is_empty() {
                     h_flex()
                         .gap(px(6.))
                         .items_center()
@@ -498,7 +511,32 @@ impl Ply {
                         .w_full()
                         .flex_wrap()
                         .gap(px(10.))
-                        .children(cards)
+                        .children(drive_cards)
+                        .into_any_element()
+                }),
+        );
+
+        sections = sections.child(
+            v_flex()
+                .w_full()
+                .gap(px(10.))
+                .child(section_label("Devices & network", cx))
+                .child(if devices.is_empty() {
+                    div()
+                        .text_size(px(UI_TEXT))
+                        .text_color(cx.theme().muted_foreground)
+                        .child("No devices or network drives connected.")
+                        .into_any_element()
+                } else {
+                    let mut device_cards: Vec<AnyElement> = Vec::new();
+                    for volume in &devices {
+                        device_cards.push(self.drive_card(volume, cx).into_any_element());
+                    }
+                    h_flex()
+                        .w_full()
+                        .flex_wrap()
+                        .gap(px(10.))
+                        .children(device_cards)
                         .into_any_element()
                 }),
         );
@@ -942,7 +980,7 @@ impl Ply {
             .child(div().text_color(cx.theme().muted_foreground).child(counts))
             .child(div().flex_1())
             .child(
-                div().key_context("PlyFilter").w(px(180.)).child(
+                div().key_context("PlyFilter").w(px(190.)).child(
                     Input::new(&self.filter)
                         .xsmall()
                         .cleanable(true)

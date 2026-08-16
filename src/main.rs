@@ -87,7 +87,7 @@ pub(crate) struct Ply {
 impl Ply {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter"));
+        let filter = cx.new(|cx| InputState::new(window, cx).placeholder("filter items…"));
         cx.subscribe(&filter, |this, _, event: &InputEvent, cx| {
             if let InputEvent::Change = event {
                 this.filter_text = this.filter.read(cx).value().to_string();
@@ -198,8 +198,17 @@ impl Ply {
         self.anchor_ix = None;
         self.properties = None;
         self.banner = None;
+        self.filter_text.clear();
         self.refresh_volumes(cx);
         cx.notify();
+    }
+
+    /// Same as `go_home`, and also blanks the filter Input widget.
+    pub(crate) fn go_home_ui(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.go_home(cx);
+        self.filter.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+        });
     }
 
     /// The volume (or picked folder) that should bound browsing for `path`.
@@ -658,7 +667,7 @@ impl Render for Ply {
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
             .on_action(cx.listener(|this, _: &OpenFolder, _, cx| this.pick_workspace(cx)))
             .on_action(cx.listener(|this, _: &ToggleHidden, _, cx| this.toggle_hidden(cx)))
-            .on_action(cx.listener(|this, _: &GoHome, _, cx| this.go_home(cx)))
+            .on_action(cx.listener(|this, _: &GoHome, window, cx| this.go_home_ui(window, cx)))
             .on_action(cx.listener(|this, _: &GoBack, _, cx| this.go_back(cx)))
             .on_action(cx.listener(|this, _: &GoForward, _, cx| this.go_forward(cx)))
             .on_action(cx.listener(|this, _: &CopyPath, _, cx| this.copy_path(cx)))
