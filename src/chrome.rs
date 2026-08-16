@@ -77,28 +77,6 @@ impl Ply {
                             .h_full()
                             .bg(crate::theme::pane_bg(cx))
                             .child({
-                                // #region agent log
-                                {
-                                    use std::sync::atomic::{AtomicBool, Ordering};
-                                    static LAST_AT_HOME: AtomicBool = AtomicBool::new(true);
-                                    let prev = LAST_AT_HOME.load(Ordering::Relaxed);
-                                    if prev != self.at_home {
-                                        LAST_AT_HOME.store(self.at_home, Ordering::Relaxed);
-                                        crate::agent_debug_log(
-                                            "C",
-                                            "chrome.rs:render_chrome",
-                                            "view branch changed",
-                                            &format!(
-                                                r#"{{"at_home":{},"prev_at_home":{},"workspace":"{}","current_folder":"{}"}}"#,
-                                                self.at_home,
-                                                prev,
-                                                self.workspace.display(),
-                                                self.current_folder.display()
-                                            ),
-                                        );
-                                    }
-                                }
-                                // #endregion
                                 if self.at_home {
                                     self.home_view(cx).into_any_element()
                                 } else {
@@ -477,22 +455,6 @@ impl Ply {
                     .child(Icon::new(icon).size(px(14.)).text_color(muted))
                     .child(div().flex_1().min_w(px(0.)).truncate().child(label))
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        // #region agent log
-                        crate::agent_debug_log(
-                            "B",
-                            "chrome.rs:sidebar_row",
-                            "sidebar_row on_click fired",
-                            &format!(
-                                r#"{{"target":"{}","at_home":{}}}"#,
-                                match &target {
-                                    RowTarget::Home => "home".to_string(),
-                                    RowTarget::Root(p) => format!("root:{}", p.display()),
-                                    RowTarget::Folder(p) => format!("folder:{}", p.display()),
-                                },
-                                this.at_home
-                            ),
-                        );
-                        // #endregion
                         this.focus.focus(window, cx);
                         match target.clone() {
                             RowTarget::Home => this.go_home(cx),
@@ -623,18 +585,6 @@ impl Ply {
                     .child(volume.total_label()),
             )
             .on_click(cx.listener(move |this, _, window, cx| {
-                // #region agent log
-                crate::agent_debug_log(
-                    "B",
-                    "chrome.rs:drive_card",
-                    "drive_card on_click fired",
-                    &format!(
-                        r#"{{"path":"{}","at_home_before":{}}}"#,
-                        path.display(),
-                        this.at_home
-                    ),
-                );
-                // #endregion
                 this.focus.focus(window, cx);
                 this.expand_sidebar_row(path.clone(), cx);
                 this.enter_root(path.clone(), path.clone(), cx);
@@ -669,18 +619,6 @@ impl Ply {
                     .child(folder_label(path)),
             )
             .on_click(cx.listener(move |this, _, window, cx| {
-                // #region agent log
-                crate::agent_debug_log(
-                    "B",
-                    "chrome.rs:quick_access_card",
-                    "quick_access_card on_click fired",
-                    &format!(
-                        r#"{{"path":"{}","at_home_before":{}}}"#,
-                        target.display(),
-                        this.at_home
-                    ),
-                );
-                // #endregion
                 this.focus.focus(window, cx);
                 this.navigate_to(target.clone(), cx);
             }))

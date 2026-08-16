@@ -84,30 +84,11 @@ impl FolderWatch {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if self.take_change() {
             *last_change = Some(now);
-            // #region agent log
-            crate::agent_debug_log(
-                "W",
-                "watch.rs:take_change_debounced",
-                "events seen; waiting quiet",
-                r#"{"fired":false}"#,
-            );
-            // #endregion
             return false;
         }
         if let Some(t) = *last_change {
             if now.saturating_duration_since(t) >= min_interval {
                 *last_change = None;
-                // #region agent log
-                crate::agent_debug_log(
-                    "W",
-                    "watch.rs:take_change_debounced",
-                    "quiet elapsed; fire reload",
-                    &format!(
-                        r#"{{"fired":true,"quiet_ms":{}}}"#,
-                        now.saturating_duration_since(t).as_millis()
-                    ),
-                );
-                // #endregion
                 return true;
             }
         }

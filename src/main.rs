@@ -6,28 +6,7 @@ mod volumes;
 mod watch;
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-// #region agent log
-/// Append one NDJSON debug line to `/tmp/ply-debug.log` (hypothesis-driven nav debugging).
-pub(crate) fn agent_debug_log(hypothesis_id: &str, location: &str, message: &str, data: &str) {
-    use std::io::Write;
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/ply-debug.log")
-    {
-        let _ = writeln!(
-            f,
-            r#"{{"hypothesisId":"{hypothesis_id}","location":"{location}","message":"{message}","data":{data},"timestamp":{ts}}}"#
-        );
-    }
-}
-// #endregion
+use std::time::Duration;
 
 use gpui::{
     AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement, Modifiers,
@@ -207,19 +186,6 @@ impl Ply {
 
     /// Leave browsing and show drives + quick access again.
     pub(crate) fn go_home(&mut self, cx: &mut Context<Self>) {
-        // #region agent log
-        agent_debug_log(
-            "A",
-            "main.rs:go_home",
-            "go_home called",
-            &format!(
-                r#"{{"at_home_before":{},"workspace":"{}","current_folder":"{}"}}"#,
-                self.at_home,
-                self.workspace.display(),
-                self.current_folder.display()
-            ),
-        );
-        // #endregion
         self.at_home = true;
         self.watch = None;
         self.list_task = None;
@@ -249,23 +215,6 @@ impl Ply {
 
     /// Open `path` as a fresh browse session rooted at `root`.
     pub(crate) fn enter_root(&mut self, root: PathBuf, path: PathBuf, cx: &mut Context<Self>) {
-        // #region agent log
-        let path_is_dir = path.is_dir();
-        agent_debug_log(
-            "A",
-            "main.rs:enter_root",
-            "enter_root entry",
-            &format!(
-                r#"{{"at_home_before":{},"root":"{}","path":"{}","path_is_dir":{},"workspace_before":"{}","current_before":"{}"}}"#,
-                self.at_home,
-                root.display(),
-                path.display(),
-                path_is_dir,
-                self.workspace.display(),
-                self.current_folder.display()
-            ),
-        );
-        // #endregion
         self.at_home = false;
         self.workspace = root;
         self.current_folder = path;
@@ -278,71 +227,19 @@ impl Ply {
         self.reveal_in_sidebar(cx);
         self.reload_listing(cx);
         self.arm_watch(cx);
-        // #region agent log
-        agent_debug_log(
-            "C",
-            "main.rs:enter_root",
-            "enter_root after state update",
-            &format!(
-                r#"{{"at_home":{},"workspace":"{}","current_folder":"{}"}}"#,
-                self.at_home,
-                self.workspace.display(),
-                self.current_folder.display()
-            ),
-        );
-        // #endregion
     }
 
     /// Set the Current Folder, entering a new Workspace when `path` is outside this one.
     pub(crate) fn navigate_to(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        // #region agent log
-        agent_debug_log(
-            "A",
-            "main.rs:navigate_to",
-            "navigate_to entry",
-            &format!(
-                r#"{{"path":"{}","path_is_dir":{},"at_home":{},"workspace":"{}","current_folder":"{}"}}"#,
-                path.display(),
-                path.is_dir(),
-                self.at_home,
-                self.workspace.display(),
-                self.current_folder.display()
-            ),
-        );
-        // #endregion
         if !path.is_dir() {
-            // #region agent log
-            agent_debug_log(
-                "A",
-                "main.rs:navigate_to",
-                "early return: not a dir",
-                &format!(r#"{{"path":"{}"}}"#, path.display()),
-            );
-            // #endregion
             self.banner = Some(format!("Not a folder: {}", path.display()).into());
             cx.notify();
             return;
         }
         if !self.at_home && path.starts_with(&self.workspace) {
             if path == self.current_folder {
-                // #region agent log
-                agent_debug_log(
-                    "A",
-                    "main.rs:navigate_to",
-                    "early return: same folder",
-                    &format!(r#"{{"path":"{}"}}"#, path.display()),
-                );
-                // #endregion
                 return;
             }
-            // #region agent log
-            agent_debug_log(
-                "A",
-                "main.rs:navigate_to",
-                "branch: in-workspace navigate",
-                &format!(r#"{{"path":"{}"}}"#, path.display()),
-            );
-            // #endregion
             self.history_back.push(self.current_folder.clone());
             self.history_forward.clear();
             self.current_folder = path;
@@ -355,19 +252,6 @@ impl Ply {
             return;
         }
         let root = self.workspace_for(&path);
-        // #region agent log
-        agent_debug_log(
-            "A",
-            "main.rs:navigate_to",
-            "branch: enter_root via workspace_for",
-            &format!(
-                r#"{{"path":"{}","root":"{}","at_home":{}}}"#,
-                path.display(),
-                root.display(),
-                self.at_home
-            ),
-        );
-        // #endregion
         self.enter_root(root, path, cx);
     }
 
@@ -489,19 +373,6 @@ impl Ply {
     }
 
     pub(crate) fn reload_listing(&mut self, cx: &mut Context<Self>) {
-        // #region agent log
-        agent_debug_log(
-            "C",
-            "main.rs:reload_listing",
-            "reload_listing start",
-            &format!(
-                r#"{{"at_home":{},"current_folder":"{}","list_generation_next":{},"runId":"post-fix"}}"#,
-                self.at_home,
-                self.current_folder.display(),
-                self.list_generation + 1
-            ),
-        );
-        // #endregion
         self.list_generation += 1;
         let generation = self.list_generation;
         // Keep prior Ready entries visible while refreshing the *same* folder so a
@@ -520,17 +391,6 @@ impl Ply {
                 .await;
             this.update(cx, |this, cx| {
                 if this.list_generation != generation {
-                    // #region agent log
-                    agent_debug_log(
-                        "C",
-                        "main.rs:reload_listing",
-                        "stale generation discarded",
-                        &format!(
-                            r#"{{"generation":{},"current_generation":{},"at_home":{}}}"#,
-                            generation, this.list_generation, this.at_home
-                        ),
-                    );
-                    // #endregion
                     return;
                 }
                 match result {
@@ -540,7 +400,6 @@ impl Ply {
                             && snapshot.fingerprint == this.last_fingerprint;
                         this.last_listed_folder = Some(listed);
                         this.last_fingerprint = snapshot.fingerprint.clone();
-                        let entry_count = snapshot.entries.len();
                         this.listing = LoadState::Ready(this.sorted(snapshot));
                         if !unchanged {
                             this.banner = None;
@@ -550,20 +409,6 @@ impl Ply {
                         if let Some(watch) = this.watch.as_ref() {
                             watch.acknowledge();
                         }
-                        // #region agent log
-                        agent_debug_log(
-                            "C",
-                            "main.rs:reload_listing",
-                            "listing ready",
-                            &format!(
-                                r#"{{"at_home":{},"current_folder":"{}","entry_count":{},"unchanged":{},"runId":"post-fix"}}"#,
-                                this.at_home,
-                                this.current_folder.display(),
-                                entry_count,
-                                unchanged
-                            ),
-                        );
-                        // #endregion
                         // ADR 0002: skip notify when Snapshot fingerprint is unchanged.
                         if !unchanged {
                             cx.notify();
@@ -571,18 +416,6 @@ impl Ply {
                     }
                     Err(err) => {
                         let message: SharedString = err.to_string().into();
-                        // #region agent log
-                        agent_debug_log(
-                            "A",
-                            "main.rs:reload_listing",
-                            "listing failed",
-                            &format!(
-                                r#"{{"at_home":{},"error":"{}"}}"#,
-                                this.at_home,
-                                message.replace('"', "'")
-                            ),
-                        );
-                        // #endregion
                         this.banner = Some(format!("Could not list folder: {message}").into());
                         this.listing = LoadState::Failed { message };
                         if let Some(watch) = this.watch.as_ref() {
