@@ -559,14 +559,30 @@ impl Ply {
             tab.columns.truncate(col_ix + 1);
         }
         if is_dir {
-            self.tab_mut().location = Location::Folder(path.clone());
-            self.tab_mut().columns.push(ColumnPane {
-                path: path.clone(),
-                listing: LoadState::Loading,
-                selected: None,
-            });
+            let location = Location::Folder(path.clone());
+            {
+                let tab = self.tab_mut();
+                if location != tab.location {
+                    tab.history.truncate(tab.history_ix + 1);
+                    tab.history.push(location.clone());
+                    tab.history_ix = tab.history.len() - 1;
+                    tab.location = location;
+                }
+                tab.columns.push(ColumnPane {
+                    path: path.clone(),
+                    listing: LoadState::Loading,
+                    selected: None,
+                });
+                tab.watch = if crate::mtp::is_mtp(&path) {
+                    None
+                } else {
+                    FolderWatch::current_folder(path.clone()).ok()
+                };
+            }
             let new_ix = self.tab().columns.len() - 1;
             self.load_column(new_ix, path, cx);
+            // Keep list/grid/status in sync so leaving Column is not stale.
+            self.reload(cx);
         }
         cx.notify();
     }
