@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-/// An Entry listed under the Workspace.
+use chrono::{DateTime, Datelike, Local};
+
+/// A file, directory, or symlink in the Current Folder.
 #[derive(Clone, Debug)]
 pub struct Entry {
     pub path: PathBuf,
@@ -72,8 +74,55 @@ impl Snapshot {
         }
     }
 
-    pub fn same_as(&self, other: &Self) -> bool {
-        self.fingerprint == other.fingerprint
+}
+
+/// Human-readable type for the Kind column, e.g. `"JPEG Image"`.
+pub fn kind_label(entry: &Entry) -> &'static str {
+    match entry.kind {
+        EntryKind::Directory => return "Folder",
+        EntryKind::Symlink { .. } => return "Shortcut",
+        EntryKind::File => {}
+    }
+    // From the name, not the path: on a portable device the path component is
+    // an opaque object ID and carries no extension.
+    let ext = Path::new(&entry.name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "jpg" | "jpeg" => "JPEG Image",
+        "png" => "PNG Image",
+        "gif" => "GIF Image",
+        "webp" => "WebP Image",
+        "bmp" => "Bitmap Image",
+        "svg" => "SVG Image",
+        "ico" => "Icon",
+        "mp4" | "m4v" => "MPEG Video",
+        "mkv" => "Matroska Video",
+        "mov" => "QuickTime Video",
+        "avi" | "webm" | "wmv" => "Video",
+        "mp3" => "MP3 Audio",
+        "wav" => "Wave Audio",
+        "flac" | "ogg" | "m4a" | "aac" => "Audio",
+        "m3u" | "m3u8" | "pls" => "Playlist",
+        "txt" | "log" | "ini" | "cfg" | "toml" | "yaml" | "yml" => "Text Document",
+        "md" => "Markdown Document",
+        "json" => "JSON Document",
+        "xml" | "csv" => "Data Document",
+        "doc" | "docx" => "Word Document",
+        "xls" | "xlsx" => "Excel Workbook",
+        "ppt" | "pptx" => "PowerPoint Presentation",
+        "pdf" => "PDF Document",
+        "zip" | "7z" | "rar" | "tar" | "gz" => "Archive",
+        "exe" | "msi" => "Application",
+        "dll" => "System File",
+        "lnk" => "Shortcut",
+        "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "c" | "cpp" | "h" | "go" | "java" | "sh" => {
+            "Source File"
+        }
+        "" => "File",
+        _ => "File",
     }
 }
 
@@ -121,56 +170,39 @@ fn entry_from_dirent(dirent: std::fs::DirEntry) -> Option<Entry> {
     })
 }
 
-fn collect_entries(path: &Path, show_hidden: bool) -> anyhow::Result<Vec<Entry>> {
+/// Hidden entries are always skipped; Ply exposes no Show Hidden control.
+fn collect_entries(path: &Path) -> anyhow::Result<Vec<Entry>> {
     let mut entries = Vec::new();
     for dirent in std::fs::read_dir(path)? {
-        let dirent = dirent?;
-        let Some(entry) = entry_from_dirent(dirent) else {
+        let Some(entry) = entry_from_dirent(dirent?) else {
             continue;
         };
-        if entry.hidden && !show_hidden {
-            continue;
+        if !entry.hidden {
+            entries.push(entry);
         }
-        entries.push(entry);
     }
     Ok(entries)
 }
 
-pub fn list_dir(path: &Path, show_hidden: bool) -> anyhow::Result<Snapshot> {
-    Ok(Snapshot::from_entries(collect_entries(path, show_hidden)?))
+/// Portable devices have no filesystem path, so those listings come from WPD.
+fn entries_of(path: &Path) -> anyhow::Result<Vec<Entry>> {
+    if crate::mtp::is_mtp(path) {
+        return crate::mtp::list(path);
+    }
+    collect_entries(path)
 }
 
-/// Direct children that are Directory entries only. Does not recurse or follow symlinks.
-pub fn list_dirs(path: &Path, show_hidden: bool) -> anyhow::Result<Snapshot> {
-    let dirs = collect_entries(path, show_hidden)?
+pub fn list_dir(path: &Path) -> anyhow::Result<Snapshot> {
+    Ok(Snapshot::from_entries(entries_of(path)?))
+}
+
+/// Direct subdirectories only. Does not recurse or follow symlinks.
+pub fn list_dirs(path: &Path) -> anyhow::Result<Snapshot> {
+    let dirs = entries_of(path)?
         .into_iter()
-        .filter(|entry| entry.is_directory())
+        .filter(Entry::is_directory)
         .collect();
     Ok(Snapshot::from_entries(dirs))
-}
-
-pub fn sort_snapshot(mut snapshot: Snapshot, column: &str, ascending: bool) -> Snapshot {
-    snapshot.entries.sort_by(|a, b| {
-        let ord = match column {
-            "name" => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-            "size" => a.size.cmp(&b.size),
-            "modified" => a.modified.cmp(&b.modified),
-            "kind" => kind_discriminant(&a.kind).cmp(&kind_discriminant(&b.kind)),
-            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        };
-        if ascending { ord } else { ord.reverse() }
-    });
-    snapshot.fingerprint = snapshot.entries.iter().map(Entry::fingerprint).collect();
-    snapshot
-}
-
-pub fn parent_in_workspace(current: &Path, workspace: &Path) -> Option<PathBuf> {
-    let parent = current.parent()?;
-    if parent.starts_with(workspace) || parent == workspace {
-        Some(parent.to_path_buf())
-    } else {
-        None
-    }
 }
 
 pub fn format_size(n: u64) -> String {
@@ -187,34 +219,63 @@ pub fn format_size(n: u64) -> String {
     }
 }
 
-/// ISO-like UTC timestamp (`YYYY-MM-DD HH:MM`), not raw unix seconds.
+/// Local-time stamp, shortened by recency: `Today, 14:02`, `Aug 12, 09:30`,
+/// then `Aug 12, 2024` once the date is outside the current year.
 pub fn format_mtime(t: Option<SystemTime>) -> String {
     let Some(t) = t else {
         return "—".into();
     };
-    let Ok(dur) = t.duration_since(std::time::UNIX_EPOCH) else {
-        return "—".into();
-    };
-    let secs = dur.as_secs() as i64;
-    let days = secs.div_euclid(86_400);
-    let tod = secs.rem_euclid(86_400) as u32;
-    let hour = tod / 3600;
-    let min = (tod % 3600) / 60;
-    let (year, month, day) = civil_from_unix_days(days);
-    format!("{year:04}-{month:02}-{day:02} {hour:02}:{min:02}")
+    let when: DateTime<Local> = t.into();
+    let now = Local::now();
+    let today = now.date_naive();
+    let date = when.date_naive();
+
+    if date == today {
+        when.format("Today, %H:%M").to_string()
+    } else if (today - date).num_days() == 1 {
+        when.format("Yesterday, %H:%M").to_string()
+    } else if date.year() == today.year() {
+        when.format("%b %-d, %H:%M").to_string()
+    } else {
+        when.format("%b %-d, %Y").to_string()
+    }
 }
 
-/// Howard Hinnant's `civil_from_days` with unix epoch day 0 = 1970-01-01.
-fn civil_from_unix_days(unix_days: i64) -> (i32, u32, u32) {
-    let z = unix_days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y as i32, m, d)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(name: &str) -> Entry {
+        Entry {
+            path: PathBuf::from(name),
+            name: name.into(),
+            kind: EntryKind::File,
+            size: 0,
+            modified: None,
+            hidden: false,
+        }
+    }
+
+    #[test]
+    fn kind_label_maps_extensions() {
+        assert_eq!(kind_label(&file("a.JPG")), "JPEG Image");
+        assert_eq!(kind_label(&file("a.mp4")), "MPEG Video");
+        assert_eq!(kind_label(&file("a.m3u")), "Playlist");
+        assert_eq!(kind_label(&file("a.docx")), "Word Document");
+        assert_eq!(kind_label(&file("a.unknown")), "File");
+        assert_eq!(kind_label(&file("noext")), "File");
+    }
+
+    #[test]
+    fn kind_label_uses_entry_kind_first() {
+        let mut dir = file("Pictures.jpg");
+        dir.kind = EntryKind::Directory;
+        assert_eq!(kind_label(&dir), "Folder");
+    }
+
+    #[test]
+    fn format_size_scales() {
+        assert_eq!(format_size(512), "512 B");
+        assert_eq!(format_size(2048), "2.0 KB");
+    }
 }

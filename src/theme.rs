@@ -1,108 +1,114 @@
-//! Solid dark chrome for Ply — Zed/Zeron density, no glass.
+//! Design tokens: a zero-hue neutral scale, sharp corners, native UI font.
+//!
+//! The source tokens are authored in OKLCH (shadcn's neutral base). GPUI has no
+//! OKLCH constructor, so they are pre-converted to sRGB here; the OKLCH value is
+//! kept alongside each entry so the two stay traceable.
 
-use std::rc::Rc;
+use gpui::{Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, Hsla, Rgba, hsla, rgb};
 
-use gpui::{App, Hsla, px};
-use gpui_component::{ActiveTheme, Theme, ThemeConfigColors, ThemeMode};
-
-/// Switch to dark mode, then overlay Ply's semantic colors and tight radius.
-///
-/// Call after `gpui_component::init`. `Theme::change` is used twice: first so a
-/// dark `ThemeConfig` exists, then again so `gpui_base` tokens pick up the
-/// overlay (mutating `Theme` fields alone would leave Base out of sync).
-pub fn apply(cx: &mut App) {
-    Theme::change(ThemeMode::Dark, None, cx);
-
-    let mut config = Theme::global(cx).dark_theme.as_ref().clone();
-    config.name = "Ply".into();
-    config.radius = Some(2);
-    config.radius_lg = Some(4);
-    config.shadow = Some(false);
-    config.font_size = Some(13.0);
-    config.mono_font_size = Some(12.0);
-    ply_colors(&mut config.colors);
-
-    Theme::global_mut(cx).dark_theme = Rc::new(config);
-    Theme::change(ThemeMode::Dark, None, cx);
-
-    let theme = Theme::global_mut(cx);
-    theme.tile_radius = px(0.);
-    theme.tile_shadow = false;
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mode {
+    Light,
+    Dark,
 }
 
-/// Solid listing / preview surface (slightly above window chrome).
-pub fn pane_bg(cx: &App) -> Hsla {
-    cx.theme().table
+impl Mode {
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Light => Self::Dark,
+            Self::Dark => Self::Light,
+        }
+    }
+
+    pub fn palette(self) -> Palette {
+        match self {
+            Self::Light => Palette::light(),
+            Self::Dark => Palette::dark(),
+        }
+    }
 }
 
-/// Slightly lifted tree / sidebar surface.
-pub fn sidebar_bg(cx: &App) -> Hsla {
-    cx.theme().sidebar
+#[derive(Clone, Copy, Debug)]
+pub struct Palette {
+    pub background: Hsla,
+    pub foreground: Hsla,
+    pub card: Hsla,
+    pub muted: Hsla,
+    pub muted_foreground: Hsla,
+    pub accent: Hsla,
+    pub border: Hsla,
+    pub destructive: Hsla,
+    pub sidebar: Hsla,
+    pub sidebar_border: Hsla,
+    pub chart_bar: Hsla,
+    pub chart_bar_track: Hsla,
+    /// Selected-row fill. Deliberately a step stronger than `accent`.
+    pub select_strong: Hsla,
+    pub overlay: Hsla,
 }
 
-fn ply_colors(c: &mut ThemeConfigColors) {
-    // Near-black chrome, not pure #000.
-    c.background = Some("#141416".into());
-    c.title_bar = Some("#141416".into());
-    c.title_bar_border = Some("#2a2a2e".into());
-    c.status_bar = Some("#141416".into());
-    c.status_bar_border = Some("#2a2a2e".into());
-    c.window_border = Some("#2a2a2e".into());
-    c.border = Some("#2a2a2e".into());
-    c.input = Some("#2a2a2e".into());
-    c.ring = Some("#3d5a80".into());
+fn c(hex: u32) -> Hsla {
+    let rgba: Rgba = rgb(hex);
+    rgba.into()
+}
 
-    c.foreground = Some("#e4e4e7".into());
-    c.muted = Some("#27272a".into());
-    c.muted_foreground = Some("#8b8b93".into());
+impl Palette {
+    fn light() -> Self {
+        Self {
+            background: c(0xffffff),      // oklch(1 0 0)
+            foreground: c(0x0a0a0a),      // oklch(0.145 0 0)
+            card: c(0xffffff),            // oklch(1 0 0)
+            muted: c(0xf5f5f5),           // oklch(0.97 0 0)
+            muted_foreground: c(0x737373), // oklch(0.556 0 0)
+            accent: c(0xf5f5f5),          // oklch(0.97 0 0)
+            border: c(0xe5e5e5),          // oklch(0.922 0 0)
+            destructive: c(0xe7000b),     // oklch(0.577 0.245 27.325)
+            sidebar: c(0xfafafa),         // oklch(0.985 0 0)
+            sidebar_border: c(0xe5e5e5),  // oklch(0.922 0 0)
+            chart_bar: c(0x737373),       // oklch(0.556 0 0)
+            chart_bar_track: c(0xe8e8e8), // oklch(0.93 0 0)
+            select_strong: c(0xe4e4e4),   // oklch(0.92 0 0)
+            overlay: hsla(0., 0., 0., 0.4),
+        }
+    }
 
-    // Sidebar / tree: one step up from chrome.
-    c.sidebar = Some("#18181b".into());
-    c.sidebar_border = Some("#2a2a2e".into());
-    c.sidebar_foreground = Some("#d4d4d8".into());
-    c.sidebar_accent = Some("#2f6fed33".into());
-    c.sidebar_accent_foreground = Some("#e4e4e7".into());
-    c.list = Some("#18181b".into());
-    c.list_even = Some("#18181b".into());
-    c.list_head = Some("#18181b".into());
-    c.list_hover = Some("#222226".into());
-    c.list_active = Some("#2f6fed33".into());
-    c.list_active_border = Some("#2f6fed66".into());
+    fn dark() -> Self {
+        Self {
+            background: c(0x0a0a0a),       // oklch(0.145 0 0)
+            foreground: c(0xfafafa),       // oklch(0.985 0 0)
+            card: c(0x171717),             // oklch(0.205 0 0)
+            muted: c(0x262626),            // oklch(0.269 0 0)
+            muted_foreground: c(0xa1a1a1), // oklch(0.708 0 0)
+            accent: c(0x262626),           // oklch(0.269 0 0)
+            border: hsla(0., 0., 1., 0.1), // oklch(1 0 0 / 10%)
+            destructive: c(0xff6467),      // oklch(0.704 0.191 22.216)
+            sidebar: c(0x171717),          // oklch(0.205 0 0)
+            sidebar_border: hsla(0., 0., 1., 0.1), // oklch(1 0 0 / 10%)
+            chart_bar: c(0xa1a1a1),        // oklch(0.708 0 0)
+            chart_bar_track: c(0x333333),  // oklch(0.32 0 0)
+            select_strong: c(0x333333),    // oklch(0.32 0 0)
+            overlay: hsla(0., 0., 0., 0.4),
+        }
+    }
+}
 
-    // Content / table: solid lifted surface.
-    c.table = Some("#1c1c1f".into());
-    c.table_even = Some("#1c1c1f".into());
-    c.table_head = Some("#1c1c1f".into());
-    c.table_head_foreground = Some("#8b8b93".into());
-    c.table_hover = Some("#252528".into());
-    c.table_active = Some("#2f6fed33".into());
-    c.table_active_border = Some("#2f6fed66".into());
-    c.table_row_border = Some("#2a2a2e80".into());
-    c.accordion = Some("#1c1c1f".into());
-    c.tiles = Some("#1c1c1f".into());
-    c.popover = Some("#1c1c1f".into());
-    c.popover_foreground = Some("#e4e4e7".into());
-    c.group_box = Some("#1c1c1f".into());
-
-    // Accent only for selection / focus, not as a flood fill.
-    c.accent = Some("#252a33".into());
-    c.accent_foreground = Some("#e4e4e7".into());
-    c.selection = Some("#2f6fed55".into());
-    c.primary = Some("#3d6ea8".into());
-    c.primary_foreground = Some("#f4f4f5".into());
-    c.primary_hover = Some("#4a7db8".into());
-    c.primary_active = Some("#2f5a8a".into());
-
-    c.scrollbar = Some("#14141600".into());
-    c.scrollbar_thumb = Some("#3f3f46cc".into());
-    c.scrollbar_thumb_hover = Some("#52525b".into());
-
-    c.tab_bar = Some("#141416".into());
-    c.tab = Some("#14141600".into());
-    c.tab_active = Some("#1c1c1f".into());
-    c.tab_active_foreground = Some("#e4e4e7".into());
-    c.tab_foreground = Some("#8b8b93".into());
-    c.tab_bar_segmented = Some("#18181b".into());
-
-    c.overlay = Some("#00000066".into());
+/// The CSS `-apple-system, "Segoe UI Variable", Ubuntu, …` stack, resolved per
+/// platform: GPUI takes one family plus an ordered fallback list.
+pub fn ui_font() -> Font {
+    let (family, fallbacks): (&str, &[&str]) = if cfg!(windows) {
+        ("Segoe UI Variable", &["Segoe UI", "Tahoma", "Arial"])
+    } else if cfg!(target_os = "macos") {
+        (".SystemUIFont", &["SF Pro Text", "Helvetica Neue", "Arial"])
+    } else {
+        ("Ubuntu", &["Roboto", "DejaVu Sans", "Helvetica", "Arial"])
+    };
+    Font {
+        family: family.into(),
+        features: FontFeatures::default(),
+        fallbacks: Some(FontFallbacks::from_fonts(
+            fallbacks.iter().map(|s| s.to_string()).collect(),
+        )),
+        weight: FontWeight::default(),
+        style: FontStyle::default(),
+    }
 }

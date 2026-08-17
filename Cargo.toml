@@ -2,7 +2,7 @@
 name = "ply"
 version = "0.1.0"
 edition = "2024"
-description = "A fast, read-only GPUI file explorer."
+description = "A fast GPUI file explorer."
 publish = false
 
 [dependencies]
@@ -14,8 +14,14 @@ gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "f3ba893bd6a996ab0699266ba774b5bbb7f0ca1c" }
 notify = "7"
 open = "5"
-rfd = "0.15"
-smallvec = "1"
+trash = "5.2.6"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target."cfg(windows)".dependencies]
+windows = { version = "0.62", features = ["Win32_Devices_PortableDevices", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_UI_Shell_PropertiesSystem", "Win32_Foundation", "Win32_System_Variant"] }
 
 [profile.dev]
 codegen-units = 16
@@ -24,4 +30,3 @@ debug = "limited"
 [profile.dev.package]
 gpui = { opt-level = 3 }
 gpui_platform = { opt-level = 3 }
-gpui_macros = { opt-level = 3 }
