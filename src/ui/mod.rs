@@ -5,11 +5,12 @@ mod home;
 mod overlay;
 mod sidebar;
 mod status;
+mod tabs;
 mod titlebar;
 
 use gpui::{
-    Hsla, InteractiveElement, IntoElement, ParentElement, Pixels, Render, StatefulInteractiveElement,
-    Styled, Svg, Window, actions, div, prelude::FluentBuilder, px, svg,
+    Hsla, InteractiveElement, IntoElement, ParentElement, Pixels, Render,
+    StatefulInteractiveElement, Styled, Svg, Window, actions, div, prelude::FluentBuilder, px, svg,
 };
 
 use crate::app::{Location, Ply, dismiss_topmost};
@@ -35,6 +36,14 @@ actions!(
         Refresh,
         FocusFilter,
         CopySelectedPath,
+        CutSelection,
+        CopySelection,
+        PasteFiles,
+        QuickLook,
+        NewFolder,
+        NewTab,
+        CloseTab,
+        NewWindow,
     ]
 );
 
@@ -109,7 +118,7 @@ impl Render for Ply {
                 }
             }))
             .on_action(cx.listener(|this, _: &BeginRename, window, cx| {
-                if let Some(path) = this.selection.last().cloned() {
+                if let Some(path) = this.tab().selection.last().cloned() {
                     this.begin_rename(path, window, cx);
                 }
             }))
@@ -140,21 +149,53 @@ impl Render for Ply {
             }))
             .on_action(cx.listener(|this, _: &FocusFilter, window, cx| {
                 if !this.is_home() {
-                    this.filter.update(cx, |input, cx| input.focus(window, cx));
+                    this.filter()
+                        .clone()
+                        .update(cx, |input, cx| input.focus(window, cx));
                 }
             }))
             .on_action(cx.listener(|this, _: &CopySelectedPath, window, cx| {
-                if this.typing(window, cx) {
-                    return;
-                }
-                if let Some(path) = this.selection.last().cloned() {
-                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                        path.to_string_lossy().into_owned(),
-                    ));
-                    this.note("Path copied.", cx);
+                if !this.typing(window, cx) {
+                    this.copy_selected_path(cx);
                 }
             }))
+            .on_action(cx.listener(|this, _: &CutSelection, window, cx| {
+                if !this.typing(window, cx) {
+                    this.clip_selection(crate::file_clip::ClipOp::Cut, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &CopySelection, window, cx| {
+                if !this.typing(window, cx) {
+                    this.clip_selection(crate::file_clip::ClipOp::Copy, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &PasteFiles, window, cx| {
+                if !this.typing(window, cx) {
+                    this.paste(cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &QuickLook, window, cx| {
+                if !this.typing(window, cx) {
+                    this.toggle_quick_look(cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &NewFolder, window, cx| {
+                if !this.typing(window, cx) {
+                    this.new_folder_shortcut(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &NewTab, window, cx| {
+                this.shortcut_new_tab(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CloseTab, window, cx| {
+                let id = this.tab().id;
+                this.close_tab(id, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NewWindow, _, cx| {
+                this.shortcut_new_window(cx);
+            }))
             .child(titlebar::render(self, cx))
+            .child(tabs::render(self, cx))
             .child(
                 div()
                     .flex()
@@ -171,7 +212,7 @@ impl Render for Ply {
                             .when(!editing, |el| {
                                 el.on_click(cx.listener(|this, _, _, cx| this.clear_selection(cx)))
                             })
-                            .map(|el| match self.location {
+                            .map(|el| match &self.tab().location {
                                 Location::Home => el.child(home::render(self, cx)),
                                 Location::Folder(_) => el
                                     .child(browser::render(self, cx))

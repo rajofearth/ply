@@ -60,13 +60,43 @@ pub struct Snapshot {
     pub fingerprint: Vec<EntryFingerprint>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum SortKey {
+    #[default]
+    Name,
+    Modified,
+    Size,
+    Kind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum SortDir {
+    #[default]
+    Asc,
+    Desc,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct SortSpec {
+    pub key: SortKey,
+    pub dir: SortDir,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ViewMode {
+    #[default]
+    List,
+    Grid,
+    Column,
+}
+
 impl Snapshot {
-    pub fn from_entries(mut entries: Vec<Entry>) -> Self {
-        entries.sort_by(|a, b| {
-            b.is_directory()
-                .cmp(&a.is_directory())
-                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        });
+    pub fn from_entries(entries: Vec<Entry>) -> Self {
+        Self::from_entries_sorted(entries, SortSpec::default())
+    }
+
+    pub fn from_entries_sorted(mut entries: Vec<Entry>, spec: SortSpec) -> Self {
+        entries.sort_by(|a, b| compare_entries(a, b, spec));
         let fingerprint = entries.iter().map(Entry::fingerprint).collect();
         Self {
             entries,
@@ -74,6 +104,59 @@ impl Snapshot {
         }
     }
 
+    pub fn resort(&mut self, spec: SortSpec) {
+        self.entries.sort_by(|a, b| compare_entries(a, b, spec));
+    }
+}
+
+fn compare_entries(a: &Entry, b: &Entry, spec: SortSpec) -> std::cmp::Ordering {
+    let dir_ord = b.is_directory().cmp(&a.is_directory());
+    if dir_ord != std::cmp::Ordering::Equal {
+        return dir_ord;
+    }
+    let primary = match spec.key {
+        SortKey::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        SortKey::Size => a.size.cmp(&b.size),
+        SortKey::Modified => a.modified.cmp(&b.modified),
+        SortKey::Kind => kind_label(a).cmp(kind_label(b)),
+    };
+    match spec.dir {
+        SortDir::Asc => primary,
+        SortDir::Desc => primary.reverse(),
+    }
+}
+
+/// Best-effort MIME type from the file name. Used when xdg-mime is missing.
+pub fn mime_guess(path: &Path) -> String {
+    let ext = Path::new(path.file_name().and_then(|n| n.to_str()).unwrap_or(""))
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "mp4" => "video/mp4",
+        "mkv" => "video/x-matroska",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "pdf" => "application/pdf",
+        "txt" | "log" | "md" => "text/plain",
+        "html" => "text/html",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "zip" => "application/zip",
+        "rs" | "py" | "js" | "ts" | "c" | "h" | "go" => "text/plain",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "exe" | "msi" => "application/vnd.microsoft.portable-executable",
+        _ => "application/octet-stream",
+    }
+    .into()
 }
 
 /// Human-readable type for the Kind column, e.g. `"JPEG Image"`.
@@ -277,5 +360,31 @@ mod tests {
     fn format_size_scales() {
         assert_eq!(format_size(512), "512 B");
         assert_eq!(format_size(2048), "2.0 KB");
+    }
+
+    #[test]
+    fn sort_keeps_directories_first() {
+        let entries = vec![
+            file("b.txt"),
+            Entry {
+                path: PathBuf::from("z"),
+                name: "z".into(),
+                kind: EntryKind::Directory,
+                size: 0,
+                modified: None,
+                hidden: false,
+            },
+            file("a.txt"),
+        ];
+        let snap = Snapshot::from_entries_sorted(
+            entries,
+            SortSpec {
+                key: SortKey::Name,
+                dir: SortDir::Asc,
+            },
+        );
+        assert!(snap.entries[0].is_directory());
+        assert_eq!(snap.entries[1].name, "a.txt");
+        assert_eq!(snap.entries[2].name, "b.txt");
     }
 }

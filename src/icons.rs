@@ -15,6 +15,7 @@ pub enum Ico {
     Search,
     LayoutGrid,
     List,
+    Columns,
     Home,
     ArrowLeft,
     ArrowRight,
@@ -27,6 +28,22 @@ pub enum Ico {
     Network,
     File,
     FileText,
+    Scissors,
+    Copy,
+    ClipboardPaste,
+    Pencil,
+    Trash,
+    Terminal,
+    FilePlus,
+    FolderPlus,
+    Refresh,
+    Info,
+    Shield,
+    Pin,
+    PinOff,
+    ExternalLink,
+    AppWindow,
+    Plus,
 }
 
 impl Ico {
@@ -43,6 +60,7 @@ impl Ico {
             Self::Search => "icons/search.svg",
             Self::LayoutGrid => "icons/layout-grid.svg",
             Self::List => "icons/list.svg",
+            Self::Columns => "icons/columns.svg",
             Self::Home => "icons/home.svg",
             Self::ArrowLeft => "icons/arrow-left.svg",
             Self::ArrowRight => "icons/arrow-right.svg",
@@ -55,6 +73,22 @@ impl Ico {
             Self::Network => "icons/network.svg",
             Self::File => "icons/file.svg",
             Self::FileText => "icons/file-text.svg",
+            Self::Scissors => "icons/scissors.svg",
+            Self::Copy => "icons/copy.svg",
+            Self::ClipboardPaste => "icons/clipboard-paste.svg",
+            Self::Pencil => "icons/pencil.svg",
+            Self::Trash => "icons/trash.svg",
+            Self::Terminal => "icons/terminal.svg",
+            Self::FilePlus => "icons/file-plus.svg",
+            Self::FolderPlus => "icons/folder-plus.svg",
+            Self::Refresh => "icons/refresh.svg",
+            Self::Info => "icons/info.svg",
+            Self::Shield => "icons/shield.svg",
+            Self::Pin => "icons/pin.svg",
+            Self::PinOff => "icons/pin-off.svg",
+            Self::ExternalLink => "icons/external-link.svg",
+            Self::AppWindow => "icons/app-window.svg",
+            Self::Plus => "icons/plus.svg",
         }
     }
 
@@ -69,6 +103,7 @@ impl Ico {
         Self::Search,
         Self::LayoutGrid,
         Self::List,
+        Self::Columns,
         Self::Home,
         Self::ArrowLeft,
         Self::ArrowRight,
@@ -81,6 +116,22 @@ impl Ico {
         Self::Network,
         Self::File,
         Self::FileText,
+        Self::Scissors,
+        Self::Copy,
+        Self::ClipboardPaste,
+        Self::Pencil,
+        Self::Trash,
+        Self::Terminal,
+        Self::FilePlus,
+        Self::FolderPlus,
+        Self::Refresh,
+        Self::Info,
+        Self::Shield,
+        Self::Pin,
+        Self::PinOff,
+        Self::ExternalLink,
+        Self::AppWindow,
+        Self::Plus,
     ];
 }
 
@@ -96,6 +147,7 @@ fn icon_bytes(path: &str) -> Option<&'static [u8]> {
         "icons/search.svg" => include_bytes!("../assets/icons/search.svg"),
         "icons/layout-grid.svg" => include_bytes!("../assets/icons/layout-grid.svg"),
         "icons/list.svg" => include_bytes!("../assets/icons/list.svg"),
+        "icons/columns.svg" => include_bytes!("../assets/icons/columns.svg"),
         "icons/home.svg" => include_bytes!("../assets/icons/home.svg"),
         "icons/arrow-left.svg" => include_bytes!("../assets/icons/arrow-left.svg"),
         "icons/arrow-right.svg" => include_bytes!("../assets/icons/arrow-right.svg"),
@@ -108,6 +160,22 @@ fn icon_bytes(path: &str) -> Option<&'static [u8]> {
         "icons/network.svg" => include_bytes!("../assets/icons/network.svg"),
         "icons/file.svg" => include_bytes!("../assets/icons/file.svg"),
         "icons/file-text.svg" => include_bytes!("../assets/icons/file-text.svg"),
+        "icons/scissors.svg" => include_bytes!("../assets/icons/scissors.svg"),
+        "icons/copy.svg" => include_bytes!("../assets/icons/copy.svg"),
+        "icons/clipboard-paste.svg" => include_bytes!("../assets/icons/clipboard-paste.svg"),
+        "icons/pencil.svg" => include_bytes!("../assets/icons/pencil.svg"),
+        "icons/trash.svg" => include_bytes!("../assets/icons/trash.svg"),
+        "icons/terminal.svg" => include_bytes!("../assets/icons/terminal.svg"),
+        "icons/file-plus.svg" => include_bytes!("../assets/icons/file-plus.svg"),
+        "icons/folder-plus.svg" => include_bytes!("../assets/icons/folder-plus.svg"),
+        "icons/refresh.svg" => include_bytes!("../assets/icons/refresh.svg"),
+        "icons/info.svg" => include_bytes!("../assets/icons/info.svg"),
+        "icons/shield.svg" => include_bytes!("../assets/icons/shield.svg"),
+        "icons/pin.svg" => include_bytes!("../assets/icons/pin.svg"),
+        "icons/pin-off.svg" => include_bytes!("../assets/icons/pin-off.svg"),
+        "icons/external-link.svg" => include_bytes!("../assets/icons/external-link.svg"),
+        "icons/app-window.svg" => include_bytes!("../assets/icons/app-window.svg"),
+        "icons/plus.svg" => include_bytes!("../assets/icons/plus.svg"),
         _ => return None,
     })
 }
@@ -151,11 +219,7 @@ mod tests {
                 .load(ico.path())
                 .unwrap_or_else(|e| panic!("{}: load error: {e}", ico.path()))
                 .unwrap_or_else(|| panic!("{}: missing asset", ico.path()));
-            assert!(
-                !bytes.is_empty(),
-                "{}: empty asset",
-                ico.path()
-            );
+            assert!(!bytes.is_empty(), "{}: empty asset", ico.path());
             let head = std::str::from_utf8(&bytes[..bytes.len().min(64)]).unwrap_or("");
             assert!(
                 head.contains("<svg"),

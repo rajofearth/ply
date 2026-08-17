@@ -1,20 +1,29 @@
 //! Ply's state and behaviour. Rendering lives in [`crate::ui`].
 
+pub mod menu;
+pub mod ops;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, Pixels, Point, SharedString, Task, Window,
-    prelude::*,
+    WindowBounds, WindowOptions, point, prelude::*, px, size,
 };
 use gpui_component::input::{InputEvent, InputState};
 
+use crate::file_clip;
 use crate::fs_ops;
-use crate::listing::{Entry, Snapshot, list_dir, list_dirs};
+use crate::listing::{Entry, Snapshot, SortSpec, list_dir, list_dirs};
+use crate::path_caps::{CapsCtx, PathCaps, is_admin_target};
+use crate::preview;
 use crate::theme::{Mode, Palette};
 use crate::volumes::{self, Volume};
 use crate::watch::FolderWatch;
+
+pub use crate::listing::ViewMode;
+pub use menu::{Menu, MenuAction};
 
 pub enum LoadState<T> {
     Loading,
@@ -29,34 +38,30 @@ pub enum Location {
     Folder(PathBuf),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ViewMode {
-    List,
-    Grid,
+pub struct ColumnPane {
+    pub path: PathBuf,
+    pub listing: LoadState<Snapshot>,
+    pub selected: Option<PathBuf>,
 }
 
-/// A right-click menu, positioned in window space.
-pub struct Menu {
-    pub at: Point<Pixels>,
-    pub items: Vec<MenuItem>,
-}
-
-#[derive(Clone)]
-pub struct MenuItem {
-    pub label: SharedString,
-    pub action: MenuAction,
-    pub danger: bool,
-}
-
-#[derive(Clone)]
-pub enum MenuAction {
-    Open(PathBuf),
-    Rename(PathBuf),
-    CopyPath(PathBuf),
-    Reveal(PathBuf),
-    Properties(PathBuf),
-    Delete(Vec<PathBuf>),
-    Unpin(PathBuf),
+/// One independent Location stack inside a window.
+pub struct Tab {
+    pub id: u64,
+    pub location: Location,
+    history: Vec<Location>,
+    history_ix: usize,
+    pub listing: LoadState<Snapshot>,
+    pub selection: Vec<PathBuf>,
+    pub anchor: Option<usize>,
+    pub view: ViewMode,
+    pub sort: SortSpec,
+    pub columns: Vec<ColumnPane>,
+    pub filter: Entity<InputState>,
+    pub filter_text: String,
+    pub placeholder_for: Option<usize>,
+    list_generation: u64,
+    list_task: Option<Task<()>>,
+    watch: Option<FolderWatch>,
 }
 
 /// A row being renamed inline. The subscription commits on Enter or blur and
@@ -76,13 +81,17 @@ pub struct Properties {
     pub location: SharedString,
 }
 
+pub struct QuickLook {
+    pub path: PathBuf,
+    pub preview: preview::Preview,
+}
+
 pub struct Ply {
     pub mode: Mode,
-    pub location: Location,
-    history: Vec<Location>,
-    history_ix: usize,
+    tabs: Vec<Tab>,
+    active: usize,
+    next_tab_id: u64,
 
-    pub listing: LoadState<Snapshot>,
     pub volumes: Vec<Volume>,
     pub quick_access: Vec<PathBuf>,
 
@@ -95,70 +104,95 @@ pub struct Ply {
     /// reach them, so breadcrumbs always find their ancestors here.
     mtp_names: HashMap<PathBuf, String>,
 
-    pub selection: Vec<PathBuf>,
-    anchor: Option<usize>,
-    pub view: ViewMode,
-
-    pub filter: Entity<InputState>,
-    pub filter_text: String,
-    /// Item count the filter placeholder was last written for.
-    pub placeholder_for: Option<usize>,
-
     pub menu: Option<Menu>,
     pub properties: Option<Properties>,
     pub rename: Option<Rename>,
+    pub quick_look: Option<QuickLook>,
     pub status: Option<SharedString>,
 
-    list_generation: u64,
-    list_task: Option<Task<()>>,
-    watch: Option<FolderWatch>,
     pub focus: FocusHandle,
+}
+
+pub fn window_options() -> WindowOptions {
+    WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(gpui::Bounds {
+            origin: point(px(80.), px(80.)),
+            size: size(px(1280.), px(800.)),
+        })),
+        app_id: Some("app.ply.explorer".into()),
+        window_decorations: Some(gpui::WindowDecorations::Client),
+        titlebar: None,
+        ..Default::default()
+    }
 }
 
 impl Ply {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let filter = cx.new(|cx| InputState::new(window, cx));
-        cx.subscribe(&filter, |this, input, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                this.filter_text = input.read(cx).value().to_string();
-                this.selection.clear();
-                this.anchor = None;
-                cx.notify();
-            }
-        })
-        .detach();
+        Self::new_at(Location::Home, window, cx)
+    }
 
+    pub fn new_at(location: Location, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut ply = Self {
             mode: Mode::Dark,
-            location: Location::Home,
-            history: vec![Location::Home],
-            history_ix: 0,
-            listing: LoadState::Ready(Snapshot::default()),
+            tabs: Vec::new(),
+            active: 0,
+            next_tab_id: 1,
             volumes: Vec::new(),
             quick_access: volumes::default_quick_access(),
             expanded: HashSet::new(),
             children: HashMap::new(),
             mtp_names: HashMap::new(),
-            selection: Vec::new(),
-            anchor: None,
-            view: ViewMode::List,
-            filter,
-            filter_text: String::new(),
-            placeholder_for: None,
             menu: None,
             properties: None,
             rename: None,
+            quick_look: None,
             status: None,
-            list_generation: 0,
-            list_task: None,
-            watch: None,
             focus: cx.focus_handle(),
         };
+        let tab = ply.make_tab(location, window, cx);
+        ply.tabs.push(tab);
         ply.refresh_volumes(cx);
         ply.start_watch_poll(cx);
         ply.start_volume_poll(cx);
+        ply.enter_active(window, cx);
         window.focus(&ply.focus, cx);
         ply
+    }
+
+    pub fn tab(&self) -> &Tab {
+        &self.tabs[self.active]
+    }
+
+    pub fn tab_mut(&mut self) -> &mut Tab {
+        &mut self.tabs[self.active]
+    }
+
+    pub fn tabs(&self) -> &[Tab] {
+        &self.tabs
+    }
+
+    pub fn active_index(&self) -> usize {
+        self.active
+    }
+
+    pub fn view(&self) -> ViewMode {
+        self.tab().view
+    }
+
+    pub fn listing(&self) -> &LoadState<Snapshot> {
+        &self.tab().listing
+    }
+
+    pub fn filter(&self) -> &Entity<InputState> {
+        &self.tab().filter
+    }
+
+    pub fn filter_text(&self) -> &str {
+        &self.tab().filter_text
+    }
+
+    pub fn columns(&self) -> &[ColumnPane] {
+        &self.tab().columns
     }
 
     pub fn palette(&self) -> Palette {
@@ -168,7 +202,7 @@ impl Ply {
     /// Whether a text field has focus, so bare-key shortcuts should stand down.
     pub fn typing(&self, window: &Window, cx: &App) -> bool {
         let focused = |input: &Entity<InputState>| input.focus_handle(cx).is_focused(window);
-        focused(&self.filter) || self.rename.as_ref().is_some_and(|r| focused(&r.input))
+        focused(self.filter()) || self.rename.as_ref().is_some_and(|r| focused(&r.input))
     }
 
     pub fn toggle_mode(&mut self, cx: &mut Context<Self>) {
@@ -177,25 +211,126 @@ impl Ply {
     }
 
     pub fn is_home(&self) -> bool {
-        self.location == Location::Home
+        self.tab().location == Location::Home
     }
 
     pub fn current_folder(&self) -> Option<&Path> {
-        match &self.location {
+        match &self.tab().location {
             Location::Home => None,
             Location::Folder(p) => Some(p),
         }
     }
 
+    fn make_tab(&mut self, location: Location, window: &mut Window, cx: &mut Context<Self>) -> Tab {
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let filter = cx.new(|cx| InputState::new(window, cx));
+        cx.subscribe(&filter, move |this, input, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                if let Some(tab) = this.tabs.iter_mut().find(|t| t.id == id) {
+                    tab.filter_text = input.read(cx).value().to_string();
+                    tab.selection.clear();
+                    tab.anchor = None;
+                }
+                cx.notify();
+            }
+        })
+        .detach();
+        Tab {
+            id,
+            location: location.clone(),
+            history: vec![location],
+            history_ix: 0,
+            listing: LoadState::Ready(Snapshot::default()),
+            selection: Vec::new(),
+            anchor: None,
+            view: ViewMode::List,
+            sort: SortSpec::default(),
+            columns: Vec::new(),
+            filter,
+            filter_text: String::new(),
+            placeholder_for: None,
+            list_generation: 0,
+            list_task: None,
+            watch: None,
+        }
+    }
+
+    // ---- tabs / windows ---------------------------------------------------
+
+    pub fn open_in_new_tab(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let tab = self.make_tab(Location::Folder(path), window, cx);
+        self.tabs.push(tab);
+        self.active = self.tabs.len() - 1;
+        self.enter_active(window, cx);
+    }
+
+    pub fn shortcut_new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let location = self.tab().location.clone();
+        let tab = self.make_tab(location, window, cx);
+        self.tabs.push(tab);
+        self.active = self.tabs.len() - 1;
+        self.enter_active(window, cx);
+    }
+
+    pub fn activate_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if ix < self.tabs.len() {
+            self.active = ix;
+            self.menu = None;
+            cx.notify();
+        }
+    }
+
+    pub fn close_tab(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tabs.len() == 1 {
+            self.go_home(window, cx);
+            return;
+        }
+        let Some(ix) = self.tabs.iter().position(|t| t.id == id) else {
+            return;
+        };
+        self.tabs.remove(ix);
+        if self.active >= self.tabs.len() {
+            self.active = self.tabs.len() - 1;
+        }
+        cx.notify();
+    }
+
+    pub fn open_in_new_window(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let mode = self.mode;
+        let _ = cx.open_window(window_options(), move |window, cx| {
+            cx.new(|cx| {
+                let mut ply = Ply::new_at(Location::Folder(path.clone()), window, cx);
+                ply.mode = mode;
+                ply
+            })
+        });
+    }
+
+    pub fn shortcut_new_window(&mut self, cx: &mut Context<Self>) {
+        let location = self.tab().location.clone();
+        let mode = self.mode;
+        let _ = cx.open_window(window_options(), move |window, cx| {
+            cx.new(|cx| {
+                let mut ply = Ply::new_at(location.clone(), window, cx);
+                ply.mode = mode;
+                ply
+            })
+        });
+    }
+
     // ---- navigation -------------------------------------------------------
 
     pub fn go(&mut self, location: Location, window: &mut Window, cx: &mut Context<Self>) {
-        if location == self.location {
+        if location == self.tab().location {
             return;
         }
-        self.history.truncate(self.history_ix + 1);
-        self.history.push(location.clone());
-        self.history_ix = self.history.len() - 1;
+        {
+            let tab = self.tab_mut();
+            tab.history.truncate(tab.history_ix + 1);
+            tab.history.push(location.clone());
+            tab.history_ix = tab.history.len() - 1;
+        }
         self.enter(location, window, cx);
     }
 
@@ -208,25 +343,25 @@ impl Ply {
     }
 
     pub fn can_go_back(&self) -> bool {
-        self.history_ix > 0
+        self.tab().history_ix > 0
     }
 
     pub fn can_go_forward(&self) -> bool {
-        self.history_ix + 1 < self.history.len()
+        self.tab().history_ix + 1 < self.tab().history.len()
     }
 
     pub fn go_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.can_go_back() {
-            self.history_ix -= 1;
-            let location = self.history[self.history_ix].clone();
+            self.tab_mut().history_ix -= 1;
+            let location = self.tab().history[self.tab().history_ix].clone();
             self.enter(location, window, cx);
         }
     }
 
     pub fn go_forward(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.can_go_forward() {
-            self.history_ix += 1;
-            let location = self.history[self.history_ix].clone();
+            self.tab_mut().history_ix += 1;
+            let location = self.tab().history[self.tab().history_ix].clone();
             self.enter(location, window, cx);
         }
     }
@@ -241,32 +376,53 @@ impl Ply {
         }
     }
 
+    fn enter_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let location = self.tab().location.clone();
+        self.enter(location, window, cx);
+    }
+
     /// Apply a location without touching history.
     fn enter(&mut self, location: Location, window: &mut Window, cx: &mut Context<Self>) {
-        self.location = location;
-        self.selection.clear();
-        self.anchor = None;
+        {
+            let tab = self.tab_mut();
+            tab.location = location.clone();
+            tab.selection.clear();
+            tab.anchor = None;
+            tab.filter_text.clear();
+            tab.placeholder_for = None;
+            tab.columns.clear();
+        }
         self.rename = None;
         self.menu = None;
-        self.filter_text.clear();
-        self.placeholder_for = None;
-        self.filter.update(cx, |input, cx| {
+        self.quick_look = None;
+        let filter = self.filter().clone();
+        filter.update(cx, |input, cx| {
             input.set_value("", window, cx);
         });
-        match self.location.clone() {
+        match location {
             Location::Home => {
-                self.watch = None;
+                self.tab_mut().watch = None;
                 self.refresh_volumes(cx);
             }
             Location::Folder(path) => {
-                // Portable devices raise no filesystem events to watch for.
-                self.watch = if crate::mtp::is_mtp(&path) {
+                self.tab_mut().watch = if crate::mtp::is_mtp(&path) {
                     None
                 } else {
                     FolderWatch::current_folder(path).ok()
                 };
-                self.listing = LoadState::Loading;
+                self.tab_mut().listing = LoadState::Loading;
                 self.reload(cx);
+                if self.view() == ViewMode::Column
+                    && let Location::Folder(p) = &self.tab().location
+                {
+                    let p = p.clone();
+                    self.tab_mut().columns = vec![ColumnPane {
+                        path: p.clone(),
+                        listing: LoadState::Loading,
+                        selected: None,
+                    }];
+                    self.load_column(0, p, cx);
+                }
             }
         }
         cx.notify();
@@ -299,11 +455,17 @@ impl Ply {
         }
     }
 
+    pub fn tab_title(&self, tab: &Tab) -> SharedString {
+        match &tab.location {
+            Location::Home => "Home".into(),
+            Location::Folder(p) => self.display_name(p),
+        }
+    }
+
     // ---- loading ----------------------------------------------------------
 
     pub fn refresh_volumes(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
-            // Discovery stats every drive and can block on network shares.
             let found = cx.background_spawn(async { volumes::discover() }).await;
             this.update(cx, |this, cx| {
                 this.volumes = found;
@@ -318,32 +480,31 @@ impl Ply {
         let Some(folder) = self.current_folder().map(Path::to_path_buf) else {
             return;
         };
-        self.list_generation += 1;
-        let generation = self.list_generation;
-        if !matches!(self.listing, LoadState::Ready(_)) {
-            self.listing = LoadState::Loading;
+        let tab_id = self.tab().id;
+        let sort = self.tab().sort;
+        self.tab_mut().list_generation += 1;
+        let generation = self.tab().list_generation;
+        if !matches!(self.tab().listing, LoadState::Ready(_)) {
+            self.tab_mut().listing = LoadState::Loading;
         }
-        self.list_task = Some(cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_spawn(async move { list_dir(&folder) })
-                .await;
+        self.tab_mut().list_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx.background_spawn(async move { list_dir(&folder) }).await;
             this.update(cx, |this, cx| {
-                if this.list_generation != generation {
+                if this.tab().id != tab_id || this.tab().list_generation != generation {
                     return;
                 }
                 match result {
-                    Ok(snapshot) => {
-                        // A watch-driven reload usually finds nothing new;
-                        // replacing an identical listing only causes churn.
-                        if let LoadState::Ready(current) = &this.listing
+                    Ok(mut snapshot) => {
+                        snapshot.resort(sort);
+                        if let LoadState::Ready(current) = &this.tab().listing
                             && current.fingerprint == snapshot.fingerprint
                         {
                             return;
                         }
                         this.remember_names(&snapshot);
-                        this.listing = LoadState::Ready(snapshot);
+                        this.tab_mut().listing = LoadState::Ready(snapshot);
                     }
-                    Err(err) => this.listing = LoadState::Failed(err.to_string().into()),
+                    Err(err) => this.tab_mut().listing = LoadState::Failed(err.to_string().into()),
                 }
                 cx.notify();
             })
@@ -351,8 +512,65 @@ impl Ply {
         }));
     }
 
-    /// Portable-device paths are object IDs, so keep the names the listing
-    /// reported; nothing else can recover them later.
+    pub fn load_column(&mut self, index: usize, path: PathBuf, cx: &mut Context<Self>) {
+        let tab_id = self.tab().id;
+        let sort = self.tab().sort;
+        cx.spawn(async move |this, cx| {
+            let result = cx.background_spawn(async move { list_dir(&path) }).await;
+            this.update(cx, |this, cx| {
+                if this.tab().id != tab_id {
+                    return;
+                }
+                match result {
+                    Ok(mut snapshot) => {
+                        snapshot.resort(sort);
+                        this.remember_names(&snapshot);
+                        if let Some(col) = this.tab_mut().columns.get_mut(index) {
+                            col.listing = LoadState::Ready(snapshot);
+                        }
+                    }
+                    Err(err) => {
+                        if let Some(col) = this.tab_mut().columns.get_mut(index) {
+                            col.listing = LoadState::Failed(err.to_string().into());
+                        }
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn drill_column(
+        &mut self,
+        col_ix: usize,
+        path: PathBuf,
+        is_dir: bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        {
+            let tab = self.tab_mut();
+            tab.selection = vec![path.clone()];
+            if let Some(col) = tab.columns.get_mut(col_ix) {
+                col.selected = Some(path.clone());
+            }
+            tab.columns.truncate(col_ix + 1);
+        }
+        if is_dir {
+            self.tab_mut().location = Location::Folder(path.clone());
+            self.tab_mut().columns.push(ColumnPane {
+                path: path.clone(),
+                listing: LoadState::Loading,
+                selected: None,
+            });
+            let new_ix = self.tab().columns.len() - 1;
+            self.load_column(new_ix, path, cx);
+        }
+        cx.notify();
+    }
+
     fn remember_names(&mut self, snapshot: &Snapshot) {
         for entry in &snapshot.entries {
             if crate::mtp::is_mtp(&entry.path) {
@@ -370,10 +588,10 @@ impl Ply {
                     .await;
                 if this
                     .update(cx, |this, cx| {
-                        let changed = this
-                            .watch
-                            .as_ref()
-                            .is_some_and(|w| w.take_change_debounced(Duration::from_millis(75)));
+                        let changed =
+                            this.tab().watch.as_ref().is_some_and(|w| {
+                                w.take_change_debounced(Duration::from_millis(75))
+                            });
                         if changed {
                             this.reload(cx);
                         }
@@ -387,17 +605,12 @@ impl Ply {
         .detach();
     }
 
-    /// Notice drives appearing and disappearing. Windows delivers this as
-    /// `WM_DEVICECHANGE`, which GPUI does not surface, so poll instead and
-    /// redraw only when the set actually moved.
     fn start_volume_poll(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(1500))
                     .await;
-                // Sequential: an unreachable network share can stall discovery,
-                // and awaiting it keeps the polls from stacking up.
                 let found = cx.background_spawn(async { volumes::discover() }).await;
                 if this
                     .update(cx, |this, cx| {
@@ -417,13 +630,13 @@ impl Ply {
 
     /// Entries in the current folder that survive the filter box.
     pub fn visible(&self) -> Vec<&Entry> {
-        let LoadState::Ready(snapshot) = &self.listing else {
+        let LoadState::Ready(snapshot) = &self.tab().listing else {
             return Vec::new();
         };
-        if self.filter_text.is_empty() {
+        if self.tab().filter_text.is_empty() {
             return snapshot.entries.iter().collect();
         }
-        let needle = self.filter_text.to_lowercase();
+        let needle = self.tab().filter_text.to_lowercase();
         snapshot
             .entries
             .iter()
@@ -431,27 +644,22 @@ impl Ply {
             .collect()
     }
 
-    /// Keep the filter's placeholder showing the folder's item count.
-    ///
-    /// Written from render because the count only settles once the listing
-    /// lands, and writing input state needs a window; the stored count makes
-    /// this a no-op on all the frames where nothing changed.
     pub fn sync_filter_placeholder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_home() {
             return;
         }
         let count = self.total_in_folder();
-        if self.placeholder_for == Some(count) {
+        if self.tab().placeholder_for == Some(count) {
             return;
         }
-        self.placeholder_for = Some(count);
+        self.tab_mut().placeholder_for = Some(count);
         let text = format!("filter {count} items…");
-        self.filter
-            .update(cx, |input, cx| input.set_placeholder(text, window, cx));
+        let filter = self.filter().clone();
+        filter.update(cx, |input, cx| input.set_placeholder(text, window, cx));
     }
 
     pub fn total_in_folder(&self) -> usize {
-        match &self.listing {
+        match &self.tab().listing {
             LoadState::Ready(snapshot) => snapshot.entries.len(),
             _ => 0,
         }
@@ -460,7 +668,7 @@ impl Ply {
     // ---- selection --------------------------------------------------------
 
     pub fn is_selected(&self, path: &Path) -> bool {
-        self.selection.iter().any(|p| p == path)
+        self.tab().selection.iter().any(|p| p == path)
     }
 
     pub fn click_row(&mut self, ix: usize, extend: bool, toggle: bool, cx: &mut Context<Self>) {
@@ -468,61 +676,67 @@ impl Ply {
         let Some(path) = paths.get(ix).cloned() else {
             return;
         };
-        if extend && let Some(anchor) = self.anchor {
-            let (lo, hi) = if anchor <= ix { (anchor, ix) } else { (ix, anchor) };
-            self.selection = paths[lo..=hi].to_vec();
+        let tab = self.tab_mut();
+        if extend && let Some(anchor) = tab.anchor {
+            let (lo, hi) = if anchor <= ix {
+                (anchor, ix)
+            } else {
+                (ix, anchor)
+            };
+            tab.selection = paths[lo..=hi].to_vec();
         } else if toggle {
-            match self.selection.iter().position(|p| *p == path) {
+            match tab.selection.iter().position(|p| *p == path) {
                 Some(at) => {
-                    self.selection.remove(at);
+                    tab.selection.remove(at);
                 }
-                None => self.selection.push(path),
+                None => tab.selection.push(path),
             }
-            self.anchor = Some(ix);
+            tab.anchor = Some(ix);
         } else {
-            self.selection = vec![path];
-            self.anchor = Some(ix);
+            tab.selection = vec![path];
+            tab.anchor = Some(ix);
         }
         cx.notify();
     }
 
-    /// Arrow-key movement. `extend` grows the range from the anchor.
     pub fn move_selection(&mut self, delta: isize, extend: bool, cx: &mut Context<Self>) {
         let paths: Vec<PathBuf> = self.visible().iter().map(|e| e.path.clone()).collect();
         if paths.is_empty() {
             return;
         }
         let current = self
+            .tab()
             .selection
             .last()
             .and_then(|last| paths.iter().position(|p| p == last))
             .unwrap_or(0) as isize;
         let next = (current + delta).clamp(0, paths.len() as isize - 1) as usize;
+        let tab = self.tab_mut();
         if extend {
-            let anchor = self.anchor.unwrap_or(current as usize);
+            let anchor = tab.anchor.unwrap_or(current as usize);
             let (lo, hi) = if anchor <= next {
                 (anchor, next)
             } else {
                 (next, anchor)
             };
-            self.selection = paths[lo..=hi].to_vec();
-            self.anchor = Some(anchor);
+            tab.selection = paths[lo..=hi].to_vec();
+            tab.anchor = Some(anchor);
         } else {
-            self.selection = vec![paths[next].clone()];
-            self.anchor = Some(next);
+            tab.selection = vec![paths[next].clone()];
+            tab.anchor = Some(next);
         }
         cx.notify();
+        self.refresh_quick_look(cx);
     }
 
     pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
-        self.selection.clear();
-        self.anchor = None;
+        self.tab_mut().selection.clear();
+        self.tab_mut().anchor = None;
         cx.notify();
     }
 
-    /// Open whatever is selected: folders navigate, files go to the OS.
     pub fn activate_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(path) = self.selection.last().cloned() else {
+        let Some(path) = self.tab().selection.last().cloned() else {
             return;
         };
         self.activate(&path, window, cx);
@@ -538,19 +752,22 @@ impl Ply {
         }
     }
 
-    /// `is_dir` cannot answer for portable devices, so trust the listing that
-    /// produced the path and fall back to the filesystem for everything else.
     fn is_folder(&self, path: &Path) -> bool {
-        if let LoadState::Ready(snapshot) = &self.listing
+        if let LoadState::Ready(snapshot) = &self.tab().listing
             && let Some(entry) = snapshot.entries.iter().find(|e| e.path == path)
         {
             return entry.is_directory();
         }
-        // Anything reached from the sidebar or This PC is already a container.
+        for col in &self.tab().columns {
+            if let LoadState::Ready(snapshot) = &col.listing
+                && let Some(entry) = snapshot.entries.iter().find(|e| e.path == path)
+            {
+                return entry.is_directory();
+            }
+        }
         crate::mtp::is_mtp(path) || path.is_dir()
     }
 
-    /// Device data has no path, so copy the object out before handing it over.
     fn open_from_device(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.note("Copying from the device…", cx);
         cx.spawn(async move |this, cx| {
@@ -575,7 +792,6 @@ impl Ply {
         self.expanded.contains(path)
     }
 
-    /// Expand or collapse a branch, loading its subfolders the first time.
     pub fn toggle_expanded(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if self.expanded.remove(&path) {
             cx.notify();
@@ -624,68 +840,82 @@ impl Ply {
         cx.notify();
     }
 
-    // ---- menu, properties, file operations --------------------------------
+    // ---- menu -------------------------------------------------------------
+
+    fn caps_ctx(&self, path: &Path, is_dir: bool, is_file: bool, is_multi: bool) -> CapsCtx<'_> {
+        CapsCtx {
+            clipboard_empty: file_clip::is_empty(),
+            is_volume: self.volumes.iter().any(|v| v.path == path),
+            pinned: self.quick_access.iter().any(|p| p == path),
+            is_dir,
+            is_file,
+            is_multi,
+            run_as_admin: is_file && is_admin_target(path),
+            folder: self.current_folder(),
+        }
+    }
 
     pub fn open_menu(&mut self, at: Point<Pixels>, path: PathBuf, cx: &mut Context<Self>) {
         if !self.is_selected(&path) {
-            self.selection = vec![path.clone()];
+            self.tab_mut().selection = vec![path.clone()];
         }
-        let pinned = self.quick_access.contains(&path);
-        let is_volume = self.volumes.iter().any(|v| v.path == path);
-        let targets = if self.selection.len() > 1 {
-            self.selection.clone()
+        let is_dir = self.is_folder(&path);
+        let is_file = !is_dir;
+        let targets = if self.tab().selection.len() > 1 {
+            self.tab().selection.clone()
         } else {
             vec![path.clone()]
         };
+        let is_multi = targets.len() > 1;
+        let ctx = self.caps_ctx(&path, is_dir, is_file, is_multi);
+        let caps = PathCaps::for_entry(&path, ctx);
+        let handlers = if caps.open_with.show() {
+            crate::open_with::handlers_for(&path)
+        } else {
+            Vec::new()
+        };
+        self.menu = Some(menu::build_entry(
+            at,
+            menu::EntrySpec {
+                path,
+                targets,
+                caps,
+                is_dir,
+                is_file,
+                handlers,
+            },
+        ));
+        cx.notify();
+    }
 
-        let mut items = vec![MenuItem {
-            label: "Open".into(),
-            action: MenuAction::Open(path.clone()),
-            danger: false,
-        }];
-        if !is_volume {
-            items.push(MenuItem {
-                label: "Rename".into(),
-                action: MenuAction::Rename(path.clone()),
-                danger: false,
-            });
+    pub fn open_empty_menu(&mut self, at: Point<Pixels>, folder: PathBuf, cx: &mut Context<Self>) {
+        self.tab_mut().selection.clear();
+        self.tab_mut().anchor = None;
+        if self.tab().location != Location::Folder(folder.clone())
+            && self.view() == ViewMode::Column
+        {
+            self.tab_mut().location = Location::Folder(folder.clone());
         }
-        items.push(MenuItem {
-            label: "Copy path".into(),
-            action: MenuAction::CopyPath(path.clone()),
-            danger: false,
-        });
-        items.push(MenuItem {
-            label: "Reveal in Explorer".into(),
-            action: MenuAction::Reveal(path.clone()),
-            danger: false,
-        });
-        if pinned {
-            items.push(MenuItem {
-                label: "Unpin from Home".into(),
-                action: MenuAction::Unpin(path.clone()),
-                danger: false,
-            });
-        }
-        items.push(MenuItem {
-            label: "Properties".into(),
-            action: MenuAction::Properties(path),
-            danger: false,
-        });
-        if !is_volume {
-            let label = if targets.len() > 1 {
-                format!("Delete {} items", targets.len()).into()
-            } else {
-                SharedString::from("Delete")
-            };
-            items.push(MenuItem {
-                label,
-                action: MenuAction::Delete(targets),
-                danger: true,
-            });
-        }
-
-        self.menu = Some(Menu { at, items });
+        let ctx = CapsCtx {
+            clipboard_empty: file_clip::is_empty(),
+            is_volume: self.volumes.iter().any(|v| v.path == folder),
+            pinned: false,
+            is_dir: true,
+            is_file: false,
+            is_multi: false,
+            run_as_admin: false,
+            folder: Some(&folder),
+        };
+        let caps = PathCaps::for_background(&folder, ctx);
+        self.menu = Some(menu::build_empty(
+            at,
+            menu::EmptySpec {
+                folder,
+                caps,
+                view: self.view(),
+                sort: self.tab().sort,
+            },
+        ));
         cx.notify();
     }
 
@@ -695,27 +925,13 @@ impl Ply {
         }
     }
 
-    pub fn run(&mut self, action: MenuAction, window: &mut Window, cx: &mut Context<Self>) {
-        self.menu = None;
-        match action {
-            MenuAction::Open(path) => self.activate(&path, window, cx),
-            MenuAction::Rename(path) => self.begin_rename(path, window, cx),
-            MenuAction::CopyPath(path) => {
-                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                    path.to_string_lossy().into_owned(),
-                ));
-                self.note("Path copied.", cx);
-            }
-            MenuAction::Reveal(path) => {
-                if let Err(err) = fs_ops::reveal(&path) {
-                    self.fail(format!("Reveal failed: {err}"), cx);
-                }
-            }
-            MenuAction::Properties(path) => self.show_properties(&path, cx),
-            MenuAction::Delete(paths) => self.delete(paths, cx),
-            MenuAction::Unpin(path) => self.unpin(&path, cx),
+    pub fn set_flyout(&mut self, ix: Option<usize>, cx: &mut Context<Self>) {
+        if let Some(menu) = &mut self.menu
+            && menu.flyout != ix
+        {
+            menu.flyout = ix;
+            cx.notify();
         }
-        cx.notify();
     }
 
     pub fn begin_rename(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
@@ -728,8 +944,6 @@ impl Ply {
             input.focus(window, cx);
             input.select_all(window, cx);
         });
-        // Deferred so the edit (and this subscription) is not torn down from
-        // inside its own callback.
         let commit = cx.subscribe(&input, |_, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
                 let ply = cx.entity();
@@ -753,7 +967,7 @@ impl Ply {
         let value = rename.input.read(cx).value().to_string();
         match fs_ops::rename(&rename.path, &value) {
             Ok(target) => {
-                self.selection = vec![target];
+                self.tab_mut().selection = vec![target];
                 self.reload(cx);
             }
             Err(err) => self.fail(err.to_string(), cx),
@@ -771,8 +985,8 @@ impl Ply {
         let count = paths.len();
         match fs_ops::delete_to_trash(&paths) {
             Ok(()) => {
-                self.selection.clear();
-                self.anchor = None;
+                self.tab_mut().selection.clear();
+                self.tab_mut().anchor = None;
                 let noun = if count == 1 { "item" } else { "items" };
                 self.note(format!("Moved {count} {noun} to the Recycle Bin."), cx);
                 self.reload(cx);
@@ -782,8 +996,8 @@ impl Ply {
     }
 
     pub fn delete_selection(&mut self, cx: &mut Context<Self>) {
-        if !self.selection.is_empty() {
-            self.delete(self.selection.clone(), cx);
+        if !self.tab().selection.is_empty() {
+            self.delete(self.tab().selection.clone(), cx);
         }
     }
 
@@ -833,11 +1047,6 @@ impl Ply {
         }
     }
 
-    pub fn set_view(&mut self, view: ViewMode, cx: &mut Context<Self>) {
-        self.view = view;
-        cx.notify();
-    }
-
     pub fn note(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.status = Some(message.into());
         self.clear_status_later(cx);
@@ -851,9 +1060,7 @@ impl Ply {
     fn clear_status_later(&mut self, cx: &mut Context<Self>) {
         cx.notify();
         cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_secs(4))
-                .await;
+            cx.background_executor().timer(Duration::from_secs(4)).await;
             this.update(cx, |this, cx| {
                 this.status = None;
                 cx.notify();
@@ -868,6 +1075,8 @@ impl Ply {
 pub fn dismiss_topmost(ply: &mut Ply, cx: &mut Context<Ply>) {
     if ply.properties.is_some() {
         ply.close_properties(cx);
+    } else if ply.quick_look.is_some() {
+        ply.close_quick_look(cx);
     } else if ply.menu.is_some() {
         ply.close_menu(cx);
     } else if ply.rename.is_some() {

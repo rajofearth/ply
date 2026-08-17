@@ -284,11 +284,9 @@ mod windows_impl {
     }
 
     /// Resolve a device key to an open handle, opening it on first use.
-    unsafe fn handle<'a>(
-        cache: &'a mut HashMap<String, Opened>,
-        key: &str,
-    ) -> Result<&'a Opened> {
-        let pnp_id = pnp_id_for(key).ok_or_else(|| anyhow!("That device is no longer connected."))?;
+    unsafe fn handle<'a>(cache: &'a mut HashMap<String, Opened>, key: &str) -> Result<&'a Opened> {
+        let pnp_id =
+            pnp_id_for(key).ok_or_else(|| anyhow!("That device is no longer connected."))?;
         if !cache.contains_key(key) {
             // SAFETY: worker thread owns the apartment these handles live in.
             let opened = unsafe { open_device(&pnp_id) }
@@ -298,7 +296,9 @@ mod windows_impl {
         Ok(&cache[key])
     }
 
-    unsafe fn property_keys(wanted: &[PROPERTYKEY]) -> windows::core::Result<IPortableDeviceKeyCollection> {
+    unsafe fn property_keys(
+        wanted: &[PROPERTYKEY],
+    ) -> windows::core::Result<IPortableDeviceKeyCollection> {
         // SAFETY: freshly created collection, keys are static constants.
         unsafe {
             let keys: IPortableDeviceKeyCollection =
@@ -406,7 +406,10 @@ mod windows_impl {
         }
     }
 
-    unsafe fn list_children(cache: &mut HashMap<String, Opened>, path: &Path) -> Result<Vec<Entry>> {
+    unsafe fn list_children(
+        cache: &mut HashMap<String, Opened>,
+        path: &Path,
+    ) -> Result<Vec<Entry>> {
         let (key, object) = parse(path).ok_or_else(|| anyhow!("Not a portable device path."))?;
         // SAFETY: all handles stay on the worker thread.
         unsafe {
@@ -421,8 +424,8 @@ mod windows_impl {
             ])
             .map_err(|e| anyhow!("Could not prepare the property list: {e}"))?;
 
-            let ids = child_ids(open, &object)
-                .map_err(|e| anyhow!("Could not read that folder: {e}"))?;
+            let ids =
+                child_ids(open, &object).map_err(|e| anyhow!("Could not read that folder: {e}"))?;
 
             let mut entries = Vec::with_capacity(ids.len());
             for id in ids {
@@ -463,8 +466,12 @@ mod windows_impl {
                 let Ok(values) = open.properties.GetValues(&HSTRING::from(storage), &keys) else {
                     continue;
                 };
-                total += values.GetUnsignedLargeIntegerValue(&STORAGE_CAPACITY).unwrap_or(0);
-                free += values.GetUnsignedLargeIntegerValue(&STORAGE_FREE).unwrap_or(0);
+                total += values
+                    .GetUnsignedLargeIntegerValue(&STORAGE_CAPACITY)
+                    .unwrap_or(0);
+                free += values
+                    .GetUnsignedLargeIntegerValue(&STORAGE_FREE)
+                    .unwrap_or(0);
             }
             (free, total)
         }
@@ -493,9 +500,11 @@ mod windows_impl {
     unsafe fn enumerate(cache: &mut HashMap<String, Opened>) -> Vec<Device> {
         // SAFETY: manager is created and released on the worker thread.
         unsafe {
-            let Ok(manager) =
-                CoCreateInstance::<_, IPortableDeviceManager>(&CLSID_MANAGER, None, CLSCTX_INPROC_SERVER)
-            else {
+            let Ok(manager) = CoCreateInstance::<_, IPortableDeviceManager>(
+                &CLSID_MANAGER,
+                None,
+                CLSCTX_INPROC_SERVER,
+            ) else {
                 return Vec::new();
             };
             // The manager snapshots the device list when created, so ask for a
@@ -503,7 +512,10 @@ mod windows_impl {
             let _ = manager.RefreshDeviceList();
 
             let mut count = 0u32;
-            if manager.GetDevices(std::ptr::null_mut(), &mut count).is_err() {
+            if manager
+                .GetDevices(std::ptr::null_mut(), &mut count)
+                .is_err()
+            {
                 return Vec::new();
             }
             if count == 0 {
@@ -515,7 +527,10 @@ mod windows_impl {
             }
 
             let mut raw_ids = vec![PWSTR::null(); count as usize];
-            if manager.GetDevices(raw_ids.as_mut_ptr(), &mut count).is_err() {
+            if manager
+                .GetDevices(raw_ids.as_mut_ptr(), &mut count)
+                .is_err()
+            {
                 return Vec::new();
             }
 
@@ -565,8 +580,15 @@ mod windows_impl {
         // SAFETY: worker-thread handles; the stream is read to completion here.
         unsafe {
             let open = handle(cache, &key)?;
-            let keys = property_keys(&[OBJECT_NAME, OBJECT_ORIGINAL_FILE_NAME, OBJECT_CONTENT_TYPE, OBJECT_SIZE, OBJECT_DATE_MODIFIED, OBJECT_IS_HIDDEN])
-                .map_err(|e| anyhow!("Could not prepare the property list: {e}"))?;
+            let keys = property_keys(&[
+                OBJECT_NAME,
+                OBJECT_ORIGINAL_FILE_NAME,
+                OBJECT_CONTENT_TYPE,
+                OBJECT_SIZE,
+                OBJECT_DATE_MODIFIED,
+                OBJECT_IS_HIDDEN,
+            ])
+            .map_err(|e| anyhow!("Could not prepare the property list: {e}"))?;
             let Some(info) = describe(open, &keys, &object) else {
                 bail!("Could not read that item from the device.");
             };
@@ -630,6 +652,7 @@ mod tests {
         assert!(!key.contains('\\'));
     }
 
+    #[cfg(windows)]
     #[test]
     fn round_trips_device_root() {
         let root = root_of("deadbeefdeadbeef");
@@ -641,20 +664,22 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn parses_nested_objects() {
         let path = root_of("abc").join("s10001").join("o42");
-        assert_eq!(
-            parse(&path),
-            Some(("abc".to_string(), "o42".to_string()))
-        );
+        assert_eq!(parse(&path), Some(("abc".to_string(), "o42".to_string())));
     }
 
+    #[cfg(windows)]
     #[test]
     fn ancestors_walk_back_to_the_device() {
         let path = root_of("abc").join("s10001").join("o42");
         let parent = path.parent().expect("nested object has a parent");
-        assert_eq!(parse(parent), Some(("abc".to_string(), "s10001".to_string())));
+        assert_eq!(
+            parse(parent),
+            Some(("abc".to_string(), "s10001".to_string()))
+        );
         let root = parent.parent().expect("storage sits under the device");
         assert_eq!(parse(root), Some(("abc".to_string(), "DEVICE".to_string())));
     }

@@ -1,11 +1,11 @@
 use std::path::PathBuf;
 
+use gpui::AppContext;
 use gpui::{
     AnyElement, ClickEvent, Context, FontWeight, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, StatefulInteractiveElement, Styled, div,
-    prelude::FluentBuilder, px,
+    MouseDownEvent, ParentElement, StatefulInteractiveElement, Styled, div, prelude::FluentBuilder,
+    px,
 };
-use gpui::AppContext;
 use gpui_component::Sizable;
 use gpui_component::input::Input;
 
@@ -24,41 +24,49 @@ pub fn entry_icon(entry: &Entry) -> Ico {
         k if k.contains("Image") || k == "Icon" => Ico::Image,
         k if k.contains("Video") => Ico::Video,
         k if k.contains("Audio") || k == "Playlist" => Ico::Music,
-        k if k.contains("Document") || k == "Source File" || k.contains("Workbook") => Ico::FileText,
+        k if k.contains("Document") || k == "Source File" || k.contains("Workbook") => {
+            Ico::FileText
+        }
         _ => Ico::File,
     }
 }
 
 pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
     let p = ply.palette();
-    let list_view = ply.view == ViewMode::List;
+    let view = ply.view();
+    let list_view = view == ViewMode::List;
+    let column_view = view == ViewMode::Column;
     let entries = ply.visible();
 
-    let body: Vec<AnyElement> = match &ply.listing {
-        LoadState::Loading if entries.is_empty() => vec![message("Loading…", ply)],
-        LoadState::Failed(err) => vec![message(err.clone(), ply)],
-        _ if entries.is_empty() && !ply.filter_text.is_empty() => {
-            vec![message("Nothing matches that filter.", ply)]
+    let body: Vec<AnyElement> = if column_view {
+        vec![column_view_el(ply, cx)]
+    } else {
+        match ply.listing() {
+            LoadState::Loading if entries.is_empty() => vec![message("Loading…", ply)],
+            LoadState::Failed(err) => vec![message(err.clone(), ply)],
+            _ if entries.is_empty() && !ply.filter_text().is_empty() => {
+                vec![message("Nothing matches that filter.", ply)]
+            }
+            _ if entries.is_empty() => vec![message("This folder is empty.", ply)],
+            _ if list_view => entries
+                .iter()
+                .enumerate()
+                .map(|(ix, e)| list_row(ply, e, ix, cx))
+                .collect(),
+            _ => vec![
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(4.))
+                    .children(
+                        entries
+                            .iter()
+                            .enumerate()
+                            .map(|(ix, e)| grid_cell(ply, e, ix, cx)),
+                    )
+                    .into_any_element(),
+            ],
         }
-        _ if entries.is_empty() => vec![message("This folder is empty.", ply)],
-        _ if list_view => entries
-            .iter()
-            .enumerate()
-            .map(|(ix, e)| list_row(ply, e, ix, cx))
-            .collect(),
-        _ => vec![
-            div()
-                .flex()
-                .flex_wrap()
-                .gap(px(4.))
-                .children(
-                    entries
-                        .iter()
-                        .enumerate()
-                        .map(|(ix, e)| grid_cell(ply, e, ix, cx)),
-                )
-                .into_any_element(),
-        ],
     };
 
     div()
@@ -91,9 +99,116 @@ pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
                 .flex_1()
                 .min_h_0()
                 .overflow_y_scroll()
-                .when(!list_view, |el| el.p(px(14.)))
+                .when(!list_view && !column_view, |el| el.p(px(14.)))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                        if let Some(folder) = this.current_folder().map(|p| p.to_path_buf()) {
+                            this.open_empty_menu(ev.position, folder, cx);
+                        }
+                    }),
+                )
                 .children(body),
         )
+}
+
+fn column_view_el(ply: &Ply, cx: &mut Context<Ply>) -> AnyElement {
+    let p = ply.palette();
+    let columns = ply.columns();
+    div()
+        .id("columns")
+        .flex()
+        .flex_1()
+        .min_h_0()
+        .overflow_x_scroll()
+        .children(columns.iter().enumerate().map(|(cix, col)| {
+            let folder = col.path.clone();
+            div()
+                .id(("col", cix))
+                .w(px(220.))
+                .flex_none()
+                .h_full()
+                .overflow_y_scroll()
+                .border_r_1()
+                .border_color(p.border)
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.open_empty_menu(ev.position, folder.clone(), cx);
+                    }),
+                )
+                .children(match &col.listing {
+                    LoadState::Loading => vec![message("Loading…", ply)],
+                    LoadState::Failed(err) => vec![message(err.clone(), ply)],
+                    LoadState::Ready(snap) if snap.entries.is_empty() => {
+                        vec![message("Empty", ply)]
+                    }
+                    LoadState::Ready(snap) => snap
+                        .entries
+                        .iter()
+                        .map(|e| {
+                            column_row(ply, e, cix, col.selected.as_ref() == Some(&e.path), cx)
+                        })
+                        .collect(),
+                })
+        }))
+        .into_any_element()
+}
+
+fn column_row(
+    ply: &Ply,
+    entry: &Entry,
+    col_ix: usize,
+    selected: bool,
+    cx: &mut Context<Ply>,
+) -> AnyElement {
+    let p = ply.palette();
+    let path = entry.path.clone();
+    let is_dir = entry.is_directory();
+    div()
+        .id(("crow", super::stable_id(&entry.path)))
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .h(px(26.))
+        .px(px(8.))
+        .cursor_default()
+        .when(selected, |el| {
+            el.bg(p.select_strong).font_weight(FontWeight::MEDIUM)
+        })
+        .when(!selected, |el| el.hover(|s| s.bg(p.muted)))
+        .child(icon(entry_icon(entry), px(14.), p.muted_foreground))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(px(12.5))
+                .child(entry.name.clone()),
+        )
+        .when(is_dir, |el| {
+            el.child(icon(Ico::ChevronRight, px(11.), p.muted_foreground))
+        })
+        .on_click({
+            let path = path.clone();
+            cx.listener(move |this, ev: &ClickEvent, window, cx| {
+                cx.stop_propagation();
+                if ev.click_count() >= 2 {
+                    this.activate(&path, window, cx);
+                    return;
+                }
+                this.drill_column(col_ix, path.clone(), is_dir, window, cx);
+            })
+        })
+        .on_mouse_down(MouseButton::Right, {
+            let path = path.clone();
+            cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                cx.stop_propagation();
+                this.open_menu(ev.position, path.clone(), cx);
+            })
+        })
+        .into_any_element()
 }
 
 fn message(text: impl Into<gpui::SharedString>, ply: &Ply) -> AnyElement {

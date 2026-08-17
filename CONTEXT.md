@@ -8,7 +8,7 @@ Location at a time in the centre pane.
 **Location**:
 What the centre pane is pointed at — either Home or a Current Folder. Navigation
 history is a stack of Locations.
-_Avoid_: page, route, view (view means list-vs-grid)
+_Avoid_: page, route, view (view means list-vs-grid-vs-column)
 
 **Home**:
 The idle Location. Shows Volumes as capacity cards and nothing else — no
@@ -31,7 +31,7 @@ _Avoid_: item, node, inode, document
 
 **Listing**:
 The ordered vector of Entries in the Current Folder: directories first, then
-name. Source of truth for both list and grid.
+the active Sort. Source of truth for list, grid, and the focused Column.
 _Avoid_: cache, index, worktree
 
 **Snapshot**:
@@ -52,7 +52,8 @@ _Avoid_: tree pane, navigator
 
 **Quick Access**:
 Folders pinned under Home in the Sidebar. Seeded from the user's shell folders;
-the user adds more by dragging a folder onto the section.
+the user adds more by dragging a folder onto the section, or via Add to Quick
+Access / Remove from Quick Access on the Entry menu.
 _Avoid_: favourites, bookmarks, shortcuts
 
 **Expand**:
@@ -65,15 +66,50 @@ Hand an Entry to the OS default app (file) or make it the Current Folder
 (directory).
 _Avoid_: launch, execute, preview
 
+**Open with**:
+Hand a file to a short list of OS-known apps, or to the native OS picker via
+"Choose another app…".
+_Avoid_: associate, default app (that's Open)
+
 **Properties**:
-The modal showing one Entry's or Volume's type, size, mtime, and location. It
-replaced the old preview pane; Ply never renders file contents.
+The modal showing one Entry's or Volume's type, size, mtime, and location.
 _Avoid_: details pane, inspector, preview
+
+**Quick Look**:
+A spacebar overlay that previews an Entry's contents — images, text, and, where
+a free OS handler or thumbnailer is available, PDF, Office, and media. It does
+not replace Open. The old rule "never render file contents" is retired.
+_Avoid_: preview pane, Properties
 
 **Hidden Entry**:
 An Entry with the platform hidden attribute or a leading `.`. Always excluded
 from the Listing — there is no Show Hidden control.
 _Avoid_: dotfile, system file
+
+**View**:
+How the Listing is laid out: List, Grid, or Column.
+_Avoid_: location, page
+
+**Column**:
+A View that shows successive folders as side-by-side panes. Selecting a
+directory fills the next pane; the focused pane is the Current Folder.
+_Avoid_: tree, miller (the name is Column)
+
+**Tab**:
+One independent Location stack inside a window. Opening a folder in a new tab
+does not disturb the current one. A new window is a separate Ply instance.
+_Avoid_: pane, split
+
+**PathCaps**:
+What a path can do right now. Impossible commands are omitted; temporarily
+unavailable ones (empty Paste) are shown disabled. Writes on MTP and on a
+Volume root are impossible.
+_Avoid_: permissions, ACL (we do not surface those)
+
+**File clipboard**:
+Cut / Copy / Paste of real Entries through the OS clipboard. Distinct from
+Copy path, which puts a string on the clipboard.
+_Avoid_: copy (alone) — say Cut/Copy/Paste or Copy path
 
 ## Design tokens
 

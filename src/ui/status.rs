@@ -13,7 +13,7 @@ use crate::icons::Ico;
 pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
     let p = ply.palette();
     let shown = ply.visible().len();
-    let selected = ply.selection.len();
+    let selected = ply.tab().selection.len();
 
     let left = match &ply.status {
         Some(message) => message.to_string(),
@@ -54,7 +54,7 @@ pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
                             div()
                                 .flex_1()
                                 .min_w_0()
-                                .child(Input::new(&ply.filter).xsmall().appearance(false)),
+                                .child(Input::new(ply.filter()).xsmall().appearance(false)),
                         ),
                 )
                 .child(
@@ -63,18 +63,20 @@ pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
                         .border_1()
                         .border_color(p.border)
                         .child(toggle(ply, ViewMode::List, Ico::List, cx))
-                        .child(toggle(ply, ViewMode::Grid, Ico::LayoutGrid, cx)),
+                        .child(toggle(ply, ViewMode::Grid, Ico::LayoutGrid, cx))
+                        .child(toggle(ply, ViewMode::Column, Ico::Columns, cx)),
                 ),
         )
 }
 
 fn toggle(ply: &Ply, view: ViewMode, ico: Ico, cx: &mut Context<Ply>) -> impl IntoElement {
     let p = ply.palette();
-    let on = ply.view == view;
+    let on = ply.view() == view;
     div()
         .id(match view {
             ViewMode::List => "view-list",
             ViewMode::Grid => "view-grid",
+            ViewMode::Column => "view-column",
         })
         .flex()
         .px(px(6.))

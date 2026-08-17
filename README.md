@@ -7,44 +7,49 @@ location at a time. Zero-hue neutral palette, sharp corners, lucide icons.
 
 Nightly Rust is required (GPUI uses `std::hint::cold_path`).
 
-```powershell
-cd P:\Projects\ply
+```
 cargo run
 ```
 
 ## Keys
 
-| Key | Action |
-| --- | --- |
-| `d` | Toggle light / dark |
-| `Enter` | Open (folder → navigate, file → OS default app) |
-| `↑` / `↓` | Move selection |
-| `Shift+↑` / `Shift+↓` | Extend selection |
-| `Alt+←` / `Backspace` | Back |
-| `Alt+→` | Forward |
-| `Alt+↑` | Parent folder |
-| `Alt+Home` | Home |
-| `F2` | Rename |
-| `Delete` | Move to Recycle Bin |
-| `Ctrl+C` | Copy path |
-| `Ctrl+F` | Focus the filter |
-| `F5` | Refresh |
-| `Esc` | Close the topmost thing (dialog → menu → rename → selection) |
+Shortcuts follow the host OS (Cmd on macOS, Ctrl elsewhere). Bare-key shortcuts
+stand down while a text field has focus.
 
-Bare-key shortcuts stand down while a text field has focus.
+| Action | Windows / Linux | macOS |
+| --- | --- | --- |
+| Open | Enter | ⌘O / ⌘↓ |
+| Rename | F2 | Return |
+| Cut / Copy / Paste files | Ctrl+X / C / V | ⌘X / C / V |
+| Copy path | Ctrl+Shift+C | ⌘⇧C |
+| Quick Look | Space | Space |
+| Delete (Recycle Bin) | Delete | ⌘⌫ |
+| New folder | Ctrl+Shift+N | ⌘⇧N |
+| New tab | Ctrl+T | ⌘T |
+| New window | Ctrl+N | ⌘N |
+| Refresh | F5 | ⌘R |
+| Focus filter | Ctrl+F | ⌘F |
+| Back | Alt+← / Backspace | ⌘[ / Backspace |
+| Forward | Alt+→ | ⌘] |
+| Parent folder | Alt+↑ | ⌘↑ |
+| Home | Alt+Home | ⌘⇧H |
+| Toggle light / dark | `d` | `d` |
+| Close topmost (dialog → Quick Look → menu → rename → selection) | Esc | Esc |
 
 ## Mouse
 
-- Click to select, `Ctrl`+click to toggle, `Shift`+click to extend.
-- Double-click to open. Right-click for the context menu.
+- Click to select, `Ctrl`+click (`⌘`+click) to toggle, `Shift`+click to extend.
+- Double-click to open. Right-click for the context menu (toolbar on an Entry;
+  list only on empty space).
 - Drag a folder onto the sidebar's Home section to pin it.
 - Sidebar branches expand **only** via the chevron — navigating never expands
   the tree.
 
 ## Writes
 
-Ply is mostly read-only, but Rename and Delete are real. Delete goes to the
-platform recycle bin and never deletes permanently.
+Rename, Delete, Cut, Copy, Paste, and New are real. Delete goes to the platform
+recycle bin and never deletes permanently.
 
-See [CONTEXT.md](CONTEXT.md) for the domain language and
+See [CONTEXT.md](CONTEXT.md) for the domain language,
+[AGENTS.md](AGENTS.md) for contributor constraints, and
 [docs/adr](docs/adr) for decisions.
