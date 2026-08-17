@@ -10,10 +10,12 @@ things made gpui-component's widgets a poor fit for that.
 Nine glyphs the design needs — `image`, `music`, `video`, `layout-grid`, `list`,
 `home`, `square`, `usb`, `file-text` — are absent, and lucide's `x` is renamed
 `close`. Reaching for near-matches is what made an earlier attempt drift off the
-design. We vendor the 22 lucide SVGs we use into `assets/icons/` and serve them
-from our own `AssetSource`, which falls back to gpui-component's for anything we
-do not own. A unit test loads every `Ico` variant, so a missing file fails the
-build rather than rendering an invisible glyph.
+design. We vendor the lucide SVGs we use into `assets/icons/` and serve them
+from our own `AssetSource` only — no fallback into gpui-component's icon pack.
+A unit test loads every `Ico` variant, so a missing file fails the build rather
+than rendering an invisible glyph. Dropping that pack (and a size-minded
+release profile: thin LTO, `opt-level = "s"`, strip) keeps the binary leaner;
+GPUI still dominates size and RAM.
 
 **Colour.** GPUI has no OKLCH constructor. Tokens are converted to sRGB once, at
 authoring time, and `src/theme.rs` records the OKLCH source next to each value

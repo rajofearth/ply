@@ -4,6 +4,8 @@
 //! OKLCH constructor, so they are pre-converted to sRGB here; the OKLCH value is
 //! kept alongside each entry so the two stay traceable.
 
+use std::sync::LazyLock;
+
 use gpui::{Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, Hsla, Rgba, hsla, rgb};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -94,7 +96,7 @@ impl Palette {
 
 /// The CSS `-apple-system, "Segoe UI Variable", Ubuntu, …` stack, resolved per
 /// platform: GPUI takes one family plus an ordered fallback list.
-pub fn ui_font() -> Font {
+static UI_FONT: LazyLock<Font> = LazyLock::new(|| {
     let (family, fallbacks): (&str, &[&str]) = if cfg!(windows) {
         ("Segoe UI Variable", &["Segoe UI", "Tahoma", "Arial"])
     } else if cfg!(target_os = "macos") {
@@ -111,4 +113,8 @@ pub fn ui_font() -> Font {
         weight: FontWeight::default(),
         style: FontStyle::default(),
     }
+});
+
+pub fn ui_font() -> Font {
+    UI_FONT.clone()
 }

@@ -5,25 +5,13 @@ use gpui::{
 
 use super::{icon, section_label};
 use crate::app::Ply;
-use crate::icons::Ico;
 use crate::listing::format_size;
-use crate::volumes::{Volume, VolumeKind};
+use crate::volumes::{self, Volume};
 
 /// The idle dashboard: drives and devices only, and no status bar.
 pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
     let p = ply.palette();
-    let drives: Vec<_> = ply
-        .volumes
-        .iter()
-        .filter(|v| v.kind == VolumeKind::Drive)
-        .cloned()
-        .collect();
-    let devices: Vec<_> = ply
-        .volumes
-        .iter()
-        .filter(|v| v.kind != VolumeKind::Drive)
-        .cloned()
-        .collect();
+    let (drives, devices) = volumes::partition_drives_devices(&ply.volumes);
     let has_devices = !devices.is_empty();
 
     div()
@@ -61,13 +49,9 @@ pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
 }
 
 /// One volume: name, a capacity bar, and free/total.
-fn card(ply: &Ply, v: Volume, cx: &mut Context<Ply>) -> AnyElement {
+fn card(ply: &Ply, v: &Volume, cx: &mut Context<Ply>) -> AnyElement {
     let p = ply.palette();
-    let ico = match v.kind {
-        VolumeKind::Drive => Ico::HardDrive,
-        VolumeKind::Device => Ico::Usb,
-        VolumeKind::Network => Ico::Network,
-    };
+    let ico = v.ico();
     let pct = v.pct_used();
     let path = v.path.clone();
     let id = super::stable_id(&v.path);

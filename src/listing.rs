@@ -1,3 +1,4 @@
+use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -76,6 +77,64 @@ impl Snapshot {
 
 }
 
+/// Coarse kind used for icons — never derived by parsing [`kind_label`] text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KindClass {
+    Folder,
+    Image,
+    Video,
+    Audio,
+    Document,
+    File,
+}
+
+/// Map an entry to its icon class from [`EntryKind`] / extension, not labels.
+pub fn kind_class(entry: &Entry) -> KindClass {
+    match entry.kind {
+        EntryKind::Directory => return KindClass::Folder,
+        EntryKind::Symlink { .. } | EntryKind::File => {}
+    }
+    kind_class_for_name(&entry.name)
+}
+
+fn kind_class_for_name(name: &str) -> KindClass {
+    let ext = extension_lower(name);
+    match ext.as_str() {
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "svg" | "ico" => KindClass::Image,
+        "mp4" | "m4v" | "mkv" | "mov" | "avi" | "webm" | "wmv" => KindClass::Video,
+        "mp3" | "wav" | "flac" | "ogg" | "m4a" | "aac" | "m3u" | "m3u8" | "pls" => {
+            KindClass::Audio
+        }
+        "txt" | "log" | "ini" | "cfg" | "toml" | "yaml" | "yml" | "md" | "json" | "xml"
+        | "csv" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "pdf" | "rs" | "py"
+        | "js" | "ts" | "tsx" | "jsx" | "c" | "cpp" | "h" | "go" | "java" | "sh" => {
+            KindClass::Document
+        }
+        _ => KindClass::File,
+    }
+}
+
+/// Lucide icon for an entry, via [`kind_class`] (not kind-label string matching).
+pub fn entry_icon(entry: &Entry) -> crate::icons::Ico {
+    use crate::icons::Ico;
+    match kind_class(entry) {
+        KindClass::Folder => Ico::Folder,
+        KindClass::Image => Ico::Image,
+        KindClass::Video => Ico::Video,
+        KindClass::Audio => Ico::Music,
+        KindClass::Document => Ico::FileText,
+        KindClass::File => Ico::File,
+    }
+}
+
+fn extension_lower(name: &str) -> String {
+    Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
 /// Human-readable type for the Kind column, e.g. `"JPEG Image"`.
 pub fn kind_label(entry: &Entry) -> &'static str {
     match entry.kind {
@@ -85,12 +144,13 @@ pub fn kind_label(entry: &Entry) -> &'static str {
     }
     // From the name, not the path: on a portable device the path component is
     // an opaque object ID and carries no extension.
-    let ext = Path::new(&entry.name)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    match ext.as_str() {
+    kind_label_for_name(&entry.name)
+}
+
+/// Kind from a bare file name / extension. Prefer [`kind_label`] when an
+/// [`Entry`] is available so folders and shortcuts stay correct.
+pub fn kind_label_for_name(name: &str) -> &'static str {
+    match extension_lower(name).as_str() {
         "jpg" | "jpeg" => "JPEG Image",
         "png" => "PNG Image",
         "gif" => "GIF Image",
@@ -126,7 +186,9 @@ pub fn kind_label(entry: &Entry) -> &'static str {
     }
 }
 
-pub fn is_hidden(path: &Path, name: &str) -> bool {
+/// Leading `.` is always hidden. On Windows, also check `FILE_ATTRIBUTE_HIDDEN`
+/// from `meta` when provided — avoids a second `symlink_metadata` per entry.
+pub fn is_hidden(path: &Path, name: &str, meta: Option<&Metadata>) -> bool {
     if name.starts_with('.') {
         return true;
     }
@@ -134,24 +196,31 @@ pub fn is_hidden(path: &Path, name: &str) -> bool {
     {
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+        if let Some(meta) = meta {
+            return meta.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0;
+        }
         if let Ok(meta) = std::fs::symlink_metadata(path) {
             return meta.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0;
         }
     }
     #[cfg(not(windows))]
-    let _ = path;
+    {
+        let _ = (path, meta);
+    }
     false
 }
 
 fn entry_from_dirent(dirent: std::fs::DirEntry) -> Option<Entry> {
     let path = dirent.path();
     let name = dirent.file_name().to_string_lossy().into_owned();
-    let file_type = dirent
-        .file_type()
+    // Prefer DirEntry::metadata: on Windows this reuses FindFirstFile data (no
+    // re-stat). Falls back to symlink_metadata if the cached data is gone.
+    let meta = dirent
+        .metadata()
         .ok()
-        .or_else(|| std::fs::symlink_metadata(&path).ok().map(|m| m.file_type()))?;
-    let meta = std::fs::symlink_metadata(&path).ok()?;
-    let hidden = is_hidden(&path, &name);
+        .or_else(|| std::fs::symlink_metadata(&path).ok())?;
+    let file_type = meta.file_type();
+    let hidden = is_hidden(&path, &name, Some(&meta));
     let kind = if file_type.is_symlink() {
         let target = std::fs::read_link(&path).unwrap_or_default();
         EntryKind::Symlink { target }
@@ -221,12 +290,14 @@ pub fn format_size(n: u64) -> String {
 
 /// Local-time stamp, shortened by recency: `Today, 14:02`, `Aug 12, 09:30`,
 /// then `Aug 12, 2024` once the date is outside the current year.
-pub fn format_mtime(t: Option<SystemTime>) -> String {
+///
+/// Pass a shared `now` when formatting many rows in one paint so `Local::now`
+/// runs once.
+pub fn format_mtime(t: Option<SystemTime>, now: DateTime<Local>) -> String {
     let Some(t) = t else {
         return "—".into();
     };
     let when: DateTime<Local> = t.into();
-    let now = Local::now();
     let today = now.date_naive();
     let date = when.date_naive();
 
@@ -274,8 +345,70 @@ mod tests {
     }
 
     #[test]
+    fn kind_class_from_extension_not_label() {
+        assert_eq!(kind_class(&file("a.JPG")), KindClass::Image);
+        assert_eq!(kind_class(&file("a.mp4")), KindClass::Video);
+        assert_eq!(kind_class(&file("a.m3u")), KindClass::Audio);
+        assert_eq!(kind_class(&file("a.docx")), KindClass::Document);
+        assert_eq!(kind_class(&file("a.rs")), KindClass::Document);
+        assert_eq!(kind_class(&file("a.zip")), KindClass::File);
+        let mut dir = file("Pictures.jpg");
+        dir.kind = EntryKind::Directory;
+        assert_eq!(kind_class(&dir), KindClass::Folder);
+    }
+
+    #[test]
     fn format_size_scales() {
         assert_eq!(format_size(512), "512 B");
         assert_eq!(format_size(2048), "2.0 KB");
+    }
+
+    #[test]
+    fn is_hidden_leading_dot() {
+        assert!(is_hidden(Path::new("."), ".gitignore", None));
+        assert!(is_hidden(Path::new("."), ".hidden", None));
+        assert!(!is_hidden(Path::new("."), "visible.txt", None));
+    }
+
+    #[test]
+    fn list_dir_skips_dotfiles() {
+        let dir = std::env::temp_dir().join(format!("ply-list-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("visible.txt"), b"a").unwrap();
+        std::fs::write(dir.join(".hidden"), b"b").unwrap();
+        let snap = list_dir(&dir).unwrap();
+        let names: Vec<_> = snap.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"visible.txt"));
+        assert!(!names.contains(&".hidden"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn is_hidden_uses_file_attributes_from_meta() {
+        use std::process::Command;
+
+        let dir = std::env::temp_dir().join(format!("ply-attr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("secret.txt");
+        std::fs::write(&path, b"x").unwrap();
+        assert!(
+            Command::new("attrib")
+                .args(["+H", &path.to_string_lossy()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(is_hidden(&path, "secret.txt", Some(&meta)));
+        // Listing should also exclude it without a second independent path.
+        let snap = list_dir(&dir).unwrap();
+        assert!(!snap.entries.iter().any(|e| e.name == "secret.txt"));
+        let _ = Command::new("attrib")
+            .args(["-H", &path.to_string_lossy()])
+            .status();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

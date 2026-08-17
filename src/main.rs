@@ -5,6 +5,7 @@ mod fs_ops;
 mod icons;
 mod listing;
 mod mtp;
+mod path_caps;
 mod theme;
 mod ui;
 mod volumes;

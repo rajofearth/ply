@@ -9,7 +9,7 @@ use gpui::{
 use super::{icon, section_label};
 use crate::app::Ply;
 use crate::icons::Ico;
-use crate::volumes::VolumeKind;
+use crate::volumes;
 
 /// A folder being dragged onto Home to pin it.
 #[derive(Clone)]
@@ -17,18 +17,7 @@ pub struct PinDrag(pub PathBuf);
 
 pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
     let p = ply.palette();
-    let drives: Vec<_> = ply
-        .volumes
-        .iter()
-        .filter(|v| v.kind == VolumeKind::Drive)
-        .cloned()
-        .collect();
-    let devices: Vec<_> = ply
-        .volumes
-        .iter()
-        .filter(|v| v.kind != VolumeKind::Drive)
-        .cloned()
-        .collect();
+    let (drives, devices) = volumes::partition_drives_devices(&ply.volumes);
 
     let mut pinned = Vec::new();
     for path in ply.quick_access.clone() {
@@ -43,7 +32,7 @@ pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
             &mut drive_rows,
             v.path.clone(),
             v.name.clone().into(),
-            Ico::HardDrive,
+            v.ico(),
             0,
             cx,
         );
@@ -51,16 +40,12 @@ pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
 
     let mut device_rows = Vec::new();
     for v in devices {
-        let ico = match v.kind {
-            VolumeKind::Network => Ico::Network,
-            _ => Ico::Usb,
-        };
         push_branch(
             ply,
             &mut device_rows,
             v.path.clone(),
             v.name.clone().into(),
-            ico,
+            v.ico(),
             0,
             cx,
         );

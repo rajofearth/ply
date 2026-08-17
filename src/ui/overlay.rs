@@ -68,7 +68,7 @@ fn properties(ply: &Ply, cx: &mut Context<Ply>) -> Option<AnyElement> {
         ("Type", props.kind.clone()),
         ("Size", props.size.clone()),
         ("Modified", props.modified.clone()),
-        ("Location", props.location.clone()),
+        ("Path", props.path.clone()),
     ];
 
     Some(

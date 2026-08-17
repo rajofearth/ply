@@ -1,5 +1,6 @@
-//! Volume discovery for This PC. [`discover`] may block on network drives
-//! (`GetDiskFreeSpaceExW` / `GetVolumeInformationW`) — call off the UI thread.
+//! Volume discovery for This PC. [`discover`] / [`discover_lettered`] may block
+//! on network drives (`GetDiskFreeSpaceExW` / `GetVolumeInformationW`) — call
+//! off the UI thread. MTP is separate so drive polls stay cheap.
 
 use std::path::PathBuf;
 
@@ -29,19 +30,94 @@ impl Volume {
         let used = self.total.saturating_sub(self.free);
         (used as f64 / self.total as f64 * 100.0) as f32
     }
+
+    /// Sidebar / home icon for this volume's kind.
+    pub fn ico(&self) -> crate::icons::Ico {
+        volume_icon(self.kind)
+    }
 }
 
-/// Mounted volumes: drives, then devices, then network.
-/// May block on unreachable network shares — run on a background executor.
-pub fn discover() -> Vec<Volume> {
+/// Icon for a [`VolumeKind`] (Drive / Device / Network).
+pub fn volume_icon(kind: VolumeKind) -> crate::icons::Ico {
+    use crate::icons::Ico;
+    match kind {
+        VolumeKind::Drive => Ico::HardDrive,
+        VolumeKind::Device => Ico::Usb,
+        VolumeKind::Network => Ico::Network,
+    }
+}
+
+/// Partition into lettered drives vs devices & network (home + sidebar sections).
+pub fn partition_drives_devices(volumes: &[Volume]) -> (Vec<&Volume>, Vec<&Volume>) {
+    let mut drives = Vec::new();
+    let mut devices = Vec::new();
+    for v in volumes {
+        if v.kind == VolumeKind::Drive {
+            drives.push(v);
+        } else {
+            devices.push(v);
+        }
+    }
+    (drives, devices)
+}
+
+/// Bitmask of present drive letters (`GetLogicalDrives`). `0` off Windows.
+pub fn logical_drives_mask() -> u32 {
     #[cfg(windows)]
     {
-        discover_windows()
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetLogicalDrives() -> u32;
+        }
+        // SAFETY: kernel32 drive bitmask; no pointers.
+        unsafe { GetLogicalDrives() }
+    }
+    #[cfg(not(windows))]
+    {
+        0
+    }
+}
+
+/// Lettered / mounted volumes only — no MTP. May block on network shares.
+pub fn discover_lettered() -> Vec<Volume> {
+    #[cfg(windows)]
+    {
+        discover_windows_lettered()
     }
     #[cfg(not(windows))]
     {
         discover_unix()
     }
+}
+
+/// Portable devices (phones, cameras) with no drive letter.
+pub fn discover_mtp_devices() -> Vec<Volume> {
+    crate::mtp::devices()
+        .into_iter()
+        .map(|d| Volume {
+            path: d.root(),
+            name: d.name,
+            kind: VolumeKind::Device,
+            free: d.free,
+            total: d.total,
+        })
+        .collect()
+}
+
+/// Merge lettered volumes with MTP devices, keeping Drive → Device → Network
+/// order and inserting MTP ahead of network shares.
+pub fn merge_lettered_and_mtp(mut lettered: Vec<Volume>, mtp: Vec<Volume>) -> Vec<Volume> {
+    let network_start = lettered
+        .iter()
+        .position(|v| v.kind == VolumeKind::Network)
+        .unwrap_or(lettered.len());
+    lettered.splice(network_start..network_start, mtp);
+    lettered
+}
+
+/// Mounted volumes: lettered drives plus MTP. May block on network shares.
+pub fn discover() -> Vec<Volume> {
+    merge_lettered_and_mtp(discover_lettered(), discover_mtp_devices())
 }
 
 /// Desktop, Downloads, Documents, Pictures, Music, Videos (existing only).
@@ -61,12 +137,11 @@ pub fn default_quick_access() -> Vec<PathBuf> {
 }
 
 #[cfg(windows)]
-fn discover_windows() -> Vec<Volume> {
+fn discover_windows_lettered() -> Vec<Volume> {
     use std::os::windows::ffi::OsStrExt;
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
-        fn GetLogicalDrives() -> u32;
         fn GetDriveTypeW(root: *const u16) -> u32;
         fn GetDiskFreeSpaceExW(root: *const u16, free: *mut u64, total: *mut u64, free_tot: *mut u64) -> i32;
         fn GetVolumeInformationW(
@@ -82,8 +157,7 @@ fn discover_windows() -> Vec<Volume> {
     const CDROM: u32 = 5;
 
     let mut by_kind: [Vec<Volume>; 3] = Default::default();
-    // SAFETY: kernel32 drive bitmask.
-    let mask = unsafe { GetLogicalDrives() };
+    let mask = logical_drives_mask();
     for i in 0..26u32 {
         if mask & (1 << i) == 0 {
             continue;
@@ -146,14 +220,6 @@ fn discover_windows() -> Vec<Volume> {
         });
     }
     let [mut drives, mut devices, mut network] = by_kind;
-    // Phones and cameras have no drive letter, so they come from WPD instead.
-    devices.extend(crate::mtp::devices().into_iter().map(|d| Volume {
-        path: d.root(),
-        name: d.name,
-        kind: VolumeKind::Device,
-        free: d.free,
-        total: d.total,
-    }));
     drives.append(&mut devices);
     drives.append(&mut network);
     drives
@@ -243,6 +309,37 @@ mod tests {
                 assert!(v.total > 0, "{:?} total == 0", v.path);
             }
         }
+    }
+
+    #[test]
+    fn merge_keeps_mtp_before_network() {
+        let lettered = vec![
+            Volume {
+                name: "C".into(),
+                path: PathBuf::from(r"C:\"),
+                kind: VolumeKind::Drive,
+                free: 1,
+                total: 2,
+            },
+            Volume {
+                name: "N".into(),
+                path: PathBuf::from(r"Z:\"),
+                kind: VolumeKind::Network,
+                free: 1,
+                total: 2,
+            },
+        ];
+        let mtp = vec![Volume {
+            name: "Phone".into(),
+            path: PathBuf::from(r"\\MTP\abc"),
+            kind: VolumeKind::Device,
+            free: 0,
+            total: 0,
+        }];
+        let merged = merge_lettered_and_mtp(lettered, mtp);
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[1].name, "Phone");
+        assert_eq!(merged[2].kind, VolumeKind::Network);
     }
 
     #[test]

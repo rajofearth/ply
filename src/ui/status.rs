@@ -12,7 +12,7 @@ use crate::icons::Ico;
 /// Only shown inside a folder: counts, the filter, and the view toggle.
 pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
     let p = ply.palette();
-    let shown = ply.visible().len();
+    let shown = ply.visible_len();
     let selected = ply.selection.len();
 
     let left = match &ply.status {

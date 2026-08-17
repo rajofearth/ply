@@ -1,9 +1,10 @@
+use std::ops::Range;
 use std::path::PathBuf;
 
 use gpui::{
-    AnyElement, ClickEvent, Context, FontWeight, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, StatefulInteractiveElement, Styled, div,
-    prelude::FluentBuilder, px,
+    AnyElement, ClickEvent, Context, Div, FontWeight, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, Stateful, StatefulInteractiveElement, Styled, div,
+    prelude::FluentBuilder, px, uniform_list,
 };
 use gpui::AppContext;
 use gpui_component::Sizable;
@@ -13,52 +14,48 @@ use super::icon;
 use super::sidebar::{DragLabel, PinDrag};
 use crate::app::{LoadState, Ply, ViewMode};
 use crate::icons::Ico;
-use crate::listing::{Entry, format_mtime, format_size, kind_label};
+use crate::listing::{self, Entry, format_mtime, format_size, kind_label};
+use chrono::{DateTime, Local};
 
-/// The icon for an entry, chosen from its kind the way the design does.
+/// Icon for an entry — delegates to [`listing::entry_icon`] (no kind-label parsing).
 pub fn entry_icon(entry: &Entry) -> Ico {
-    if entry.is_directory() {
-        return Ico::Folder;
-    }
-    match kind_label(entry) {
-        k if k.contains("Image") || k == "Icon" => Ico::Image,
-        k if k.contains("Video") => Ico::Video,
-        k if k.contains("Audio") || k == "Playlist" => Ico::Music,
-        k if k.contains("Document") || k == "Source File" || k.contains("Workbook") => Ico::FileText,
-        _ => Ico::File,
-    }
+    listing::entry_icon(entry)
 }
 
 pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
     let p = ply.palette();
     let list_view = ply.view == ViewMode::List;
-    let entries = ply.visible();
+    let count = ply.visible_len();
 
-    let body: Vec<AnyElement> = match &ply.listing {
-        LoadState::Loading if entries.is_empty() => vec![message("Loading…", ply)],
-        LoadState::Failed(err) => vec![message(err.clone(), ply)],
-        _ if entries.is_empty() && !ply.filter_text.is_empty() => {
-            vec![message("Nothing matches that filter.", ply)]
-        }
-        _ if entries.is_empty() => vec![message("This folder is empty.", ply)],
-        _ if list_view => entries
-            .iter()
-            .enumerate()
-            .map(|(ix, e)| list_row(ply, e, ix, cx))
-            .collect(),
-        _ => vec![
-            div()
-                .flex()
-                .flex_wrap()
-                .gap(px(4.))
-                .children(
-                    entries
+    // The list view is virtualized: `uniform_list` scrolls itself and only asks
+    // for the rows it is about to paint, so it must not sit inside another
+    // scroll area. Grid stays a plain wrapped flow for now.
+    let body: AnyElement = match empty_message(ply, count) {
+        Some(text) => scroll_area(list_view).child(text).into_any_element(),
+        None if list_view => uniform_list(
+            "entries",
+            count,
+            cx.processor(|this, range: Range<usize>, _window, cx| {
+                let now = Local::now();
+                let entries = this.visible();
+                range
+                    .filter_map(|ix| entries.get(ix).map(|e| list_row(this, e, ix, now, cx)))
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .flex_1()
+        .min_h_0()
+        .into_any_element(),
+        None => scroll_area(list_view)
+            .child(
+                div().flex().flex_wrap().gap(px(4.)).children(
+                    ply.visible()
                         .iter()
                         .enumerate()
                         .map(|(ix, e)| grid_cell(ply, e, ix, cx)),
-                )
-                .into_any_element(),
-        ],
+                ),
+            )
+            .into_any_element(),
     };
 
     div()
@@ -85,15 +82,28 @@ pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
                     .child(div().w(px(130.)).flex_none().child("Modified")),
             )
         })
-        .child(
-            div()
-                .id("entries")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .when(!list_view, |el| el.p(px(14.)))
-                .children(body),
-        )
+        .child(body)
+}
+
+/// Scrolling container for everything that is not the virtualized list.
+fn scroll_area(list_view: bool) -> Stateful<Div> {
+    div()
+        .id("entries")
+        .flex_1()
+        .min_h_0()
+        .overflow_y_scroll()
+        .when(!list_view, |el| el.p(px(14.)))
+}
+
+/// The placeholder shown instead of rows, if there are no rows to show.
+fn empty_message(ply: &Ply, count: usize) -> Option<AnyElement> {
+    match &ply.listing {
+        LoadState::Loading if count == 0 => Some(message("Loading…", ply)),
+        LoadState::Failed(err) => Some(message(err.clone(), ply)),
+        _ if count > 0 => None,
+        _ if !ply.filter_text.is_empty() => Some(message("Nothing matches that filter.", ply)),
+        _ => Some(message("This folder is empty.", ply)),
+    }
 }
 
 fn message(text: impl Into<gpui::SharedString>, ply: &Ply) -> AnyElement {
@@ -105,7 +115,13 @@ fn message(text: impl Into<gpui::SharedString>, ply: &Ply) -> AnyElement {
         .into_any_element()
 }
 
-fn list_row(ply: &Ply, entry: &Entry, ix: usize, cx: &mut Context<Ply>) -> AnyElement {
+fn list_row(
+    ply: &Ply,
+    entry: &Entry,
+    ix: usize,
+    now: DateTime<Local>,
+    cx: &mut Context<Ply>,
+) -> AnyElement {
     let p = ply.palette();
     let selected = ply.is_selected(&entry.path);
     let renaming = ply.rename.as_ref().is_some_and(|r| r.path == entry.path);
@@ -176,7 +192,7 @@ fn list_row(ply: &Ply, entry: &Entry, ix: usize, cx: &mut Context<Ply>) -> AnyEl
                 .truncate()
                 .text_size(px(12.))
                 .text_color(p.muted_foreground)
-                .child(format_mtime(entry.modified)),
+                .child(format_mtime(entry.modified, now)),
         )
         .when(!renaming, |el| {
             el.on_click(activate(ix, path.clone(), cx))

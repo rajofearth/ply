@@ -112,31 +112,21 @@ fn icon_bytes(path: &str) -> Option<&'static [u8]> {
     })
 }
 
-/// Serves Ply's vendored lucide icons, falling back to gpui-component's assets.
+/// Serves Ply's vendored lucide icons only (no gpui-component asset pack).
 pub struct Assets;
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
-        if let Some(bytes) = icon_bytes(path) {
-            return Ok(Some(Cow::Borrowed(bytes)));
-        }
-        gpui_component_assets::Assets.load(path)
+        Ok(icon_bytes(path).map(Cow::Borrowed))
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
-        let mut paths: Vec<SharedString> = Ico::ALL
+        Ok(Ico::ALL
             .iter()
             .map(|ico| ico.path())
             .filter(|p| p.starts_with(path))
             .map(SharedString::from)
-            .collect();
-
-        for p in gpui_component_assets::Assets.list(path)? {
-            if !paths.iter().any(|ours| ours.as_ref() == p.as_ref()) {
-                paths.push(p);
-            }
-        }
-        Ok(paths)
+            .collect())
     }
 }
 

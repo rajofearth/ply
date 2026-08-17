@@ -1,7 +1,7 @@
 # Ply
 
-A desktop file explorer: a Home dashboard of Volumes, a static Sidebar, and one
-Location at a time in the centre pane.
+A desktop file explorer: a Home of Volumes, a static Sidebar, and one Location
+at a time in the centre pane.
 
 ## Language
 
@@ -66,9 +66,10 @@ Hand an Entry to the OS default app (file) or make it the Current Folder
 _Avoid_: launch, execute, preview
 
 **Properties**:
-The modal showing one Entry's or Volume's type, size, mtime, and location. It
-replaced the old preview pane; Ply never renders file contents.
-_Avoid_: details pane, inspector, preview
+The modal showing one Entry's or Volume's type, size, mtime, and Path. Built
+from a real Entry or Volume — never a stub. It replaced the old preview pane;
+Ply never renders file contents.
+_Avoid_: details pane, inspector, preview, Location (that word is navigation)
 
 **Hidden Entry**:
 An Entry with the platform hidden attribute or a leading `.`. Always excluded

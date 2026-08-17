@@ -1,7 +1,11 @@
 # Ply
 
-A GPUI file explorer: a Home dashboard of drives, a static sidebar, and one
-location at a time. Zero-hue neutral palette, sharp corners, lucide icons.
+A GPUI file explorer: a Home of Volumes, a static sidebar, and one location at
+a time. Zero-hue neutral palette, sharp corners, lucide icons. Properties is a
+modal (no preview pane). MTP devices are supported but limited — browse and
+open where the OS allows; richer MTP work is deferred. Release builds use a
+size-minded profile (thin LTO, size opts, strip); GPUI still dominates binary
+size and RAM.
 
 ## Run
 
@@ -11,6 +15,8 @@ Nightly Rust is required (GPUI uses `std::hint::cold_path`).
 cd P:\Projects\ply
 cargo run
 ```
+
+For a smaller binary: `cargo build --release`.
 
 ## Keys
 

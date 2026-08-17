@@ -4658,7 +4658,6 @@ dependencies = [
  "dirs",
  "gpui",
  "gpui-component",
- "gpui-component-assets",
  "gpui_platform",
  "libc",
  "notify",

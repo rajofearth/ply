@@ -13,7 +13,7 @@ pub fn open_with_os(path: &Path) -> Result<()> {
 
 /// Show the entry selected in the platform's own file manager.
 pub fn reveal(path: &Path) -> Result<()> {
-    if crate::mtp::is_mtp(path) {
+    if !crate::path_caps::for_path(path).reveal {
         bail!("A portable device has no folder to reveal.");
     }
     #[cfg(windows)]
@@ -30,7 +30,7 @@ pub fn reveal(path: &Path) -> Result<()> {
 /// `new_name` is a bare file name: anything path-like is rejected rather than
 /// silently moving the entry somewhere else.
 pub fn rename(path: &Path, new_name: &str) -> Result<PathBuf> {
-    if crate::mtp::is_mtp(path) {
+    if !crate::path_caps::for_path(path).rename {
         bail!("Renaming on a portable device is not supported.");
     }
     let new_name = new_name.trim();
@@ -62,8 +62,8 @@ pub fn delete_to_trash(paths: &[PathBuf]) -> Result<()> {
     if paths.is_empty() {
         return Ok(());
     }
-    if paths.iter().any(|p| crate::mtp::is_mtp(p)) {
-        bail!("A portable device has no Recycle Bin to move items to.");
+    if paths.iter().any(|p| !crate::path_caps::for_path(p).trash) {
+        bail!("A portable device has no Recycle Bin to move to.");
     }
     trash::delete_all(paths)?;
     Ok(())
