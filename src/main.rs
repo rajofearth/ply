@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod budget;
 mod fs_ops;
 mod icons;
 mod listing;

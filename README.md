@@ -7,16 +7,23 @@ open where the OS allows; richer MTP work is deferred. Release builds use a
 size-minded profile (thin LTO, size opts, strip); GPUI still dominates binary
 size and RAM.
 
-## Run
+## Commands
 
 Nightly Rust is required (GPUI uses `std::hint::cold_path`).
 
-```powershell
-cd P:\Projects\ply
-cargo run
-```
+| Command | Does |
+| --- | --- |
+| `cargo run` | Run the explorer (debug) |
+| `cargo run --release` | Run the size-minded release build |
+| `cargo build --release` | Build the release binary at `target/release/` |
+| `cargo check` | Fast type-check |
+| `cargo test` | Full suite |
+| `cargo test budgets_report -- --nocapture` | Print the binary / RAM budgets and gate the release size |
+| `cargo fmt` / `cargo clippy` | Format / lint |
 
-For a smaller binary: `cargo build --release`.
+The budget test fails the suite when a release binary exists and exceeds the
+size ceiling; set `PLY_BUDGET_REQUIRE_RELEASE=1` to also fail when no release
+binary is built yet.
 
 ## Keys
 
@@ -52,5 +59,6 @@ Bare-key shortcuts stand down while a text field has focus.
 Ply is mostly read-only, but Rename and Delete are real. Delete goes to the
 platform recycle bin and never deletes permanently.
 
-See [CONTEXT.md](CONTEXT.md) for the domain language and
+See [CONTEXT.md](CONTEXT.md) for the domain language,
+[AGENTS.md](AGENTS.md) for how coding agents should work in this repo, and
 [docs/adr](docs/adr) for decisions.
