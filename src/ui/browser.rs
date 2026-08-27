@@ -160,6 +160,19 @@ fn message(text: impl Into<gpui::SharedString>, ply: &Ply) -> AnyElement {
         .into_any_element()
 }
 
+/// Truncate a filename in the middle, showing the start and end with `…` in
+/// between, so the user can identify the file even when the label is clipped.
+fn truncate_middle(name: &str, max_chars: usize) -> String {
+    if name.len() <= max_chars {
+        return name.to_owned();
+    }
+    // Keep at least 3 chars on each side of the ellipsis.
+    let keep = (max_chars - 1) / 2;
+    let head: String = name.chars().take(keep).collect();
+    let tail: String = name.chars().rev().take(keep).collect::<Vec<_>>().into_iter().rev().collect();
+    format!("{head}…{tail}")
+}
+
 /// Shows a decoded media thumbnail when one is cached, otherwise the generic
 /// SVG icon. Triggers extraction on demand for image/video entries.
 fn icon_or_thumb(
@@ -292,7 +305,7 @@ fn grid_cell(ply: &Ply, entry: &Entry, ix: usize, cx: &mut Context<Ply>) -> AnyE
         .cursor_default()
         .when(selected, |el| el.bg(p.select_strong))
         .when(!selected, |el| el.hover(|s| s.bg(p.muted)))
-        .child(icon_or_thumb(ply, entry, 56., 28., cx))
+        .child(icon_or_thumb(ply, entry, 56., 56., cx))
         .map(|el| {
             if renaming {
                 el.child(rename_field(ply, cx))
@@ -300,9 +313,11 @@ fn grid_cell(ply: &Ply, entry: &Entry, ix: usize, cx: &mut Context<Ply>) -> AnyE
                 el.child(
                     div()
                         .w_full()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
                         .text_size(px(11.))
                         .line_height(px(14.))
-                        .child(entry.name.clone()),
+                        .child(truncate_middle(&entry.name, 12)),
                 )
             }
         })
