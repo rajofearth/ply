@@ -115,6 +115,46 @@ pub fn merge_lettered_and_mtp(mut lettered: Vec<Volume>, mtp: Vec<Volume>) -> Ve
     lettered
 }
 
+/// Re-query free/total for local `Drive` volumes, returning the ones whose
+/// numbers changed (with the fresh numbers). Network drives and MTP are never
+/// touched, so this never blocks on a hung share.
+#[cfg(windows)]
+pub fn refresh_local_sizes(volumes: &[Volume]) -> Vec<Volume> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(root: *const u16, free: *mut u64, total: *mut u64, free_tot: *mut u64) -> i32;
+    }
+
+    volumes
+        .iter()
+        .filter(|v| v.kind == VolumeKind::Drive)
+        .filter_map(|v| {
+            let wide: Vec<u16> = std::ffi::OsStr::new(&v.path)
+                .encode_wide()
+                .chain(Some(0))
+                .collect();
+            let (mut free, mut total, mut free_tot) = (0u64, 0u64, 0u64);
+            // SAFETY: valid locals.
+            let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, &mut total, &mut free_tot) };
+            (ok != 0 && total != 0).then_some((v, free, total))
+        })
+        .filter_map(|(v, free, total)| {
+            (v.free != free || v.total != total).then_some(Volume {
+                free,
+                total,
+                ..v.clone()
+            })
+        })
+        .collect()
+}
+
+#[cfg(not(windows))]
+pub fn refresh_local_sizes(_volumes: &[Volume]) -> Vec<Volume> {
+    Vec::new()
+}
+
 /// Mounted volumes: lettered drives plus MTP. May block on network shares.
 pub fn discover() -> Vec<Volume> {
     merge_lettered_and_mtp(discover_lettered(), discover_mtp_devices())
@@ -346,6 +386,21 @@ mod tests {
     fn quick_access_existing_dirs() {
         for p in default_quick_access() {
             assert!(p.is_dir(), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn refresh_local_sizes_never_touches_network_or_mtp() {
+        let volumes = vec![
+            Volume { name: "C".into(), path: PathBuf::from(r"C:\"), kind: VolumeKind::Drive, free: 10, total: 100 },
+            Volume { name: "N".into(), path: PathBuf::from(r"Z:\"), kind: VolumeKind::Network, free: 5, total: 10 },
+            Volume { name: "Phone".into(), path: PathBuf::from(r"\\MTP\abc"), kind: VolumeKind::Device, free: 0, total: 0 },
+        ];
+        // Nothing here changes on disk, so the guaranteed outcome is that
+        // unchanged local drives, plus all network/MTP, are never reported back.
+        let updated = refresh_local_sizes(&volumes);
+        for v in &updated {
+            assert_eq!(v.kind, VolumeKind::Drive, "only local drives refresh");
         }
     }
 }

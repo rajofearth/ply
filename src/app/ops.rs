@@ -112,7 +112,9 @@ impl Ply {
     pub(super) fn start_volume_poll(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             let mut last_mask = volumes::logical_drives_mask();
+            let mut ticks_since_sizes: u32 = 0;
             let mut ticks_since_mtp: u32 = 0;
+            const SIZES_EVERY_TICKS: u32 = 2; // ~3s at 1.5s/tick, home only
             const MTP_EVERY_TICKS: u32 = 7; // ~10.5s at 1.5s/tick
             loop {
                 cx.background_executor()
@@ -145,6 +147,42 @@ impl Ply {
                         break;
                     }
                     last_mask = mask;
+                }
+
+                // Keep local free-space sizes live while Home is showing, without
+                // re-querying network/MTP (which keep their own cadence below).
+                ticks_since_sizes = ticks_since_sizes.saturating_add(1);
+                if ticks_since_sizes >= SIZES_EVERY_TICKS {
+                    ticks_since_sizes = 0;
+                    let volumes = this
+                        .update(cx, |this, _| this.is_home().then(|| this.volumes.clone()))
+                        .ok()
+                        .flatten();
+                    if let Some(volumes) = volumes {
+                        let updated = cx
+                            .background_spawn(async move { volumes::refresh_local_sizes(&volumes) })
+                            .await;
+                        this.update(cx, |this, cx| {
+                            // `refresh_local_sizes` returns only changed volumes;
+                            // nothing to paint when it's empty, so skip the
+                            // re-render (Home should stay idle otherwise).
+                            if updated.is_empty() {
+                                return;
+                            }
+                            for v in updated {
+                                if let Some(slot) = this
+                                    .volumes
+                                    .iter_mut()
+                                    .find(|s| s.path == v.path && s.kind == v.kind)
+                                {
+                                    slot.free = v.free;
+                                    slot.total = v.total;
+                                }
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+                    }
                 }
 
                 ticks_since_mtp = ticks_since_mtp.saturating_add(1);
