@@ -1,0 +1,1713 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ply — Design Sheet</title>
+<style>
+  :root {
+    --bg: #0A0A0A;
+    --fg: #FAFAFA;
+    --card: #171717;
+    --muted: #262626;
+    --muted-fg: #A1A1A1;
+    --accent: #262626;
+    --border: rgba(255,255,255,0.1);
+    --destructive: #FF6467;
+    --sidebar: #171717;
+    --select: #333333;
+    --chart-track: #333333;
+    --font: 'Segoe UI Variable', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: var(--font);
+    background: var(--bg);
+    color: var(--fg);
+    font-size: 13px;
+    line-height: 1.5;
+    padding: 60px;
+    max-width: 1400px;
+    margin: 0 auto;
+  }
+
+  /* ── Header ────────────────────────────── */
+  .header {
+    display: flex;
+    align-items: baseline;
+    gap: 16px;
+    margin-bottom: 60px;
+    padding-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  .header h1 {
+    font-size: 32px;
+    font-weight: 600;
+    letter-spacing: -0.5px;
+  }
+  .header .subtitle {
+    font-size: 13px;
+    color: var(--muted-fg);
+  }
+
+  /* ── Section ───────────────────────────── */
+  .section {
+    margin-bottom: 56px;
+  }
+  .section-label {
+    font-size: 10px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+    color: var(--muted-fg);
+    margin-bottom: 20px;
+  }
+  .section-title {
+    font-size: 18px;
+    font-weight: 600;
+    margin-bottom: 8px;
+  }
+  .section-desc {
+    color: var(--muted-fg);
+    font-size: 13px;
+    margin-bottom: 24px;
+    max-width: 640px;
+    line-height: 1.6;
+  }
+
+  /* ── Color Swatches ────────────────────── */
+  .palette-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 12px;
+  }
+  .swatch {
+    border: 1px solid var(--border);
+    overflow: hidden;
+  }
+  .swatch-color {
+    height: 80px;
+    width: 100%;
+  }
+  .swatch-info {
+    padding: 10px 12px;
+    background: var(--card);
+  }
+  .swatch-name {
+    font-size: 12px;
+    font-weight: 500;
+    margin-bottom: 2px;
+  }
+  .swatch-hex {
+    font-size: 11px;
+    color: var(--muted-fg);
+    font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+  }
+  .swatch-oklch {
+    font-size: 10px;
+    color: var(--muted-fg);
+    font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+    opacity: 0.7;
+  }
+  .swatch-use {
+    font-size: 10px;
+    color: var(--muted-fg);
+    margin-top: 4px;
+  }
+
+  /* ── Typography Scale ──────────────────── */
+  .type-scale {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+  }
+  .type-row {
+    display: grid;
+    grid-template-columns: 100px 1fr 1fr;
+    align-items: baseline;
+    padding: 14px 0;
+    border-bottom: 1px solid var(--border);
+    gap: 24px;
+  }
+  .type-row:last-child { border-bottom: none; }
+  .type-size {
+    font-size: 11px;
+    color: var(--muted-fg);
+    font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+  }
+  .type-sample { font-family: var(--font); }
+  .type-usage {
+    font-size: 11px;
+    color: var(--muted-fg);
+  }
+
+  /* ── Icon Grid ─────────────────────────── */
+  .icon-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
+    gap: 8px;
+  }
+  .icon-cell {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 16px 8px 12px;
+    border: 1px solid var(--border);
+    background: var(--card);
+    gap: 8px;
+    transition: background 0.15s;
+  }
+  .icon-cell:hover { background: var(--muted); }
+  .icon-cell svg {
+    width: 20px;
+    height: 20px;
+    stroke: var(--fg);
+    fill: none;
+    stroke-width: 1.5;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  .icon-cell .icon-name {
+    font-size: 9px;
+    color: var(--muted-fg);
+    text-align: center;
+    line-height: 1.3;
+  }
+
+  /* ── Icon Sizes ────────────────────────── */
+  .icon-sizes {
+    display: flex;
+    align-items: flex-end;
+    gap: 24px;
+    margin-top: 24px;
+    padding: 24px;
+    border: 1px solid var(--border);
+    background: var(--card);
+  }
+  .icon-size-item {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+  }
+  .icon-size-item svg {
+    stroke: var(--fg);
+    fill: none;
+    stroke-width: 1.5;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  .icon-size-label {
+    font-size: 10px;
+    color: var(--muted-fg);
+    font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+  }
+  .icon-size-context {
+    font-size: 9px;
+    color: var(--muted-fg);
+    text-align: center;
+    max-width: 80px;
+  }
+
+  /* ── Component Demos ───────────────────── */
+  .component-row {
+    display: flex;
+    gap: 32px;
+    flex-wrap: wrap;
+    align-items: flex-start;
+  }
+  .component-demo {
+    border: 1px solid var(--border);
+    background: var(--card);
+    min-width: 240px;
+  }
+  .component-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--muted-fg);
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  /* Sidebar demo */
+  .sidebar-demo { width: 220px; }
+  .sidebar-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 12px;
+    font-size: 12.5px;
+    cursor: default;
+  }
+  .sidebar-row.active {
+    background: var(--accent);
+    font-weight: 500;
+    color: var(--fg);
+  }
+  .sidebar-row:not(.active) {
+    color: var(--muted-fg);
+  }
+  .sidebar-row:hover:not(.active) {
+    background: var(--muted);
+  }
+  .sidebar-row svg {
+    width: 14px; height: 14px;
+    stroke: currentColor; fill: none;
+    stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round;
+    flex-shrink: 0;
+  }
+  .sidebar-section {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--muted-fg);
+    padding: 12px 12px 4px;
+  }
+
+  /* List row demo */
+  .list-demo { min-width: 500px; flex: 1; }
+  .list-header {
+    display: grid;
+    grid-template-columns: 1fr 130px 80px 130px;
+    height: 28px;
+    align-items: center;
+    padding: 0 12px;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--muted-fg);
+    border-bottom: 1px solid var(--border);
+    gap: 16px;
+  }
+  .list-row {
+    display: grid;
+    grid-template-columns: 1fr 130px 80px 130px;
+    height: 29px;
+    align-items: center;
+    padding: 0 12px;
+    font-size: 12.5px;
+    border-bottom: 1px solid var(--border);
+    gap: 16px;
+  }
+  .list-row.selected {
+    background: var(--select);
+    font-weight: 500;
+  }
+  .list-row:hover:not(.selected) {
+    background: var(--muted);
+  }
+  .list-row .muted { color: var(--muted-fg); font-size: 12px; }
+  .list-name { display: flex; align-items: center; gap: 8px; }
+  .list-name svg {
+    width: 14px; height: 14px;
+    stroke: var(--muted-fg); fill: none;
+    stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round;
+    flex-shrink: 0;
+  }
+
+  /* Grid demo */
+  .grid-demo { min-width: 420px; }
+  .grid-cells {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 10px;
+  }
+  .grid-cell {
+    width: 96px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 10px 4px 8px;
+    gap: 6px;
+  }
+  .grid-cell.selected { background: var(--select); }
+  .grid-cell:hover:not(.selected) { background: var(--muted); }
+  .grid-thumb {
+    width: 60px;
+    height: 48px;
+    background: var(--muted);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .grid-thumb svg {
+    width: 28px; height: 28px;
+    stroke: var(--muted-fg); fill: none;
+    stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round;
+  }
+  .grid-thumb img {
+    width: 100%; height: 100%; object-fit: cover;
+  }
+  .grid-label {
+    font-size: 11px;
+    text-align: center;
+    line-height: 1.3;
+    max-width: 90px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* Context menu demo */
+  .context-demo { min-width: 220px; }
+  .context-toolbar {
+    display: flex;
+    gap: 2px;
+    padding: 6px;
+    border-bottom: 1px solid var(--border);
+  }
+  .context-toolbar-btn {
+    width: 32px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: none;
+  }
+  .context-toolbar-btn svg {
+    width: 16px; height: 16px;
+    stroke: var(--fg); fill: none;
+    stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round;
+  }
+  .context-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 12px;
+    height: 28px;
+    font-size: 12px;
+  }
+  .context-row:hover { background: var(--muted); }
+  .context-row svg {
+    width: 14px; height: 14px;
+    stroke: var(--muted-fg); fill: none;
+    stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round;
+    flex-shrink: 0;
+  }
+  .context-sep {
+    height: 1px;
+    background: var(--border);
+    margin: 4px 8px;
+  }
+  .context-shortcut {
+    margin-left: auto;
+    font-size: 11px;
+    color: var(--muted-fg);
+    font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+  }
+
+  /* Status bar demo */
+  .status-demo {
+    height: 26px;
+    display: flex;
+    align-items: center;
+    padding: 0 12px;
+    gap: 10px;
+    font-size: 11px;
+    color: var(--muted-fg);
+  }
+
+  /* Home card demo */
+  .home-cards {
+    display: flex;
+    gap: 12px;
+    padding: 20px;
+  }
+  .home-card {
+    width: 240px;
+    padding: 14px;
+    border: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    cursor: default;
+  }
+  .home-card:hover { background: var(--muted); }
+  .home-card-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    font-weight: 500;
+  }
+  .home-card-header svg {
+    width: 16px; height: 16px;
+    stroke: var(--fg); fill: none;
+    stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round;
+  }
+  .capacity-bar {
+    height: 4px;
+    background: var(--chart-track);
+    margin-top: 4px;
+  }
+  .capacity-fill {
+    height: 100%;
+    background: var(--muted-fg);
+  }
+  .home-card-stats {
+    font-size: 11px;
+    color: var(--muted-fg);
+    display: flex;
+    justify-content: space-between;
+  }
+
+  /* Properties demo */
+  .props-demo { min-width: 320px; }
+  .props-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+  }
+  .props-header-label {
+    font-size: 12px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--muted-fg);
+  }
+  .props-close {
+    width: 20px; height: 20px;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer;
+  }
+  .props-close svg {
+    width: 14px; height: 14px;
+    stroke: var(--muted-fg); fill: none;
+    stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round;
+  }
+  .props-filename {
+    font-size: 14px;
+    padding: 12px 14px 10px;
+  }
+  .props-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 6px 14px;
+    font-size: 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  .props-row-label { color: var(--muted-fg); }
+  .props-row-value { font-weight: 500; }
+
+  /* Capacity bar demo */
+  .capacity-demo {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    padding: 24px;
+    border: 1px solid var(--border);
+    background: var(--card);
+    max-width: 400px;
+  }
+  .capacity-row {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .capacity-label {
+    font-size: 12px;
+    font-weight: 500;
+  }
+  .capacity-track {
+    height: 4px;
+    background: var(--chart-track);
+  }
+  .capacity-bar-fill {
+    height: 100%;
+    background: var(--muted-fg);
+  }
+  .capacity-stats {
+    font-size: 11px;
+    color: var(--muted-fg);
+    display: flex;
+    justify-content: space-between;
+  }
+
+  /* ── Dimensions Table ──────────────────── */
+  .dim-table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+  .dim-table th, .dim-table td {
+    text-align: left;
+    padding: 8px 16px 8px 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+  }
+  .dim-table th {
+    font-weight: 500;
+    font-size: 11px;
+    color: var(--muted-fg);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .dim-table td:first-child { font-weight: 500; }
+  .dim-table .mono {
+    font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+    font-size: 11px;
+    color: var(--muted-fg);
+  }
+
+  /* ── Principles ────────────────────────── */
+  .principles {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 12px;
+  }
+  .principle {
+    border: 1px solid var(--border);
+    padding: 20px;
+    background: var(--card);
+  }
+  .principle-num {
+    font-size: 10px;
+    color: var(--muted-fg);
+    margin-bottom: 8px;
+    font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+  }
+  .principle-title {
+    font-size: 14px;
+    font-weight: 600;
+    margin-bottom: 6px;
+  }
+  .principle-desc {
+    font-size: 12px;
+    color: var(--muted-fg);
+    line-height: 1.5;
+  }
+
+  /* ── Spacing Scale ─────────────────────── */
+  .spacing-scale {
+    display: flex;
+    align-items: flex-end;
+    gap: 16px;
+    padding: 24px;
+    border: 1px solid var(--border);
+    background: var(--card);
+    flex-wrap: wrap;
+  }
+  .spacing-item {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+  }
+  .spacing-bar {
+    background: var(--muted-fg);
+    opacity: 0.3;
+    width: 24px;
+  }
+  .spacing-val {
+    font-size: 10px;
+    color: var(--muted-fg);
+    font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+  }
+
+  /* ── Radius demo ───────────────────────── */
+  .radius-demo {
+    display: flex;
+    gap: 24px;
+    align-items: center;
+    padding: 24px;
+    border: 1px solid var(--border);
+    background: var(--card);
+  }
+  .radius-box {
+    width: 80px;
+    height: 60px;
+    border: 2px solid var(--muted-fg);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    color: var(--muted-fg);
+  }
+
+  /* ── Two-col layout ────────────────────── */
+  .two-col {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 32px;
+  }
+
+  /* ── Divider ───────────────────────────── */
+  .divider {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 56px 0;
+  }
+
+  /* ── Titlebar Demo ─────────────────────── */
+  .titlebar-demo {
+    display: flex;
+    align-items: center;
+    height: 38px;
+    padding: 0 12px;
+    gap: 6px;
+    border-bottom: 1px solid var(--border);
+    background: var(--sidebar);
+  }
+  .tb-brand {
+    font-size: 13px;
+    font-weight: 600;
+    margin-right: 4px;
+  }
+  .tb-nav {
+    display: flex;
+    gap: 2px;
+    margin-right: 6px;
+  }
+  .tb-nav-btn {
+    width: 28px;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .tb-nav-btn svg {
+    width: 15px; height: 15px;
+    stroke: var(--muted-fg); fill: none;
+    stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round;
+  }
+  .tb-nav-btn.disabled { opacity: 0.4; }
+  .tb-breadcrumbs {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12.5px;
+    flex: 1;
+  }
+  .tb-crumb { font-weight: 500; color: var(--fg); }
+  .tb-crumb-sep {
+    width: 12px; height: 12px;
+    stroke: var(--muted-fg); fill: none;
+    stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round;
+  }
+  .tb-crumb-inactive { color: var(--muted-fg); }
+  .tb-controls {
+    display: flex;
+    gap: 2px;
+    margin-left: auto;
+  }
+  .tb-ctrl-btn {
+    width: 28px;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .tb-ctrl-btn svg {
+    width: 14px; height: 14px;
+    stroke: var(--fg); fill: none;
+    stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round;
+  }
+
+  /* ── File kind badges ──────────────────── */
+  .kind-grid {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .kind-badge {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    background: var(--card);
+    font-size: 11px;
+  }
+  .kind-badge svg {
+    width: 14px; height: 14px;
+    stroke: var(--muted-fg); fill: none;
+    stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round;
+  }
+</style>
+</head>
+<body>
+
+<!-- ════════════════════════════════════════════════════ -->
+<!-- HEADER                                              -->
+<!-- ════════════════════════════════════════════════════ -->
+<div class="header">
+  <h1>Ply</h1>
+  <span class="subtitle">Design Sheet — Visual Identity & System Reference</span>
+</div>
+
+<!-- ════════════════════════════════════════════════════ -->
+<!-- 01 — DESIGN PHILOSOPHY                             -->
+<!-- ════════════════════════════════════════════════════ -->
+<div class="section">
+  <div class="section-label">01 — Design Philosophy</div>
+  <div class="section-title">Core Principles</div>
+  <div class="section-desc">
+    Ply is a dense, dark-native desktop file explorer. Its visual language draws from the "Zeron" aesthetic — compact, achromatic, and utilitarian. Every design decision prioritises information density, fast scanning, and zero visual noise.
+  </div>
+  <div class="principles">
+    <div class="principle">
+      <div class="principle-num">01</div>
+      <div class="principle-title">Zero-Hue Achromatic</div>
+      <div class="principle-desc">The entire palette is greyscale. The only chromatic hue is <code>destructive</code> (red), reserved exclusively for Delete. Colour never communicates state — weight and contrast do.</div>
+    </div>
+    <div class="principle">
+      <div class="principle-num">02</div>
+      <div class="principle-title">Sharp Corners Everywhere</div>
+      <div class="principle-desc"><code>border-radius: 0</code> globally. The only exception is a 2px radius on media thumbnails in grid view. Ply rejects softness — it is precise, engineered, rectangular.</div>
+    </div>
+    <div class="principle">
+      <div class="principle-num">03</div>
+      <div class="principle-title">Native UI Font</div>
+      <div class="principle-desc">No custom font is bundled. Ply uses the platform's native typeface — Segoe UI Variable on Windows, SF Pro on macOS, Ubuntu on Linux — for instant rendering and OS integration.</div>
+    </div>
+    <div class="principle">
+      <div class="principle-num">04</div>
+      <div class="principle-title">State via Weight, Not Colour</div>
+      <div class="principle-desc">Active and selected states are communicated through <code>font-weight: 500</code> (Medium) and background contrast shifts. Hue shifts are never used for interactive state.</div>
+    </div>
+    <div class="principle">
+      <div class="principle-num">05</div>
+      <div class="principle-title">Dense, Compact Layout</div>
+      <div class="principle-desc">Row heights are 29px. Titlebar is 38px. Status bar is 26px. Every pixel is budgeted for maximum information density. Ply fits more on screen than any competitor.</div>
+    </div>
+    <div class="principle">
+      <div class="principle-num">06</div>
+      <div class="principle-title">OKLCH-Authored, sRGB-Delivered</div>
+      <div class="principle-desc">Tokens are authored in OKLCH (the perceptually uniform space behind shadcn/ui) and pre-converted to sRGB hex values for rendering. The OKLCH source is recorded alongside each value for provenance.</div>
+    </div>
+  </div>
+</div>
+
+<hr class="divider">
+
+<!-- ════════════════════════════════════════════════════ -->
+<!-- 02 — COLOUR PALETTE                                -->
+<!-- ════════════════════════════════════════════════════ -->
+<div class="section">
+  <div class="section-label">02 — Colour Palette</div>
+  <div class="section-title">Dark Mode (Default)</div>
+  <div class="section-desc">Ply defaults to dark mode. The palette is derived from shadcn's OKLCH neutral base, pre-converted to sRGB.</div>
+  <div class="palette-grid">
+    <div class="swatch">
+      <div class="swatch-color" style="background:#0A0A0A"></div>
+      <div class="swatch-info">
+        <div class="swatch-name">background</div>
+        <div class="swatch-hex">#0A0A0A</div>
+        <div class="swatch-oklch">oklch(0.145 0 0)</div>
+        <div class="swatch-use">Main window background</div>
+      </div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background:#FAFAFA"></div>
+      <div class="swatch-info">
+        <div class="swatch-name">foreground</div>
+        <div class="swatch-hex">#FAFAFA</div>
+        <div class="swatch-oklch">oklch(0.985 0 0)</div>
+        <div class="swatch-use">Primary text</div>
+      </div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background:#171717"></div>
+      <div class="swatch-info">
+        <div class="swatch-name">card / sidebar</div>
+        <div class="swatch-hex">#171717</div>
+        <div class="swatch-oklch">oklch(0.205 0 0)</div>
+        <div class="swatch-use">Card, dialog, sidebar surfaces</div>
+      </div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background:#262626"></div>
+      <div class="swatch-info">
+        <div class="swatch-name">muted / accent</div>
+        <div class="swatch-hex">#262626</div>
+        <div class="swatch-oklch">oklch(0.269 0 0)</div>
+        <div class="swatch-use">Hover fill, active row bg</div>
+      </div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background:#333333"></div>
+      <div class="swatch-info">
+        <div class="swatch-name">select / chart track</div>
+        <div class="swatch-hex">#333333</div>
+        <div class="swatch-oklch">oklch(0.32 0 0)</div>
+        <div class="swatch-use">Selected row, capacity bar track</div>
+      </div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background:#A1A1A1"></div>
+      <div class="swatch-info">
+        <div class="swatch-name">muted foreground / chart bar</div>
+        <div class="swatch-hex">#A1A1A1</div>
+        <div class="swatch-oklch">oklch(0.708 0 0)</div>
+        <div class="swatch-use">Secondary text, inactive icons, bar fill</div>
+      </div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background:rgba(255,255,255,0.1)"></div>
+      <div class="swatch-info">
+        <div class="swatch-name">border</div>
+        <div class="swatch-hex">rgba(255,255,255,0.1)</div>
+        <div class="swatch-oklch">oklch(1 0 0 / 10%)</div>
+        <div class="swatch-use">All panel/row/separator borders</div>
+      </div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background:#FF6467"></div>
+      <div class="swatch-info">
+        <div class="swatch-name">destructive</div>
+        <div class="swatch-hex">#FF6467</div>
+        <div class="swatch-oklch">oklch(0.704 0.191 22.2)</div>
+        <div class="swatch-use">Delete actions — the ONLY hue</div>
+      </div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background:rgba(0,0,0,0.4)"></div>
+      <div class="swatch-info">
+        <div class="swatch-name">overlay</div>
+        <div class="swatch-hex">hsla(0, 0, 0, 0.4)</div>
+        <div class="swatch-oklch">—</div>
+        <div class="swatch-use">Scrim behind modals/dialogs</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <div class="section-title">Light Mode</div>
+  <div class="section-desc">The inverse scale. Same neutral origin, light surfaces with dark text.</div>
+  <div class="palette-grid">
+    <div class="swatch">
+      <div class="swatch-color" style="background:#FFFFFF; border: 1px solid var(--border)"></div>
+      <div class="swatch-info">
+        <div class="swatch-name">background / card</div>
+        <div class="swatch-hex">#FFFFFF</div>
+        <div class="swatch-oklch">oklch(1 0 0)</div>
+        <div class="swatch-use">Main surfaces</div>
+      </div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background:#0A0A0A"></div>
+      <div class="swatch-info">
+        <div class="swatch-name">foreground</div>
+        <div class="swatch-hex">#0A0A0A</div>
+        <div class="swatch-oklch">oklch(0.145 0 0)</div>
+        <div class="swatch-use">Primary text</div>
+      </div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background:#FAFAFA; border: 1px solid var(--border)"></div>
+      <div class="swatch-info">
+        <div class="swatch-name">sidebar</div>
+        <div class="swatch-hex">#FAFAFA</div>
+        <div class="swatch-oklch">oklch(0.985 0 0)</div>
+        <div class="swatch-use">Sidebar background</div>
+      </div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background:#F5F5F5; border: 1px solid var(--border)"></div>
+      <div class="swatch-info">
+        <div class="swatch-name">muted / accent</div>
+        <div class="swatch-hex">#F5F5F5</div>
+        <div class="swatch-oklch">oklch(0.97 0 0)</div>
+        <div class="swatch-use">Hover fill, active row bg</div>
+      </div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background:#E4E4E4; border: 1px solid var(--border)"></div>
+      <div class="swatch-info">
+        <div class="swatch-name">select_strong</div>
+        <div class="swatch-hex">#E4E4E4</div>
+        <div class="swatch-oklch">oklch(0.92 0 0)</div>
+        <div class="swatch-use">Selected row fill</div>
+      </div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background:#E5E5E5; border: 1px solid var(--border)"></div>
+      <div class="swatch-info">
+        <div class="swatch-name">border</div>
+        <div class="swatch-hex">#E5E5E5</div>
+        <div class="swatch-oklch">oklch(0.922 0 0)</div>
+        <div class="swatch-use">All borders, separators</div>
+      </div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background:#737373"></div>
+      <div class="swatch-info">
+        <div class="swatch-name">muted foreground</div>
+        <div class="swatch-hex">#737373</div>
+        <div class="swatch-oklch">oklch(0.556 0 0)</div>
+        <div class="swatch-use">Secondary text, inactive icons</div>
+      </div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background:#E7000B"></div>
+      <div class="swatch-info">
+        <div class="swatch-name">destructive</div>
+        <div class="swatch-hex">#E7000B</div>
+        <div class="swatch-oklch">oklch(0.577 0.245 27.3)</div>
+        <div class="swatch-use">Delete actions — the ONLY hue</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<hr class="divider">
+
+<!-- ════════════════════════════════════════════════════ -->
+<!-- 03 — TYPOGRAPHY                                    -->
+<!-- ════════════════════════════════════════════════════ -->
+<div class="section">
+  <div class="section-label">03 — Typography</div>
+  <div class="section-title">Type Scale</div>
+  <div class="section-desc">
+    Ply uses the platform's native UI font. No custom typeface is bundled. The scale is tight and purpose-built for dense information display.
+  </div>
+
+  <div style="margin-bottom: 16px; padding: 12px 16px; border: 1px solid var(--border); background: var(--card);">
+    <div style="font-size: 11px; color: var(--muted-fg); margin-bottom: 4px; font-weight: 500;">FONT STACK</div>
+    <div style="font-size: 12px; font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace; color: var(--muted-fg);">
+      Windows: <span style="color:var(--fg)">Segoe UI Variable</span> → Segoe UI → Tahoma → Arial<br>
+      macOS: <span style="color:var(--fg)">.SystemUIFont</span> → SF Pro Text → Helvetica Neue → Arial<br>
+      Linux: <span style="color:var(--fg)">Ubuntu</span> → Roboto → DejaVu Sans → Helvetica → Arial
+    </div>
+  </div>
+
+  <div class="type-scale">
+    <div class="type-row">
+      <div class="type-size">10px</div>
+      <div class="type-sample" style="font-size:10px; text-transform:uppercase; letter-spacing:1.2px;">Section Labels</div>
+      <div class="type-usage">Sidebar headings, uppercase section labels</div>
+    </div>
+    <div class="type-row">
+      <div class="type-size">11px</div>
+      <div class="type-sample" style="font-size:11px">Status bar · List headers · Drive card stats</div>
+      <div class="type-usage">Status bar, list column headers, grid cell labels</div>
+    </div>
+    <div class="type-row">
+      <div class="type-size">12px</div>
+      <div class="type-sample" style="font-size:12px">Menu items · List row secondary columns · Properties labels</div>
+      <div class="type-usage">Menu items, context menu items, properties dialog labels</div>
+    </div>
+    <div class="type-row">
+      <div class="type-size">12.5px</div>
+      <div class="type-sample" style="font-size:12.5px; font-weight:500">Sidebar rows · Breadcrumbs · List row names</div>
+      <div class="type-usage">Title bar text, sidebar row text, breadcrumbs, list row names</div>
+    </div>
+    <div class="type-row">
+      <div class="type-size">13px</div>
+      <div class="type-sample" style="font-size:13px">Root body text · Home card drive names</div>
+      <div class="type-usage">Base font size (body), home card labels</div>
+    </div>
+    <div class="type-row">
+      <div class="type-size">14px</div>
+      <div class="type-sample" style="font-size:14px">Properties filename · Menu icons (14px)</div>
+      <div class="type-usage">Properties dialog filename, context menu icons</div>
+    </div>
+  </div>
+
+  <div style="margin-top: 24px;">
+    <div class="section-label" style="margin-bottom: 12px;">Font Weights</div>
+    <div style="display: flex; gap: 24px; flex-wrap: wrap;">
+      <div style="padding: 16px; border: 1px solid var(--border); background: var(--card); min-width: 200px;">
+        <div style="font-size: 10px; color: var(--muted-fg); margin-bottom: 6px;">DEFAULT (400)</div>
+        <div style="font-size: 16px;">Normal body text</div>
+      </div>
+      <div style="padding: 16px; border: 1px solid var(--border); background: var(--card); min-width: 200px;">
+        <div style="font-size: 10px; color: var(--muted-fg); margin-bottom: 6px;">MEDIUM (500)</div>
+        <div style="font-size: 16px; font-weight: 500;">Active rows · Selected items · Bold menu items</div>
+      </div>
+      <div style="padding: 16px; border: 1px solid var(--border); background: var(--card); min-width: 200px;">
+        <div style="font-size: 10px; color: var(--muted-fg); margin-bottom: 6px;">SEMIBOLD (600)</div>
+        <div style="font-size: 16px; font-weight: 600;">"Ply" brand name in titlebar only</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<hr class="divider">
+
+<!-- ════════════════════════════════════════════════════ -->
+<!-- 04 — ICONS                                         -->
+<!-- ════════════════════════════════════════════════════ -->
+<div class="section">
+  <div class="section-label">04 — Iconography</div>
+  <div class="section-title">Lucide Icons (v1.31.0)</div>
+  <div class="section-desc">
+    All icons are vendored Lucide SVGs with <code>stroke="currentColor"</code>. They are tinted at render time via the text color. No dependency on gpui-component's icon pack. Stroke width: 1.5px. Line cap & join: round.
+  </div>
+
+  <div class="icon-grid">
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><path d="M15 6H9v12h6"/><path d="M12 3v18"/></svg>
+      <div class="icon-name">ChevronRight</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg>
+      <div class="icon-name">ChevronDown</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>
+      <div class="icon-name">Folder</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>
+      <div class="icon-name">Image</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+      <div class="icon-name">Music</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><path d="m22 8-6 4 6 4V8Z"/><rect width="14" height="12" x="2" y="6" rx="2" ry="2"/></svg>
+      <div class="icon-name">Video</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><line x1="22" x2="2" y1="12" y2="12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/><line x1="6" x2="6.01" y1="16" y2="16"/><line x1="10" x2="10.01" y1="16" y2="16"/></svg>
+      <div class="icon-name">HardDrive</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+      <div class="icon-name">Search</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="14" y="3" rx="1"/><rect width="7" height="7" x="14" y="14" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/></svg>
+      <div class="icon-name">LayoutGrid</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><line x1="8" x2="21" y1="6" y2="6"/><line x1="8" x2="21" y1="12" y2="12"/><line x1="8" x2="21" y1="18" y2="18"/><line x1="3" x2="3.01" y1="6" y2="6"/><line x1="3" x2="3.01" y1="12" y2="12"/><line x1="3" x2="3.01" y1="18" y2="18"/></svg>
+      <div class="icon-name">List</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9,22 9,12 15,12 15,22"/></svg>
+      <div class="icon-name">Home</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><path d="m12 19-7-7 7-7"/><path d="M19 12H5"/></svg>
+      <div class="icon-name">ArrowLeft</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+      <div class="icon-name">ArrowRight</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>
+      <div class="icon-name">Sun</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
+      <div class="icon-name">Moon</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><path d="M5 12h14"/></svg>
+      <div class="icon-name">Minus</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><rect width="14" height="14" x="5" y="5" rx="2"/></svg>
+      <div class="icon-name">Square</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+      <div class="icon-name">X</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M7 7h3"/><path d="M7 12h10"/><path d="M7 17h10"/></svg>
+      <div class="icon-name">Usb</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" x2="6.01" y1="6" y2="6"/><line x1="6" x2="6.01" y1="18" y2="18"/></svg>
+      <div class="icon-name">Network</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/></svg>
+      <div class="icon-name">File</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><line x1="16" x2="8" y1="13" y2="13"/><line x1="16" x2="8" y1="17" y2="17"/><line x1="10" x2="8" y1="9" y2="9"/></svg>
+      <div class="icon-name">FileText</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="3"/><path d="M8.12 8.12 12 12"/><path d="M20 4 8.12 15.88"/><circle cx="6" cy="18" r="3"/><path d="M14.8 14.8 20 20"/></svg>
+      <div class="icon-name">Scissors</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+      <div class="icon-name">Copy</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>
+      <div class="icon-name">Pencil</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>
+      <div class="icon-name">Trash</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6a1 1 0 0 1 1-1 1 1 0 0 0 1-1V4a2 2 0 0 0-2-2H9a2 2 0 0 0-2 2v1a1 1 0 0 0 1 1 1 1 0 0 1 1 1z"/></svg>
+      <div class="icon-name">Pin</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>
+      <div class="icon-name">Info</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><path d="M12 10v6"/><path d="M9 13h6"/><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>
+      <div class="icon-name">FolderPlus</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><path d="m16 18 2 2 4-4"/><path d="M21 11.3V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h6"/><path d="m12 12 4 10 1.7-6.3L21 16"/></svg>
+      <div class="icon-name">ClipboardPaste</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" x2="20" y1="19" y2="19"/></svg>
+      <div class="icon-name">Terminal</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg>
+      <div class="icon-name">Shield</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>
+      <div class="icon-name">ExternalLink</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>
+      <div class="icon-name">Refresh</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/></svg>
+      <div class="icon-name">ArrowUpDown</div>
+    </div>
+    <div class="icon-cell">
+      <svg viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg>
+      <div class="icon-name">Check</div>
+    </div>
+  </div>
+
+  <div class="section-label" style="margin-top: 24px;">Icon Size Scale</div>
+  <div class="icon-sizes">
+    <div class="icon-size-item">
+      <svg width="10" height="10" viewBox="0 0 24 24"><path d="M15 6H9v12h6"/></svg>
+      <div class="icon-size-label">10px</div>
+      <div class="icon-size-context">Sort chevron</div>
+    </div>
+    <div class="icon-size-item">
+      <svg width="11" height="11" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg>
+      <div class="icon-size-label">11px</div>
+      <div class="icon-size-context">Sidebar branch</div>
+    </div>
+    <div class="icon-size-item">
+      <svg width="12" height="12" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+      <div class="icon-size-label">12px</div>
+      <div class="icon-size-context">Breadcrumbs · Search · Toggles</div>
+    </div>
+    <div class="icon-size-item">
+      <svg width="13" height="13" viewBox="0 0 24 24"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
+      <div class="icon-size-label">13px</div>
+      <div class="icon-size-context">Theme toggle</div>
+    </div>
+    <div class="icon-size-item">
+      <svg width="14" height="14" viewBox="0 0 24 24"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>
+      <div class="icon-size-label">14px</div>
+      <div class="icon-size-context">Sidebar rows · Nav · Menus · Window controls</div>
+    </div>
+    <div class="icon-size-item">
+      <svg width="15" height="15" viewBox="0 0 24 24"><path d="m12 19-7-7 7-7"/><path d="M19 12H5"/></svg>
+      <div class="icon-size-label">15px</div>
+      <div class="icon-size-context">Back/forward nav</div>
+    </div>
+    <div class="icon-size-item">
+      <svg width="16" height="16" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+      <div class="icon-size-label">16px</div>
+      <div class="icon-size-context">Context menu toolbar · Home card icons</div>
+    </div>
+    <div class="icon-size-item">
+      <svg width="28" height="28" viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/></svg>
+      <div class="icon-size-label">28px</div>
+      <div class="icon-size-context">Grid cell fallback</div>
+    </div>
+  </div>
+
+  <div class="section-label" style="margin-top: 24px;">File Kind Icons</div>
+  <div class="kind-grid">
+    <div class="kind-badge">
+      <svg viewBox="0 0 24 24"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>
+      Directory
+    </div>
+    <div class="kind-badge">
+      <svg viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/></svg>
+      File
+    </div>
+    <div class="kind-badge">
+      <svg viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><line x1="16" x2="8" y1="13" y2="13"/><line x1="16" x2="8" y1="17" y2="17"/></svg>
+      Document
+    </div>
+    <div class="kind-badge">
+      <svg viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>
+      Image
+    </div>
+    <div class="kind-badge">
+      <svg viewBox="0 0 24 24"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+      Audio
+    </div>
+    <div class="kind-badge">
+      <svg viewBox="0 0 24 24"><path d="m22 8-6 4 6 4V8Z"/><rect width="14" height="12" x="2" y="6" rx="2" ry="2"/></svg>
+      Video
+    </div>
+    <div class="kind-badge">
+      <svg viewBox="0 0 24 24"><line x1="22" x2="2" y1="12" y2="12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>
+      Drive
+    </div>
+    <div class="kind-badge">
+      <svg viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M7 7h3"/><path d="M7 12h10"/><path d="M7 17h10"/></svg>
+      Removable
+    </div>
+    <div class="kind-badge">
+      <svg viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" x2="6.01" y1="6" y2="6"/><line x1="6" x2="6.01" y1="18" y2="18"/></svg>
+      Network
+    </div>
+  </div>
+</div>
+
+<hr class="divider">
+
+<!-- ════════════════════════════════════════════════════ -->
+<!-- 05 — DIMENSIONS & SPACING                          -->
+<!-- ════════════════════════════════════════════════════ -->
+<div class="section">
+  <div class="section-label">05 — Dimensions & Spacing</div>
+  <div class="section-title">Layout Dimensions</div>
+
+  <div class="two-col">
+    <div>
+      <div class="section-label" style="margin-bottom: 12px;">Window & Regions</div>
+      <table class="dim-table">
+        <tr><th>Element</th><th>Value</th></tr>
+        <tr><td>Window size</td><td class="mono">1280 × 800</td></tr>
+        <tr><td>Titlebar height</td><td class="mono">38px</td></tr>
+        <tr><td>Sidebar width</td><td class="mono">220px</td></tr>
+        <tr><td>Status bar height</td><td class="mono">26px</td></tr>
+        <tr><td>List header height</td><td class="mono">28px</td></tr>
+        <tr><td>List row height</td><td class="mono">29px</td></tr>
+        <tr><td>Grid cell width</td><td class="mono">96px</td></tr>
+        <tr><td>Home card width</td><td class="mono">240px</td></tr>
+        <tr><td>Filter input width</td><td class="mono">170px</td></tr>
+        <tr><td>Properties dialog</td><td class="mono">320px</td></tr>
+        <tr><td>Context menu item</td><td class="mono">28px h</td></tr>
+        <tr><td>Context menu toolbar</td><td class="mono">32 × 32px</td></tr>
+      </table>
+    </div>
+    <div>
+      <div class="section-label" style="margin-bottom: 12px;">List Column Widths</div>
+      <table class="dim-table">
+        <tr><th>Column</th><th>Width</th></tr>
+        <tr><td>Name</td><td class="mono">flex (grows)</td></tr>
+        <tr><td>Kind</td><td class="mono">130px</td></tr>
+        <tr><td>Size</td><td class="mono">80px</td></tr>
+        <tr><td>Modified</td><td class="mono">130px</td></tr>
+      </table>
+
+      <div class="section-label" style="margin-top: 24px; margin-bottom: 12px;">Border Radius</div>
+      <div class="radius-demo">
+        <div class="radius-box" style="border-radius: 0">0px</div>
+        <div style="font-size: 12px; color: var(--muted-fg);">Global default. Only exception: <code>2px</code> on media thumbnails in grid view.</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="section-label" style="margin-top: 32px;">Spacing Scale</div>
+  <div class="spacing-scale">
+    <div class="spacing-item"><div class="spacing-bar" style="height:1px"></div><div class="spacing-val">1px</div><div style="font-size:9px;color:var(--muted-fg);text-align:center">Separator</div></div>
+    <div class="spacing-item"><div class="spacing-bar" style="height:2px"></div><div class="spacing-val">2px</div><div style="font-size:9px;color:var(--muted-fg);text-align:center">Toolbar gap</div></div>
+    <div class="spacing-item"><div class="spacing-bar" style="height:3px"></div><div class="spacing-val">3px</div><div style="font-size:9px;color:var(--muted-fg);text-align:center">Input pad-y</div></div>
+    <div class="spacing-item"><div class="spacing-bar" style="height:4px"></div><div class="spacing-val">4px</div><div style="font-size:9px;color:var(--muted-fg);text-align:center">Section pad</div></div>
+    <div class="spacing-item"><div class="spacing-bar" style="height:5px"></div><div class="spacing-val">5px</div><div style="font-size:9px;color:var(--muted-fg);text-align:center">Sidebar row-y</div></div>
+    <div class="spacing-item"><div class="spacing-bar" style="height:6px"></div><div class="spacing-val">6px</div><div style="font-size:9px;color:var(--muted-fg);text-align:center">Gap (tiny)</div></div>
+    <div class="spacing-item"><div class="spacing-bar" style="height:8px"></div><div class="spacing-val">8px</div><div style="font-size:9px;color:var(--muted-fg);text-align:center">Gap (small)</div></div>
+    <div class="spacing-item"><div class="spacing-bar" style="height:10px"></div><div class="spacing-val">10px</div><div style="font-size:9px;color:var(--muted-fg);text-align:center">Gap (medium)</div></div>
+    <div class="spacing-item"><div class="spacing-bar" style="height:12px"></div><div class="spacing-val">12px</div><div style="font-size:9px;color:var(--muted-fg);text-align:center">Pad-x (standard)</div></div>
+    <div class="spacing-item"><div class="spacing-bar" style="height:14px"></div><div class="spacing-val">14px</div><div style="font-size:9px;color:var(--muted-fg);text-align:center">Card pad</div></div>
+    <div class="spacing-item"><div class="spacing-bar" style="height:16px"></div><div class="spacing-val">16px</div><div style="font-size:9px;color:var(--muted-fg);text-align:center">Column gap</div></div>
+    <div class="spacing-item"><div class="spacing-bar" style="height:20px"></div><div class="spacing-val">20px</div><div style="font-size:9px;color:var(--muted-fg);text-align:center">Content pad</div></div>
+    <div class="spacing-item"><div class="spacing-bar" style="height:24px"></div><div class="spacing-val">24px</div><div style="font-size:9px;color:var(--muted-fg);text-align:center">Empty pad</div></div>
+  </div>
+</div>
+
+<hr class="divider">
+
+<!-- ════════════════════════════════════════════════════ -->
+<!-- 06 — COMPONENT PATTERNS                            -->
+<!-- ════════════════════════════════════════════════════ -->
+<div class="section">
+  <div class="section-label">06 — Component Patterns</div>
+  <div class="section-title">Interactive Demos</div>
+  <div class="section-desc">Each pattern follows the same token language. Borders are 1px everywhere. Hover = muted fill. Selection = select fill + weight 500.</div>
+
+  <!-- Titlebar -->
+  <div style="margin-bottom: 24px;">
+    <div class="component-label">Titlebar (38px)</div>
+    <div class="titlebar-demo">
+      <div class="tb-brand">Ply</div>
+      <div class="tb-nav">
+        <div class="tb-nav-btn disabled">
+          <svg viewBox="0 0 24 24"><path d="m12 19-7-7 7-7"/><path d="M19 12H5"/></svg>
+        </div>
+        <div class="tb-nav-btn disabled">
+          <svg viewBox="0 0 24 24"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+        </div>
+        <div class="tb-nav-btn">
+          <svg viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9,22 9,12 15,12 15,22"/></svg>
+        </div>
+      </div>
+      <div class="tb-breadcrumbs">
+        <span class="tb-crumb-inactive">This PC</span>
+        <svg class="tb-crumb-sep" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>
+        <span class="tb-crumb">Local Disk (C:)</span>
+        <svg class="tb-crumb-sep" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>
+        <span class="tb-crumb">Users</span>
+      </div>
+      <div style="margin-left: 8px;">
+        <svg width="13" height="13" viewBox="0 0 24 24" style="stroke:var(--muted-fg);fill:none;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>
+      </div>
+    </div>
+  </div>
+
+  <div class="component-row">
+    <!-- Sidebar -->
+    <div>
+      <div class="component-label">Sidebar (220px)</div>
+      <div class="component-demo sidebar-demo">
+        <div class="sidebar-section">Quick Access</div>
+        <div class="sidebar-row active">
+          <svg viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+          Home
+        </div>
+        <div class="sidebar-row">
+          <svg viewBox="0 0 24 24"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>
+          Documents
+        </div>
+        <div class="sidebar-row">
+          <svg viewBox="0 0 24 24"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>
+          Downloads
+        </div>
+        <div class="sidebar-section">This PC</div>
+        <div class="sidebar-row">
+          <svg viewBox="0 0 24 24"><line x1="22" x2="2" y1="12" y2="12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>
+          Local Disk (C:)
+        </div>
+        <div class="sidebar-row">
+          <svg viewBox="0 0 24 24"><line x1="22" x2="2" y1="12" y2="12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>
+          Data (D:)
+        </div>
+        <div class="sidebar-section">Devices & Network</div>
+        <div class="sidebar-row">
+          <svg viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M7 7h3"/><path d="M7 12h10"/><path d="M7 17h10"/></svg>
+          USB Drive (E:)
+        </div>
+      </div>
+    </div>
+
+    <!-- List View -->
+    <div style="flex: 1; min-width: 500px;">
+      <div class="component-label">List View</div>
+      <div class="component-demo list-demo">
+        <div class="list-header">
+          <span>Name</span>
+          <span>Kind</span>
+          <span>Size</span>
+          <span>Modified</span>
+        </div>
+        <div class="list-row">
+          <div class="list-name">
+            <svg viewBox="0 0 24 24"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>
+            Projects
+          </div>
+          <span class="muted">File folder</span>
+          <span class="muted">—</span>
+          <span class="muted">2026-08-25 14:30</span>
+        </div>
+        <div class="list-row selected">
+          <div class="list-name">
+            <svg viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/></svg>
+            README.md
+          </div>
+          <span class="muted">Markdown</span>
+          <span class="muted">4.2 KB</span>
+          <span class="muted">2026-08-26 09:15</span>
+        </div>
+        <div class="list-row">
+          <div class="list-name">
+            <svg viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>
+            screenshot.png
+          </div>
+          <span class="muted">PNG Image</span>
+          <span class="muted">1.8 MB</span>
+          <span class="muted">2026-08-24 18:42</span>
+        </div>
+        <div class="list-row">
+          <div class="list-name">
+            <svg viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><line x1="16" x2="8" y1="13" y2="13"/><line x1="16" x2="8" y1="17" y2="17"/></svg>
+            notes.txt
+          </div>
+          <span class="muted">Text Document</span>
+          <span class="muted">256 B</span>
+          <span class="muted">2026-08-20 11:03</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="component-row" style="margin-top: 24px;">
+    <!-- Grid View -->
+    <div>
+      <div class="component-label">Grid View</div>
+      <div class="component-demo grid-demo">
+        <div class="grid-cells">
+          <div class="grid-cell">
+            <div class="grid-thumb">
+              <svg viewBox="0 0 24 24"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>
+            </div>
+            <div class="grid-label">Documents</div>
+          </div>
+          <div class="grid-cell selected">
+            <div class="grid-thumb">
+              <svg viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>
+            </div>
+            <div class="grid-label">photo.jpg</div>
+          </div>
+          <div class="grid-cell">
+            <div class="grid-thumb">
+              <svg viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/></svg>
+            </div>
+            <div class="grid-label">data.csv</div>
+          </div>
+          <div class="grid-cell">
+            <div class="grid-thumb">
+              <svg viewBox="0 0 24 24"><path d="m22 8-6 4 6 4V8Z"/><rect width="14" height="12" x="2" y="6" rx="2" ry="2"/></svg>
+            </div>
+            <div class="grid-label">demo.mp4</div>
+          </div>
+          <div class="grid-cell">
+            <div class="grid-thumb">
+              <svg viewBox="0 0 24 24"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+            </div>
+            <div class="grid-label">track.mp3</div>
+          </div>
+          <div class="grid-cell">
+            <div class="grid-thumb">
+              <svg viewBox="0 0 24 24"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>
+            </div>
+            <div class="grid-label">Archive</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Context Menu -->
+    <div>
+      <div class="component-label">Context Menu</div>
+      <div class="component-demo context-demo">
+        <div class="context-toolbar">
+          <div class="context-toolbar-btn">
+            <svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="3"/><path d="M8.12 8.12 12 12"/><path d="M20 4 8.12 15.88"/><circle cx="6" cy="18" r="3"/><path d="M14.8 14.8 20 20"/></svg>
+          </div>
+          <div class="context-toolbar-btn">
+            <svg viewBox="0 0 24 24"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+          </div>
+          <div class="context-toolbar-btn">
+            <svg viewBox="0 0 24 24"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6a1 1 0 0 1 1-1 1 1 0 0 0 1-1V4a2 2 0 0 0-2-2H9a2 2 0 0 0-2 2v1a1 1 0 0 0 1 1 1 1 0 0 1 1 1z"/></svg>
+          </div>
+          <div class="context-toolbar-btn">
+            <svg viewBox="0 0 24 24"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>
+          </div>
+          <div class="context-toolbar-btn">
+            <svg viewBox="0 0 24 24"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>
+          </div>
+        </div>
+        <div class="context-row">
+          <svg viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/></svg>
+          Open
+          <span class="context-shortcut">Enter</span>
+        </div>
+        <div class="context-sep"></div>
+        <div class="context-row">
+          <svg viewBox="0 0 24 24"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>
+          Rename
+          <span class="context-shortcut">F2</span>
+        </div>
+        <div class="context-row">
+          <svg viewBox="0 0 24 24"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+          Copy
+          <span class="context-shortcut">Ctrl+C</span>
+        </div>
+        <div class="context-row">
+          <svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="3"/><path d="M8.12 8.12 12 12"/><path d="M20 4 8.12 15.88"/><circle cx="6" cy="18" r="3"/><path d="M14.8 14.8 20 20"/></svg>
+          Cut
+          <span class="context-shortcut">Ctrl+X</span>
+        </div>
+        <div class="context-sep"></div>
+        <div class="context-row" style="color: var(--destructive);">
+          <svg viewBox="0 0 24 24" style="stroke: var(--destructive)"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>
+          Delete
+          <span class="context-shortcut" style="color: var(--destructive)">Del</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Status Bar -->
+    <div style="min-width: 400px; flex: 1;">
+      <div class="component-label">Status Bar (26px)</div>
+      <div class="component-demo">
+        <div class="status-demo">
+          <span>4 items</span>
+          <span>·</span>
+          <span>1 selected</span>
+          <span style="margin-left: auto;">List view</span>
+        </div>
+      </div>
+
+      <div class="component-label" style="margin-top: 16px;">Capacity Bar</div>
+      <div class="capacity-demo">
+        <div class="capacity-row">
+          <div class="capacity-label">Local Disk (C:)</div>
+          <div class="capacity-track"><div class="capacity-bar-fill" style="width: 62%"></div></div>
+          <div class="capacity-stats"><span>186 GB used</span><span>300 GB</span></div>
+        </div>
+        <div class="capacity-row">
+          <div class="capacity-label">Data (D:)</div>
+          <div class="capacity-track"><div class="capacity-bar-fill" style="width: 35%"></div></div>
+          <div class="capacity-stats"><span>350 GB used</span><span>1 TB</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Home Cards -->
+  <div style="margin-top: 24px;">
+    <div class="component-label">Home Volume Cards</div>
+    <div class="component-demo" style="width: auto;">
+      <div class="home-cards">
+        <div class="home-card">
+          <div class="home-card-header">
+            <svg viewBox="0 0 24 24"><line x1="22" x2="2" y1="12" y2="12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/><line x1="6" x2="6.01" y1="16" y2="16"/><line x1="10" x2="10.01" y1="16" y2="16"/></svg>
+            Local Disk (C:)
+          </div>
+          <div class="capacity-bar"><div class="capacity-fill" style="width:62%"></div></div>
+          <div class="home-card-stats">
+            <span>186 GB free</span>
+            <span>300 GB</span>
+          </div>
+        </div>
+        <div class="home-card">
+          <div class="home-card-header">
+            <svg viewBox="0 0 24 24"><line x1="22" x2="2" y1="12" y2="12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/><line x1="6" x2="6.01" y1="16" y2="16"/><line x1="10" x2="10.01" y1="16" y2="16"/></svg>
+            Data (D:)
+          </div>
+          <div class="capacity-bar"><div class="capacity-fill" style="width:35%"></div></div>
+          <div class="home-card-stats">
+            <span>650 GB free</span>
+            <span>1 TB</span>
+          </div>
+        </div>
+        <div class="home-card">
+          <div class="home-card-header">
+            <svg viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M7 7h3"/><path d="M7 12h10"/><path d="M7 17h10"/></svg>
+            USB Drive (E:)
+          </div>
+          <div class="capacity-bar"><div class="capacity-fill" style="width:78%"></div></div>
+          <div class="home-card-stats">
+            <span>34 GB free</span>
+            <span>128 GB</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Properties Dialog -->
+  <div style="margin-top: 24px;">
+    <div class="component-label">Properties Dialog (320px)</div>
+    <div class="component-demo props-demo" style="box-shadow: 0 0 0 1px var(--border);">
+      <div class="props-header">
+        <div class="props-header-label">PROPERTIES</div>
+        <div class="props-close">
+          <svg viewBox="0 0 24 24"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+        </div>
+      </div>
+      <div class="props-filename">screenshot.png</div>
+      <div class="props-row">
+        <span class="props-row-label">Type</span>
+        <span class="props-row-value">PNG Image</span>
+      </div>
+      <div class="props-row">
+        <span class="props-row-label">Size</span>
+        <span class="props-row-value">1.8 MB</span>
+      </div>
+      <div class="props-row">
+        <span class="props-row-label">Modified</span>
+        <span class="props-row-value">Aug 24, 2026</span>
+      </div>
+      <div class="props-row" style="border-bottom: none;">
+        <span class="props-row-label">Path</span>
+        <span class="props-row-value" style="font-size:11px; font-family: 'SF Mono', monospace;">C:\Users\Pics</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<hr class="divider">
+
+<!-- ════════════════════════════════════════════════════ -->
+<!-- 07 — TECHNICAL REFERENCE                           -->
+<!-- ════════════════════════════════════════════════════ -->
+<div class="section">
+  <div class="section-label">07 — Technical Reference</div>
+  <div class="section-title">Rendering & Implementation Notes</div>
+
+  <div class="two-col">
+    <div>
+      <table class="dim-table">
+        <tr><th>Property</th><th>Value</th></tr>
+        <tr><td>Framework</td><td class="mono">GPUI (Zed fork v0.2.2)</td></tr>
+        <tr><td>Platform</td><td class="mono">gpui_platform (font-kit)</td></tr>
+        <tr><td>Components</td><td class="mono">Hand-rolled (Input only)</td></tr>
+        <tr><td>Icons</td><td class="mono">Lucide v1.31.0 (vendored SVGs)</td></tr>
+        <tr><td>Icon rendering</td><td class="mono">stroke="currentColor" + tint</td></tr>
+        <tr><td>Image format</td><td class="mono">SVG via include_bytes!</td></tr>
+        <tr><td>Thumbnails</td><td class="mono">image crate v0.25</td></tr>
+        <tr><td>Decorations</td><td class="mono">Client-side (custom titlebar)</td></tr>
+        <tr><td>App ID</td><td class="mono">app.ply.explorer</td></tr>
+        <tr><td>Default mode</td><td class="mono">Dark</td></tr>
+        <tr><td>Border radius</td><td class="mono">0 (sharp)</td></tr>
+        <tr><td>Shadow</td><td class="mono">shadow_lg on overlays only</td></tr>
+      </table>
+    </div>
+    <div>
+      <div class="section-label" style="margin-bottom: 12px;">Key Files</div>
+      <table class="dim-table">
+        <tr><th>File</th><th>Role</th></tr>
+        <tr><td class="mono">src/theme.rs</td><td>Design tokens (palette, font)</td></tr>
+        <tr><td class="mono">src/icons.rs</td><td>Icon enum + SVG manifest</td></tr>
+        <tr><td class="mono">src/ui/titlebar.rs</td><td>Titlebar component</td></tr>
+        <tr><td class="mono">src/ui/sidebar.rs</td><td>Sidebar component</td></tr>
+        <tr><td class="mono">src/ui/browser.rs</td><td>List + Grid views</td></tr>
+        <tr><td class="mono">src/ui/home.rs</td><td>Home volume cards</td></tr>
+        <tr><td class="mono">src/ui/overlay.rs</td><td>Context menu + Properties</td></tr>
+        <tr><td class="mono">src/ui/status.rs</td><td>Status bar</td></tr>
+        <tr><td class="mono">CONTEXT.md</td><td>Domain vocabulary</td></tr>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div style="margin-top: 56px; padding-top: 24px; border-top: 1px solid var(--border); text-align: center; color: var(--muted-fg); font-size: 11px;">
+  Ply Design Sheet — Generated from source code truth in <code>src/theme.rs</code>, <code>src/icons.rs</code>, and <code>CONTEXT.md</code>
+</div>
+
+</body>
+</html>
