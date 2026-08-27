@@ -39,6 +39,7 @@ subagents must ground themselves in the actual source/examples below before writ
 - before writing any GPUI code, read the relevant example file(s) above, not just this summary.
 - prefer gpui-component over raw GPUI primitives unless the task specifically requires low-level control.
 - if an API doesn't match what's in the examples, trust the examples over memory.
+- subagents and you too are required to read `unslop` n `blast radius` skiils if not available then https://github.com/cursor/plugins/tree/main/pstack/skills/.
 
 **change impact discipline**
 
