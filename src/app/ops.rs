@@ -319,6 +319,64 @@ impl Ply {
         cx.notify();
     }
 
+    /// Grid-aware arrow-key movement. `cols` is the estimated column count.
+    pub fn move_grid_selection(
+        &mut self,
+        cols: usize,
+        right: isize,
+        down: isize,
+        extend: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let paths: Vec<PathBuf> = self.visible().iter().map(|e| e.path.clone()).collect();
+        if paths.is_empty() || cols == 0 {
+            return;
+        }
+        let cur = self
+            .selection
+            .last()
+            .and_then(|last| paths.iter().position(|p| p == last))
+            .unwrap_or(0);
+        let row = cur / cols;
+        let col = cur % cols;
+        let total = paths.len();
+        let last_row_len = total.saturating_sub((total / cols) * cols);
+        let max_row = if last_row_len == 0 {
+            total / cols - 1
+        } else {
+            total / cols
+        };
+
+        // Horizontal first, then vertical.
+        let new_col = (col as isize + right).clamp(0, cols as isize - 1) as usize;
+        let new_row = (row as isize + down).clamp(0, max_row as isize) as usize;
+
+        // Clamp to actual row length (last row may be partial).
+        let row_len = if new_row == max_row {
+            let r = total - new_row * cols;
+            if r == 0 { cols } else { r }
+        } else {
+            cols
+        };
+        let new_col = new_col.min(row_len - 1);
+        let next = new_row * cols + new_col;
+
+        if extend {
+            let anchor = self.anchor.unwrap_or(cur);
+            let (lo, hi) = if anchor <= next {
+                (anchor, next)
+            } else {
+                (next, anchor)
+            };
+            self.replace_selection(paths[lo..=hi].to_vec());
+            self.anchor = Some(anchor);
+        } else {
+            self.replace_selection(vec![paths[next].clone()]);
+            self.anchor = Some(next);
+        }
+        cx.notify();
+    }
+
     pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
         self.clear_selection_paths();
         self.anchor = None;

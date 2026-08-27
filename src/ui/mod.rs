@@ -12,7 +12,7 @@ use gpui::{
     Styled, Svg, Window, actions, div, prelude::FluentBuilder, px, svg,
 };
 
-use crate::app::{Location, Ply, dismiss_topmost};
+use crate::app::{Location, Ply, ViewMode, dismiss_topmost};
 use crate::icons::Ico;
 use crate::theme;
 
@@ -30,8 +30,12 @@ actions!(
         DeleteSelection,
         SelectUp,
         SelectDown,
+        SelectLeft,
+        SelectRight,
         ExtendUp,
         ExtendDown,
+        ExtendLeft,
+        ExtendRight,
         Refresh,
         FocusFilter,
         CopySelectedPath,
@@ -67,6 +71,15 @@ pub fn section_label(text: &'static str, color: Hsla) -> impl IntoElement {
         .text_size(px(10.))
         .text_color(color)
         .child(text.to_uppercase())
+}
+
+/// Estimate the number of grid columns from the window width.
+const CELL_W: f32 = 96.;
+const CELL_GAP: f32 = 4.;
+const SIDEBAR_W: f32 = 220.;
+fn grid_cols(window: &Window) -> usize {
+    let avail = f32::from(window.viewport_size().width) - SIDEBAR_W;
+    ((avail / (CELL_W + CELL_GAP)).floor() as usize).max(1)
 }
 
 impl Render for Ply {
@@ -120,22 +133,66 @@ impl Render for Ply {
             }))
             .on_action(cx.listener(|this, _: &SelectUp, window, cx| {
                 if !this.typing(window, cx) {
-                    this.move_selection(-1, false, cx);
+                    if this.view == ViewMode::Grid {
+                        let cols = grid_cols(window);
+                        this.move_grid_selection(cols, 0, -1, false, cx);
+                    } else {
+                        this.move_selection(-1, false, cx);
+                    }
                 }
             }))
             .on_action(cx.listener(|this, _: &SelectDown, window, cx| {
                 if !this.typing(window, cx) {
-                    this.move_selection(1, false, cx);
+                    if this.view == ViewMode::Grid {
+                        let cols = grid_cols(window);
+                        this.move_grid_selection(cols, 0, 1, false, cx);
+                    } else {
+                        this.move_selection(1, false, cx);
+                    }
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SelectLeft, window, cx| {
+                if !this.typing(window, cx) && this.view == ViewMode::Grid {
+                    let cols = grid_cols(window);
+                    this.move_grid_selection(cols, -1, 0, false, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SelectRight, window, cx| {
+                if !this.typing(window, cx) && this.view == ViewMode::Grid {
+                    let cols = grid_cols(window);
+                    this.move_grid_selection(cols, 1, 0, false, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &ExtendUp, window, cx| {
                 if !this.typing(window, cx) {
-                    this.move_selection(-1, true, cx);
+                    if this.view == ViewMode::Grid {
+                        let cols = grid_cols(window);
+                        this.move_grid_selection(cols, 0, -1, true, cx);
+                    } else {
+                        this.move_selection(-1, true, cx);
+                    }
                 }
             }))
             .on_action(cx.listener(|this, _: &ExtendDown, window, cx| {
                 if !this.typing(window, cx) {
-                    this.move_selection(1, true, cx);
+                    if this.view == ViewMode::Grid {
+                        let cols = grid_cols(window);
+                        this.move_grid_selection(cols, 0, 1, true, cx);
+                    } else {
+                        this.move_selection(1, true, cx);
+                    }
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ExtendLeft, window, cx| {
+                if !this.typing(window, cx) && this.view == ViewMode::Grid {
+                    let cols = grid_cols(window);
+                    this.move_grid_selection(cols, -1, 0, true, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ExtendRight, window, cx| {
+                if !this.typing(window, cx) && this.view == ViewMode::Grid {
+                    let cols = grid_cols(window);
+                    this.move_grid_selection(cols, 1, 0, true, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &FocusFilter, window, cx| {

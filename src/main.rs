@@ -17,8 +17,9 @@ use gpui::{AppContext, KeyBinding, WindowBounds, WindowOptions, point, px, size}
 
 use app::Ply;
 use ui::{
-    Activate, BeginRename, CopySelectedPath, DeleteSelection, Dismiss, ExtendDown, ExtendUp,
-    FocusFilter, GoBack, GoForward, GoHome, GoUp, Refresh, SelectDown, SelectUp, ToggleTheme,
+    Activate, BeginRename, CopySelectedPath, DeleteSelection, Dismiss, ExtendDown, ExtendLeft,
+    ExtendRight, ExtendUp, FocusFilter, GoBack, GoForward, GoHome, GoUp, Refresh, SelectDown,
+    SelectLeft, SelectRight, SelectUp, ToggleTheme,
 };
 
 fn main() {
@@ -40,8 +41,12 @@ fn main() {
                 KeyBinding::new("delete", DeleteSelection, Some("Ply")),
                 KeyBinding::new("up", SelectUp, Some("Ply")),
                 KeyBinding::new("down", SelectDown, Some("Ply")),
+                KeyBinding::new("left", SelectLeft, Some("Ply")),
+                KeyBinding::new("right", SelectRight, Some("Ply")),
                 KeyBinding::new("shift-up", ExtendUp, Some("Ply")),
                 KeyBinding::new("shift-down", ExtendDown, Some("Ply")),
+                KeyBinding::new("shift-left", ExtendLeft, Some("Ply")),
+                KeyBinding::new("shift-right", ExtendRight, Some("Ply")),
                 KeyBinding::new("f5", Refresh, Some("Ply")),
                 KeyBinding::new("ctrl-f", FocusFilter, Some("Ply")),
                 KeyBinding::new("ctrl-c", CopySelectedPath, Some("Ply")),
