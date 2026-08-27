@@ -53,6 +53,7 @@ fn card(ply: &Ply, v: &Volume, cx: &mut Context<Ply>) -> AnyElement {
     let p = ply.palette();
     let ico = v.ico();
     let pct = v.pct_used();
+    let fill = if pct >= 81.0 { p.destructive } else { p.chart_bar };
     let path = v.path.clone();
     let id = super::stable_id(&v.path);
 
@@ -84,7 +85,7 @@ fn card(ply: &Ply, v: &Volume, cx: &mut Context<Ply>) -> AnyElement {
                 .h(px(4.))
                 .mb(px(6.))
                 .bg(p.chart_bar_track)
-                .child(div().h_full().w(gpui::relative(pct / 100.)).bg(p.chart_bar)),
+                .child(div().h_full().w(gpui::relative(pct / 100.)).bg(fill)),
         )
         .child(
             div()
