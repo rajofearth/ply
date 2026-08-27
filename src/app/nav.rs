@@ -51,6 +51,13 @@ impl Ply {
     }
 
     pub fn go_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .current_folder()
+            .is_some_and(crate::recycle_bin::is_recycle_bin)
+        {
+            // The Recycle Bin is not under any real folder.
+            return self.go_home(window, cx);
+        }
         match self.current_folder().and_then(Path::parent) {
             Some(parent) => {
                 let parent = parent.to_path_buf();
@@ -91,13 +98,19 @@ impl Ply {
             }
         }
         cx.notify();
+        self.update_window_title(window);
     }
-
-    /// Breadcrumb trail: display name plus the folder each crumb opens.
     pub fn crumbs(&self) -> Vec<(SharedString, PathBuf)> {
         let Some(folder) = self.current_folder() else {
             return Vec::new();
         };
+        if crate::recycle_bin::is_recycle_bin(folder) {
+            // A synthetic root has no meaningful ancestors; show it alone.
+            return vec![(
+                crate::recycle_bin::display_name().into(),
+                folder.to_path_buf(),
+            )];
+        }
         let mut crumbs: Vec<(SharedString, PathBuf)> = folder
             .ancestors()
             .map(|a| (self.display_name(a), a.to_path_buf()))
@@ -110,6 +123,9 @@ impl Ply {
     pub fn display_name(&self, path: &Path) -> SharedString {
         if let Some(v) = self.volumes.iter().find(|v| v.path == path) {
             return v.name.clone().into();
+        }
+        if crate::recycle_bin::is_recycle_bin(path) {
+            return crate::recycle_bin::display_name().into();
         }
         if let Some(name) = self.mtp_names.get(path) {
             return name.clone().into();

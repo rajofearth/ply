@@ -16,6 +16,9 @@ pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> Vec<AnyElement> {
     if let Some(dialog) = properties(ply, cx) {
         layers.push(dialog);
     }
+    if let Some(dialog) = confirm_dialog(ply, cx) {
+        layers.push(dialog);
+    }
     layers
 }
 
@@ -122,12 +125,7 @@ fn chrome(p: crate::theme::Palette) -> gpui::Div {
         .shadow_lg()
 }
 
-fn paint_rows(
-    ply: &Ply,
-    rows: &[MenuRow],
-    base: usize,
-    cx: &mut Context<Ply>,
-) -> Vec<AnyElement> {
+fn paint_rows(ply: &Ply, rows: &[MenuRow], base: usize, cx: &mut Context<Ply>) -> Vec<AnyElement> {
     let hair = ply.palette().border;
     rows.iter()
         .enumerate()
@@ -253,9 +251,9 @@ fn properties(ply: &Ply, cx: &mut Context<Ply>) -> Option<AnyElement> {
                                         .flex()
                                         .cursor_default()
                                         .child(icon(Ico::X, px(14.), p.muted_foreground))
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.close_properties(cx)
-                                        })),
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.close_properties(cx)),
+                                        ),
                                 ),
                         )
                         .child(
@@ -268,9 +266,10 @@ fn properties(ply: &Ply, cx: &mut Context<Ply>) -> Option<AnyElement> {
                                         .truncate()
                                         .child(props.name.clone()),
                                 )
-                                .children(rows.into_iter().map(|(label, value)| {
-                                    field(p, label, value)
-                                })),
+                                .children(
+                                    rows.into_iter()
+                                        .map(|(label, value)| field(p, label, value)),
+                                ),
                         ),
                 ),
         )
@@ -278,11 +277,7 @@ fn properties(ply: &Ply, cx: &mut Context<Ply>) -> Option<AnyElement> {
     )
 }
 
-fn field(
-    p: crate::theme::Palette,
-    label: &'static str,
-    value: gpui::SharedString,
-) -> gpui::Div {
+fn field(p: crate::theme::Palette, label: &'static str, value: gpui::SharedString) -> gpui::Div {
     div()
         .flex()
         .justify_between()
@@ -298,4 +293,111 @@ fn field(
                 .child(label),
         )
         .child(div().truncate().text_right().child(value))
+}
+
+/// A modal confirm step. Dismisses on Cancel, clicking the scrim, or Esc; the
+/// confirming action runs only on the explicit Confirm button.
+fn confirm_dialog(ply: &Ply, cx: &mut Context<Ply>) -> Option<AnyElement> {
+    let dialog = ply.confirm.as_ref()?;
+    let p = ply.palette();
+    let confirm_color = if dialog.danger {
+        p.destructive
+    } else {
+        p.foreground
+    };
+    let confirm_text = dialog.confirm_text.clone();
+    let cancel_text = gpui::SharedString::from("Cancel");
+
+    Some(
+        deferred(
+            div()
+                .id("confirm-scrim")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(p.overlay)
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.cancel_confirm(cx)),
+                )
+                .child(
+                    div()
+                        .occlude()
+                        .w(px(360.))
+                        .bg(p.card)
+                        .border_1()
+                        .border_color(p.border)
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .px(px(14.))
+                                .py(px(10.))
+                                .border_b_1()
+                                .border_color(p.border)
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(p.muted_foreground)
+                                        .child(dialog.title.to_uppercase()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .p(px(14.))
+                                .child(
+                                    div()
+                                        .text_size(px(13.))
+                                        .text_color(p.foreground)
+                                        .child(dialog.message.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .justify_end()
+                                        .gap(px(8.))
+                                        .mt(px(16.))
+                                        .child(confirm_button(
+                                            p,
+                                            cancel_text,
+                                            p.foreground,
+                                            cx.listener(|this, _, _, cx| this.cancel_confirm(cx)),
+                                        ))
+                                        .child(confirm_button(
+                                            p,
+                                            confirm_text,
+                                            confirm_color,
+                                            cx.listener(|this, _, _, cx| this.run_confirm(cx)),
+                                        )),
+                                ),
+                        ),
+                ),
+        )
+        .into_any_element(),
+    )
+}
+
+/// A simple labelled action button (Ply hand-rolls controls rather than pulling
+/// in a component lib), carrying a full-width click highlight.
+fn confirm_button(
+    p: crate::theme::Palette,
+    label: gpui::SharedString,
+    text: gpui::Hsla,
+    click: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(label.to_string())
+        .flex()
+        .items_center()
+        .px(px(14.))
+        .py(px(6.))
+        .text_size(px(12.))
+        .text_color(text)
+        .cursor_default()
+        .hover(|s| s.bg(p.muted))
+        .child(label)
+        .on_click(click)
 }

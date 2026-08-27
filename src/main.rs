@@ -2,13 +2,14 @@
 
 mod app;
 mod budget;
-mod thumbs;
 mod fs_ops;
 mod icons;
 mod listing;
 mod mtp;
 mod path_caps;
+mod recycle_bin;
 mod theme;
+mod thumbs;
 mod ui;
 mod volumes;
 mod watch;

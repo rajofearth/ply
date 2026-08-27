@@ -151,6 +151,20 @@ pub struct Properties {
     pub path: SharedString,
 }
 
+/// What confirming a [`ConfirmDialog`] runs.
+pub enum ConfirmAction {
+    DeletePermanently(Vec<PathBuf>),
+}
+
+/// A modal asking the user to confirm a potentially destructive action.
+pub struct ConfirmDialog {
+    pub title: SharedString,
+    pub message: SharedString,
+    pub confirm_text: SharedString,
+    pub danger: bool,
+    pub action: ConfirmAction,
+}
+
 pub struct Ply {
     pub mode: Mode,
     pub location: Location,
@@ -188,6 +202,7 @@ pub struct Ply {
 
     pub menu: Option<Menu>,
     pub properties: Option<Properties>,
+    pub confirm: Option<ConfirmDialog>,
     pub rename: Option<Rename>,
     pub status: Option<SharedString>,
 
@@ -236,6 +251,7 @@ impl Ply {
             visible_indices: Vec::new(),
             menu: None,
             properties: None,
+            confirm: None,
             rename: None,
             status: None,
             list_generation: 0,
@@ -247,6 +263,7 @@ impl Ply {
         ply.refresh_volumes(cx);
         ply.start_watch_poll(cx);
         ply.start_volume_poll(cx);
+        ply.update_window_title(window);
         window.focus(&ply.focus, cx);
         ply
     }
@@ -264,6 +281,22 @@ impl Ply {
     pub fn typing(&self, window: &Window, cx: &App) -> bool {
         let focused = |input: &Entity<InputState>| input.focus_handle(cx).is_focused(window);
         focused(&self.filter) || self.rename.as_ref().is_some_and(|r| focused(&r.input))
+    }
+
+    /// The OS window title (taskbar / alt-tab): `<folder> - Ply`, or
+    /// `Home - Ply`. The folder name is truncated from the middle when long.
+    fn window_title(&self) -> String {
+        let name = match &self.location {
+            Location::Home => "Home".to_string(),
+            Location::Folder(path) => crate::listing::truncate_middle(&self.display_name(path), 60),
+        };
+        format!("{name} - Ply")
+    }
+
+    /// Push the current location into the native window title. Called whenever
+    /// the Location changes so the taskbar and alt-tab stay in sync.
+    fn update_window_title(&self, window: &mut Window) {
+        window.set_window_title(&self.window_title());
     }
 
     pub fn toggle_mode(&mut self, cx: &mut Context<Self>) {
@@ -321,7 +354,9 @@ impl Ply {
 
 /// Escape closes whatever is on top, innermost first.
 pub fn dismiss_topmost(ply: &mut Ply, cx: &mut Context<Ply>) {
-    if ply.properties.is_some() {
+    if ply.confirm.is_some() {
+        ply.cancel_confirm(cx);
+    } else if ply.properties.is_some() {
         ply.close_properties(cx);
     } else if ply.menu.is_some() {
         ply.close_menu(cx);

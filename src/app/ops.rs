@@ -10,7 +10,8 @@ use crate::listing::{Entry, Snapshot, SortKey, list_sorted};
 use crate::volumes;
 
 use super::{
-    LoadState, Menu, MenuAction, MenuItem, MenuRow, Ply, Properties, Rename, ToolBtn, ViewMode,
+    ConfirmAction, ConfirmDialog, LoadState, Menu, MenuAction, MenuItem, MenuRow, Ply, Properties,
+    Rename, ToolBtn, ViewMode,
 };
 
 impl Ply {
@@ -430,6 +431,13 @@ impl Ply {
     }
 
     pub fn activate(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .current_folder()
+            .is_some_and(crate::recycle_bin::is_recycle_bin)
+        {
+            // The Recycle Bin is browse-only: items have no openable path.
+            return;
+        }
         if self.is_folder(path) {
             self.open_folder(path.to_path_buf(), window, cx);
         } else if !crate::path_caps::for_path(path).open_direct {
@@ -491,8 +499,14 @@ impl Ply {
         let is_file = !is_dir && !is_volume;
         let admin = !multi && is_file && fs_ops::is_admin_target(&path) && writable;
 
+        // The Recycle Bin is browse-only: its items carry shell parsing IDs, so
+        // none of the mutating actions (cut/copy/rename/delete) apply there.
+        let browse_only = self
+            .current_folder()
+            .is_some_and(crate::recycle_bin::is_recycle_bin);
+
         let mut toolbar = Vec::new();
-        if !is_volume {
+        if !is_volume && !browse_only {
             toolbar.push(btn(Ico::Scissors, MenuAction::Cut, false, false));
             toolbar.push(btn(Ico::Copy, MenuAction::Copy, false, false));
             if !multi && caps.rename {
@@ -522,12 +536,14 @@ impl Ply {
             rows.push(flyout(
                 "Open with",
                 Ico::ExternalLink,
-                vec![MenuItem::new(
-                    "Choose another app…",
-                    None,
-                    Some(MenuAction::ChooseApp(path.clone())),
-                )
-                .into()],
+                vec![
+                    MenuItem::new(
+                        "Choose another app…",
+                        None,
+                        Some(MenuAction::ChooseApp(path.clone())),
+                    )
+                    .into(),
+                ],
             ));
         }
         if admin {
@@ -578,7 +594,7 @@ impl Ply {
             Ico::Info,
             MenuAction::Properties(path.clone()),
         ));
-        if !is_volume && caps.trash {
+        if !is_volume && !browse_only && caps.trash {
             let label = if targets.len() > 1 {
                 format!("Delete {}", targets.len())
             } else {
@@ -792,21 +808,120 @@ impl Ply {
         }
     }
 
+    /// Delete selected entries. On a volume that supports a Recycle Bin this
+    /// moves them to trash; anywhere else (removable/CD/network devices) it
+    /// asks the user to confirm a permanent delete first, like Explorer.
+    /// Drive/device/Recycle-Bin roots are refused outright.
     pub fn delete(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        // Browsing the Recycle Bin is read-only: its items carry shell parsing IDs,
+        // not trashable filesystem paths, so going through the normal delete would
+        // mis-target them.
+        if self
+            .current_folder()
+            .is_some_and(crate::recycle_bin::is_recycle_bin)
+        {
+            self.note("The Recycle Bin is browse-only.", cx);
+            return;
+        }
+        let (trash, permanent) = match fs_ops::plan_delete(&paths) {
+            Err(e) => {
+                // Refused: a drive/device root is in the batch. Fail closed, no dialog,
+                // nothing is deleted.
+                self.note(format!("{e}"), cx);
+                return;
+            }
+            Ok(pair) => pair,
+        };
+        if !trash.is_empty() {
+            self.delete_to_trash(trash, cx);
+        }
+        if !permanent.is_empty() {
+            self.request_confirm_delete(permanent, cx);
+        }
+    }
+
+    fn finish_delete_ok(&mut self, note: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.clear_selection_paths();
+        self.anchor = None;
+        self.note(note, cx);
+        self.reload(cx);
+    }
+
+    fn finish_delete_err(&mut self, err: anyhow::Error, cx: &mut Context<Self>) {
+        self.fail(format!("Delete failed: {err}"), cx);
+    }
+
+    fn delete_to_trash(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         let count = paths.len();
         match fs_ops::delete_to_trash(&paths) {
             Ok(()) => {
-                self.clear_selection_paths();
-                self.anchor = None;
                 let note = if count == 1 {
                     "Moved to the Recycle Bin.".to_string()
                 } else {
                     format!("Moved {count} to the Recycle Bin.")
                 };
-                self.note(note, cx);
-                self.reload(cx);
+                self.finish_delete_ok(note, cx);
             }
-            Err(err) => self.fail(format!("Delete failed: {err}"), cx),
+            Err(err) => self.finish_delete_err(err, cx),
+        }
+    }
+
+    /// Show a permanent-delete confirmation for volumes with no Recycle Bin.
+    fn request_confirm_delete(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let (message, confirm_text) = if paths.len() == 1 {
+            (
+                format!(
+                    "\"{}\" will be permanently deleted.\nThis can't be undone.",
+                    paths[0]
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| paths[0].to_string_lossy().into_owned())
+                ),
+                "Delete forever".to_string(),
+            )
+        } else {
+            (
+                format!(
+                    "{} items will be permanently deleted.\nThis can't be undone.",
+                    paths.len()
+                ),
+                "Delete forever".to_string(),
+            )
+        };
+        self.confirm = Some(ConfirmDialog {
+            title: "Delete permanently?".into(),
+            message: message.into(),
+            confirm_text: confirm_text.into(),
+            danger: true,
+            action: ConfirmAction::DeletePermanently(paths),
+        });
+        cx.notify();
+    }
+
+    /// Run the confirmed action. Close the dialog first so state is clean.
+    pub fn run_confirm(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.confirm.take() else {
+            return;
+        };
+        match dialog.action {
+            ConfirmAction::DeletePermanently(paths) => match fs_ops::delete_permanently(&paths) {
+                Ok(()) => {
+                    let note = if paths.len() == 1 {
+                        "Deleted permanently.".to_string()
+                    } else {
+                        format!("Deleted {} permanently.", paths.len())
+                    };
+                    self.finish_delete_ok(note, cx);
+                }
+                Err(err) => self.finish_delete_err(err, cx),
+            },
+        }
+        cx.notify();
+    }
+
+    pub fn cancel_confirm(&mut self, cx: &mut Context<Self>) {
+        if self.confirm.take().is_some() {
+            cx.notify();
         }
     }
 

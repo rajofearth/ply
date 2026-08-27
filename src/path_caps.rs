@@ -19,7 +19,7 @@ pub fn is_portable(path: &Path) -> bool {
 }
 
 pub fn for_path(path: &Path) -> Caps {
-    if is_portable(path) {
+    if is_portable(path) || crate::recycle_bin::is_recycle_bin(path) {
         Caps {
             watch: false,
             rename: false,
@@ -54,6 +54,15 @@ mod tests {
     fn portable_paths_get_no_caps() {
         let path = PathBuf::from(r"\\MTP\DEVICE\o1");
         assert!(is_portable(&path));
+        let caps = for_path(&path);
+        assert!(!caps.watch && !caps.rename && !caps.trash && !caps.reveal && !caps.open_direct);
+    }
+
+    #[test]
+    fn recycle_bin_path_gets_no_caps() {
+        // Browse-only: the Recycle Bin must offer no mutating or openable caps.
+        let path = PathBuf::from(crate::recycle_bin::ROOT_STR);
+        assert!(crate::recycle_bin::is_recycle_bin(&path));
         let caps = for_path(&path);
         assert!(!caps.watch && !caps.rename && !caps.trash && !caps.reveal && !caps.open_direct);
     }

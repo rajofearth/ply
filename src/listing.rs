@@ -28,6 +28,26 @@ impl Entry {
     }
 }
 
+/// Truncate a string from the middle, keeping at most `max` total chars with an
+/// ellipsis in the middle so both ends of a long name stay readable.
+pub fn truncate_middle(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_owned();
+    }
+    // Keep at least one char each side of the ellipsis; never underflows.
+    let keep = max.saturating_sub(1) / 2;
+    let head: String = s.chars().take(keep).collect();
+    let tail: String = s
+        .chars()
+        .rev()
+        .take(keep)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{head}…{tail}")
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum SortKey {
     Name,
@@ -72,7 +92,9 @@ impl Snapshot {
         let mut ib: Vec<_> = (0..b.len()).collect();
         ia.sort_unstable_by(|&i, &j| cmp_name(&a[i].name, &a[j].name));
         ib.sort_unstable_by(|&i, &j| cmp_name(&b[i].name, &b[j].name));
-        ia.iter().zip(&ib).all(|(&i, &j)| entry_meta_eq(&a[i], &b[j]))
+        ia.iter()
+            .zip(&ib)
+            .all(|(&i, &j)| entry_meta_eq(&a[i], &b[j]))
     }
 }
 
@@ -283,7 +305,11 @@ fn collect_entries(path: &Path) -> anyhow::Result<Vec<Entry>> {
 }
 
 /// Portable devices have no filesystem path, so those listings come from WPD.
+/// The Recycle Bin is a virtual shell namespace with no path either.
 fn entries_of(path: &Path) -> anyhow::Result<Vec<Entry>> {
+    if crate::recycle_bin::is_recycle_bin(path) {
+        return crate::recycle_bin::list();
+    }
     if crate::mtp::is_mtp(path) {
         return crate::mtp::list(path);
     }
@@ -446,6 +472,74 @@ mod tests {
     }
 
     #[test]
+    fn truncate_middle_short_string_unchanged() {
+        assert_eq!(truncate_middle("short.txt", 12), "short.txt");
+    }
+
+    #[test]
+    fn truncate_middle_long_ascii_halves() {
+        let result = truncate_middle(&"a".repeat(60), 30);
+        // keep = (max - 1) / 2 = 14 each side plus the ellipsis -> 29 chars.
+        assert_eq!(result.chars().count(), 29);
+        assert!(result.starts_with("aaa"));
+        assert!(result.ends_with("aaa"));
+        assert!(result.contains('…'));
+    }
+
+    #[test]
+    fn truncate_middle_counts_chars_not_bytes() {
+        // 7 CJK chars, each 3 bytes. A byte-gated version would mis-truncate.
+        let name = "界界界界界界界";
+        let result = truncate_middle(name, 5);
+        assert_eq!(result.chars().count(), 5);
+    }
+
+    #[test]
+    fn truncate_middle_zero_max_does_not_panic() {
+        let _ = truncate_middle("abc", 0);
+    }
+
+    #[test]
+    fn truncate_middle_at_max_is_unchanged() {
+        assert_eq!(truncate_middle("abc", 3), "abc");
+    }
+
+    #[test]
+    fn truncate_middle_long_ascii_is_symmetric() {
+        // keep = (max - 1) / 2 = 14 per side, plus one ellipsis -> 29 chars,
+        // all 'a's, exactly one '…' in the middle.
+        let result = truncate_middle(&"a".repeat(60), 30);
+        assert_eq!(result.chars().count(), 29);
+        assert_eq!(result, format!("{}{}{}", "a".repeat(14), "…", "a".repeat(14)));
+        assert_eq!(result.matches('…').count(), 1);
+    }
+
+    #[test]
+    fn truncate_middle_cjk_counts_chars_not_bytes() {
+        // 7 CJK chars, each 3 bytes. A byte-gated version would truncate to
+        // fewer than 5 chars; the char-gated version must keep exactly 5.
+        let result = truncate_middle(&"界".repeat(7), 5);
+        assert_eq!(result.chars().count(), 5);
+        assert!(!result.ends_with("界界界界界"), "must actually truncate the long tail");
+    }
+
+    #[test]
+    fn truncate_middle_tiny_max_is_bounded_and_nevers_panics() {
+        for (s, max) in [("abc", 0), ("abc", 1), ("abcd", 1)] {
+            let result = truncate_middle(s, max);
+            assert!(
+                result.chars().count() <= 1,
+                "{s:?} with max {max} must collapse to at most 1 char, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn truncate_middle_empty_input_stays_empty() {
+        assert_eq!(truncate_middle("", 10), "");
+    }
+
+    #[test]
     fn default_sort_is_dirs_then_newest_mtime() {
         use std::time::{Duration, UNIX_EPOCH};
         let older = UNIX_EPOCH + Duration::from_secs(10);
@@ -486,7 +580,10 @@ mod tests {
 
     #[test]
     fn name_sort_is_case_insensitive() {
-        let snap = Snapshot::sorted(vec![file("b.txt"), file("A.txt"), file("c.txt")], SortKey::Name);
+        let snap = Snapshot::sorted(
+            vec![file("b.txt"), file("A.txt"), file("c.txt")],
+            SortKey::Name,
+        );
         let names: Vec<_> = snap.entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["A.txt", "b.txt", "c.txt"]);
     }

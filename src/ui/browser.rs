@@ -1,12 +1,12 @@
 use std::ops::Range;
 use std::path::PathBuf;
 
+use gpui::AppContext;
 use gpui::{
     AnyElement, ClickEvent, Context, Div, FontWeight, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ObjectFit, ParentElement, Stateful, StatefulInteractiveElement, Styled, div,
-    img, prelude::FluentBuilder, px, uniform_list, StyledImage,
+    MouseDownEvent, ObjectFit, ParentElement, Stateful, StatefulInteractiveElement, Styled,
+    StyledImage, div, img, prelude::FluentBuilder, px, uniform_list,
 };
-use gpui::AppContext;
 use gpui_component::Sizable;
 use gpui_component::input::Input;
 
@@ -14,7 +14,9 @@ use super::icon;
 use super::sidebar::{DragLabel, PinDrag};
 use crate::app::{LoadState, Ply, ViewMode};
 use crate::icons::Ico;
-use crate::listing::{Entry, SortKey, entry_icon, format_mtime, format_size, kind_label};
+use crate::listing::{
+    Entry, SortKey, entry_icon, format_mtime, format_size, kind_label, truncate_middle,
+};
 use crate::theme::Palette;
 use crate::thumbs;
 use chrono::{DateTime, Local};
@@ -158,19 +160,6 @@ fn message(text: impl Into<gpui::SharedString>, ply: &Ply) -> AnyElement {
         .text_color(ply.palette().muted_foreground)
         .child(text.into())
         .into_any_element()
-}
-
-/// Truncate a filename in the middle, showing the start and end with `…` in
-/// between, so the user can identify the file even when the label is clipped.
-fn truncate_middle(name: &str, max_chars: usize) -> String {
-    if name.len() <= max_chars {
-        return name.to_owned();
-    }
-    // Keep at least 3 chars on each side of the ellipsis.
-    let keep = (max_chars - 1) / 2;
-    let head: String = name.chars().take(keep).collect();
-    let tail: String = name.chars().rev().take(keep).collect::<Vec<_>>().into_iter().rev().collect();
-    format!("{head}…{tail}")
 }
 
 /// Shows a decoded media thumbnail when one is cached, otherwise the generic
