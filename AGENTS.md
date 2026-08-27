@@ -47,7 +47,15 @@ before modifying any function, module, or shared resource:
 1. trace its `blast radius`: what calls it, what it calls, what shares state or config with it.
 2. state any invariants the surrounding code relies on (data always sorted, auth always checked first, cache always invalidated on write, etc.) and confirm the change doesn't break them.
 3. note anything at the edges that's affected: security boundaries, memory/perf-sensitive paths, or anywhere untrusted input touches this code.
-4. if the blast radius or invariant list is non-trivial, say so explicitly before writing the diff.
+4. explicitly consider performance impact, code quality, and security. ask whether a better, cleaner, faster, or more efficient approach already exists (library, pattern, existing code elsewhere) or whether an entirely different way of solving it would be superior. use subagents for unbiased research and alternative ideas when helpful.
+5. if the blast radius, invariant list, or the set of quality/security/performance concerns is non-trivial, say so explicitly before writing the diff.
+
+after the change:
+
+1. re-evaluate performance impact, code quality, and security of what was just written.
+2. look for further improvements: cleaner structure, faster paths, better efficiency, or opportunities to slice/refactor the code.
+3. check whether the new logic duplicates (or is weaker than) something already present elsewhere in the codebase. if a better version exists, update callers to use it and remove the duplication so the codebase stays clean.
+4. confirm the change still respects the original blast radius and invariants.
 
 this applies to subagents and to you directly; no exceptions for "small" changes.
 
