@@ -3,8 +3,8 @@ use std::path::PathBuf;
 
 use gpui::{
     AnyElement, ClickEvent, Context, Div, FontWeight, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, Stateful, StatefulInteractiveElement, Styled, div,
-    prelude::FluentBuilder, px, uniform_list,
+    MouseDownEvent, ObjectFit, ParentElement, Stateful, StatefulInteractiveElement, Styled, div,
+    img, prelude::FluentBuilder, px, uniform_list, StyledImage,
 };
 use gpui::AppContext;
 use gpui_component::Sizable;
@@ -16,6 +16,7 @@ use crate::app::{LoadState, Ply, ViewMode};
 use crate::icons::Ico;
 use crate::listing::{Entry, SortKey, entry_icon, format_mtime, format_size, kind_label};
 use crate::theme::Palette;
+use crate::thumbs;
 use chrono::{DateTime, Local};
 
 pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
@@ -159,6 +160,31 @@ fn message(text: impl Into<gpui::SharedString>, ply: &Ply) -> AnyElement {
         .into_any_element()
 }
 
+/// Shows a decoded media thumbnail when one is cached, otherwise the generic
+/// SVG icon. Triggers extraction on demand for image/video entries.
+fn icon_or_thumb(
+    ply: &Ply,
+    entry: &Entry,
+    box_px: f32,
+    icon_px: f32,
+    cx: &mut Context<Ply>,
+) -> AnyElement {
+    let p = ply.palette();
+    let key = thumbs::cache_key(&entry.path, entry.modified);
+    let cached = ply.thumb_cache().read(cx).get(&key);
+    if cached.is_none() {
+        thumbs::request_thumbnail(ply, entry, cx);
+    }
+    match cached {
+        Some(thumb) => img(thumb)
+            .size(px(box_px))
+            .rounded(px(2.))
+            .object_fit(ObjectFit::Cover)
+            .into_any_element(),
+        None => icon(entry_icon(entry), px(icon_px), p.muted_foreground).into_any_element(),
+    }
+}
+
 fn list_row(
     ply: &Ply,
     entry: &Entry,
@@ -194,7 +220,7 @@ fn list_row(
                 .items_center()
                 .gap(px(8.))
                 .min_w_0()
-                .child(icon(entry_icon(entry), px(14.), p.muted_foreground))
+                .child(icon_or_thumb(ply, entry, 16., 14., cx))
                 .map(|el| {
                     if renaming {
                         el.child(rename_field(ply, cx))
@@ -266,7 +292,7 @@ fn grid_cell(ply: &Ply, entry: &Entry, ix: usize, cx: &mut Context<Ply>) -> AnyE
         .cursor_default()
         .when(selected, |el| el.bg(p.select_strong))
         .when(!selected, |el| el.hover(|s| s.bg(p.muted)))
-        .child(icon(entry_icon(entry), px(28.), p.muted_foreground))
+        .child(icon_or_thumb(ply, entry, 56., 28., cx))
         .map(|el| {
             if renaming {
                 el.child(rename_field(ply, cx))

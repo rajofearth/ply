@@ -2,6 +2,7 @@
 
 mod app;
 mod budget;
+mod thumbs;
 mod fs_ops;
 mod icons;
 mod listing;

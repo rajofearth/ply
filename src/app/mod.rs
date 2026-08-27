@@ -195,6 +195,9 @@ pub struct Ply {
     list_task: Option<Task<()>>,
     watch: Option<FolderWatch>,
     pub focus: FocusHandle,
+
+    /// Decoded media thumbnails, keyed by path + mtime. Dropped with the window.
+    pub thumbs: Entity<crate::thumbs::ThumbCache>,
 }
 
 impl Ply {
@@ -239,6 +242,7 @@ impl Ply {
             list_task: None,
             watch: None,
             focus: cx.focus_handle(),
+            thumbs: cx.new(|_| crate::thumbs::ThumbCache::new()),
         };
         ply.refresh_volumes(cx);
         ply.start_watch_poll(cx);
@@ -249,6 +253,11 @@ impl Ply {
 
     pub fn palette(&self) -> Palette {
         self.mode.palette()
+    }
+
+    /// The window's thumbnail cache.
+    pub fn thumb_cache(&self) -> Entity<crate::thumbs::ThumbCache> {
+        self.thumbs.clone()
     }
 
     /// Whether a text field has focus, so bare-key shortcuts should stand down.
