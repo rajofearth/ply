@@ -1,32 +1,58 @@
-# Ply
+**Ply**
 
-## Read on the matching branch
+if a task can be delegated to the subagent, whether it's research, exploration, or writing code, please use subagents. Use multiple if necessary.
+always talk without slop(`unslop`).
 
-| Branch | Source of truth |
-| --- | --- |
-| Names, Avoids, UI vocabulary | [CONTEXT.md](CONTEXT.md) |
-| Listing model, why no worktree | [docs/adr/0002-listing-not-worktree.md](docs/adr/0002-listing-not-worktree.md) |
-| Hand-rolled shell, Input-only gpui-component | [docs/adr/0003-hand-rolled-explorer-shell.md](docs/adr/0003-hand-rolled-explorer-shell.md) |
-| Settled base, PathCaps, listing/UI/volume efficiency | [docs/adr/0004-settled-base-and-efficiency.md](docs/adr/0004-settled-base-and-efficiency.md) |
-| Build / test / run commands | [README.md](README.md#commands) |
-| Binary + RAM budgets and the size gate | [src/budget.rs](src/budget.rs) |
+read on the matching branch. names, avoids, and UI vocabulary live in `CONTEXT.md`. the listing model and why there's no worktree is in `docs/adr/0002-listing-not-worktree.md`. the hand-rolled shell and input-only gpui-component decision is in `docs/adr/0003-hand-rolled-explorer-shell.md`. 
+settled base, PathCaps, and listing/UI/volume efficiency is in `docs/adr/0004-settled-base-and-efficiency.md`. build/test/run commands are in `README.md`. binary and RAM budgets plus the size gate are in `src/budget.rs`.
 
-## Budgets
+run `cargo test budgets_report -- --nocapture` and obey the printed gate.
 
-Run `cargo test budgets_report -- --nocapture` and obey the printed gate.
-Gotcha: a running Ply shows ~300 MB working set, but that is GPU shared memory
-and does not count — only non-GPU working set counts toward the RAM ceiling.
+gotcha: a running Ply shows about 300 MB working set, but that's GPU shared memory and doesn't count. only non-GPU working set counts toward the RAM ceiling.
 
-## Orchestration
+this project uses GPUI (Zed's UI framework), not to be confused with general GUI/GPU terms.
 
-Parent plans and integrates; sub-agents dig. Dispatch for parallel,
-high-context, or specialist work — architecture, performance, research, docs,
-bug/security/spec review. Grill one question at a time.
+subagents must ground themselves in the actual source/examples below before writing GPUI code; do not rely on memorized API shapes.
 
-Prefer tickets (epic + children) for non-trivial work; close them as you finish.
-Parallelize independent digs, but keep one writer per hot file. Measure before
-every performance patch. Plan → approve → implement on cross-cutting refactors
-unless the user already said go.
+**reference sources (fetch before implementing)**
 
-MTP feature growth stays deferred until the user reopens it (ADR 0004). Expand
-scope only when asked.
+- repo: https://github.com/zed-industries/zed (GPUI lives in `crates/gpui/`)
+- concepts doc: `crates/gpui/docs/contexts.md`
+- crate README: `crates/gpui/README.md`
+- working examples (primary source of truth): `crates/gpui/examples/`
+  - `hello_world.rs` — minimal app skeleton
+  - `gif_viewer.rs` — image loading/rendering
+  - `scrollable.rs`, `uniform_list.rs` — scrolling lists
+  - `grid_layout.rs` — grid layouts
+  - `input.rs` — text input handling
+- component library (higher-level, better docs): https://longbridge.github.io/gpui-component/llms.txt
+  - getting started: https://longbridge.github.io/gpui-component/docs/getting-started.md
+  - design guidelines: https://longbridge.github.io/gpui-component/docs/design-guides.md
+  - coding guidelines: https://longbridge.github.io/gpui-component/docs/coding-guides.md
+  - icons & assets: https://longbridge.github.io/gpui-component/docs/assets.md
+  - `story` crate in that repo — full working gallery app of all components, use as a reference implementation
+- architecture overview (auto-generated, cross-check against source): https://deepwiki.com/zed-industries/zed
+- real shipped GPUI apps for pattern reference: https://github.com/zed-industries/awesome-gpui
+
+**subagent instructions**
+
+- before writing any GPUI code, read the relevant example file(s) above, not just this summary.
+- prefer gpui-component over raw GPUI primitives unless the task specifically requires low-level control.
+- if an API doesn't match what's in the examples, trust the examples over memory.
+
+**change impact discipline**
+
+before modifying any function, module, or shared resource:
+
+1. trace its `blast radius`: what calls it, what it calls, what shares state or config with it.
+2. state any invariants the surrounding code relies on (data always sorted, auth always checked first, cache always invalidated on write, etc.) and confirm the change doesn't break them.
+3. note anything at the edges that's affected: security boundaries, memory/perf-sensitive paths, or anywhere untrusted input touches this code.
+4. if the blast radius or invariant list is non-trivial, say so explicitly before writing the diff.
+
+this applies to subagents and to you directly; no exceptions for "small" changes.
+
+parent plans and integrates; sub-agents dig. Dispatch for parallel, high-context, or specialist work: architecture, performance, research, docs, bug/security/spec review. grill one question at a time.
+
+prefer tickets (epic plus children) for non-trivial work; close them as you finish. Parallelize independent digs, but keep one writer per hot file. Measure before every performance patch. Plan, get approval, then implement on cross-cutting refactors, unless the user already said go.
+
+MTP feature growth stays deferred until the user reopens it (ADR 0004). Expand scope only when asked.

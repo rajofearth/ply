@@ -133,7 +133,7 @@ pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
             div()
                 .flex()
                 .items_center()
-                .gap(px(14.))
+                .gap(px(6.))
                 .text_color(p.muted_foreground)
                 .child(caption_button(
                     "minimize",
@@ -179,7 +179,8 @@ fn caption_button(
         .occlude()
         .cursor_default()
         .window_control_area(area)
-        .hover(|s| s.text_color(hover))
+        .hover(|s| s.bg(p.muted).text_color(hover))
+        .p(px(4.))
         .child(icon(ico, size, p.muted_foreground))
 }
 
