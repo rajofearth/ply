@@ -5,10 +5,13 @@ use gpui::{Context, Pixels, Point, SharedString, Window, prelude::*};
 use gpui_component::input::{InputEvent, InputState};
 
 use crate::fs_ops;
-use crate::listing::{Entry, Snapshot, list_dir};
+use crate::icons::Ico;
+use crate::listing::{Entry, Snapshot, SortKey, list_sorted};
 use crate::volumes;
 
-use super::{LoadState, Menu, MenuAction, MenuItem, Properties, Ply, Rename};
+use super::{
+    LoadState, Menu, MenuAction, MenuItem, MenuRow, Ply, Properties, Rename, ToolBtn, ViewMode,
+};
 
 impl Ply {
     pub fn refresh_volumes(&mut self, cx: &mut Context<Self>) {
@@ -30,12 +33,13 @@ impl Ply {
         };
         self.list_generation += 1;
         let generation = self.list_generation;
+        let key = self.sort;
         if !matches!(self.listing, LoadState::Ready(_)) {
             self.listing = LoadState::Loading;
         }
         self.list_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(async move { list_dir(&folder) })
+                .background_spawn(async move { list_sorted(&folder, key) })
                 .await;
             this.update(cx, |this, cx| {
                 if this.list_generation != generation {
@@ -46,7 +50,7 @@ impl Ply {
                         // A watch-driven reload usually finds nothing new;
                         // replacing an identical listing only causes churn.
                         if let LoadState::Ready(current) = &this.listing
-                            && current.fingerprint == snapshot.fingerprint
+                            && current.same_contents(&snapshot)
                         {
                             return;
                         }
@@ -119,8 +123,9 @@ impl Ply {
                 if mask != last_mask {
                     // Sequential: an unreachable network share can stall lettered
                     // discovery; awaiting keeps lettered polls from stacking.
-                    let lettered =
-                        cx.background_spawn(async { volumes::discover_lettered() }).await;
+                    let lettered = cx
+                        .background_spawn(async { volumes::discover_lettered() })
+                        .await;
                     if this
                         .update(cx, |this, cx| {
                             let mtp: Vec<_> = this
@@ -261,7 +266,11 @@ impl Ply {
             return;
         };
         if extend && let Some(anchor) = self.anchor {
-            let (lo, hi) = if anchor <= ix { (anchor, ix) } else { (ix, anchor) };
+            let (lo, hi) = if anchor <= ix {
+                (anchor, ix)
+            } else {
+                (ix, anchor)
+            };
             self.replace_selection(paths[lo..=hi].to_vec());
         } else if toggle {
             match self.selection.iter().position(|p| *p == path) {
@@ -337,9 +346,7 @@ impl Ply {
     /// `is_dir` cannot answer for portable devices, so trust the listing that
     /// produced the path and fall back to the filesystem for everything else.
     fn is_folder(&self, path: &Path) -> bool {
-        if let LoadState::Ready(snapshot) = &self.listing
-            && let Some(entry) = snapshot.entries.iter().find(|e| e.path == path)
-        {
+        if let Some(entry) = self.listing_entry(path) {
             return entry.is_directory();
         }
         // Anything reached from the sidebar or This PC is already a container.
@@ -374,63 +381,203 @@ impl Ply {
         let pinned = self.quick_access.contains(&path);
         let is_volume = self.volumes.iter().any(|v| v.path == path);
         let caps = crate::path_caps::for_path(&path);
+        let writable = caps.rename;
         let targets = if self.selection.len() > 1 {
             self.selection.clone()
         } else {
             vec![path.clone()]
         };
+        let multi = targets.len() > 1;
+        let is_dir = self
+            .listing_entry(&path)
+            .map(Entry::is_directory)
+            .unwrap_or_else(|| path.is_dir());
+        let is_file = !is_dir && !is_volume;
+        let admin = !multi && is_file && fs_ops::is_admin_target(&path) && writable;
 
-        let mut items = vec![MenuItem {
-            label: "Open".into(),
-            action: MenuAction::Open(path.clone()),
-            danger: false,
-        }];
-        if !is_volume && caps.rename {
-            items.push(MenuItem {
-                label: "Rename".into(),
-                action: MenuAction::Rename(path.clone()),
-                danger: false,
-            });
+        let mut toolbar = Vec::new();
+        if !is_volume {
+            toolbar.push(btn(Ico::Scissors, MenuAction::Cut, false, false));
+            toolbar.push(btn(Ico::Copy, MenuAction::Copy, false, false));
+            if !multi && caps.rename {
+                toolbar.push(btn(
+                    Ico::Pencil,
+                    MenuAction::Rename(path.clone()),
+                    true,
+                    false,
+                ));
+            }
+            if caps.trash {
+                toolbar.push(btn(
+                    Ico::Trash,
+                    MenuAction::Delete(targets.clone()),
+                    true,
+                    true,
+                ));
+            }
         }
-        items.push(MenuItem {
-            label: "Copy path".into(),
-            action: MenuAction::CopyPath(path.clone()),
-            danger: false,
-        });
+
+        let mut rows = vec![row(
+            "Open",
+            Ico::ExternalLink,
+            MenuAction::Open(path.clone()),
+        )];
+        if is_file && writable {
+            rows.push(flyout(
+                "Open with",
+                Ico::ExternalLink,
+                vec![MenuItem::new(
+                    "Choose another app…",
+                    None,
+                    Some(MenuAction::ChooseApp(path.clone())),
+                )
+                .into()],
+            ));
+        }
+        if admin {
+            rows.push(row(
+                "Run as administrator",
+                Ico::Shield,
+                MenuAction::RunAsAdmin(path.clone()),
+            ));
+        }
+        if !multi && is_dir && writable {
+            rows.push(row(
+                "Open in Terminal",
+                Ico::Terminal,
+                MenuAction::OpenInTerminal(path.clone()),
+            ));
+        }
+        rows.push(MenuRow::Separator);
+        if is_dir && !is_volume {
+            rows.push(if pinned {
+                row(
+                    "Remove from Quick Access",
+                    Ico::PinOff,
+                    MenuAction::Unpin(path.clone()),
+                )
+            } else {
+                row(
+                    "Add to Quick Access",
+                    Ico::Pin,
+                    MenuAction::Pin(path.clone()),
+                )
+            });
+            rows.push(MenuRow::Separator);
+        }
+        rows.push(row(
+            "Copy path",
+            Ico::Copy,
+            MenuAction::CopyPath(path.clone()),
+        ));
         if caps.reveal {
-            items.push(MenuItem {
-                label: "Reveal in Explorer".into(),
-                action: MenuAction::Reveal(path.clone()),
-                danger: false,
-            });
+            rows.push(row(
+                "Reveal in Explorer",
+                Ico::Folder,
+                MenuAction::Reveal(path.clone()),
+            ));
         }
-        if pinned {
-            items.push(MenuItem {
-                label: "Unpin from Home".into(),
-                action: MenuAction::Unpin(path.clone()),
-                danger: false,
-            });
-        }
-        items.push(MenuItem {
-            label: "Properties".into(),
-            action: MenuAction::Properties(path),
-            danger: false,
-        });
+        rows.push(row(
+            "Properties",
+            Ico::Info,
+            MenuAction::Properties(path.clone()),
+        ));
         if !is_volume && caps.trash {
             let label = if targets.len() > 1 {
-                format!("Delete {}", targets.len()).into()
+                format!("Delete {}", targets.len())
             } else {
-                SharedString::from("Delete")
+                "Delete".into()
             };
-            items.push(MenuItem {
-                label,
-                action: MenuAction::Delete(targets),
-                danger: true,
-            });
+            rows.push(MenuRow::Separator);
+            rows.push(
+                MenuItem::new(label, Some(Ico::Trash), Some(MenuAction::Delete(targets)))
+                    .danger()
+                    .into(),
+            );
         }
 
-        self.menu = Some(Menu { at, items });
+        self.show_menu(at, toolbar, rows, cx);
+    }
+
+    pub fn open_empty_menu(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(folder) = self.current_folder().map(Path::to_path_buf) else {
+            return;
+        };
+        let writable = crate::path_caps::for_path(&folder).rename;
+        let view = self.view;
+        let sort = self.sort;
+
+        let mut rows = vec![
+            flyout(
+                "View",
+                Ico::LayoutGrid,
+                [
+                    ("List", Ico::List, ViewMode::List),
+                    ("Grid", Ico::LayoutGrid, ViewMode::Grid),
+                ]
+                .into_iter()
+                .map(|(label, ico, mode)| {
+                    marked(label, Some(ico), MenuAction::SetView(mode), view == mode)
+                })
+                .collect(),
+            ),
+            flyout(
+                "Sort by",
+                Ico::ArrowUpDown,
+                [
+                    ("Name", SortKey::Name),
+                    ("Date modified", SortKey::Modified),
+                    ("Type", SortKey::Kind),
+                    ("Size", SortKey::Size),
+                ]
+                .into_iter()
+                .map(|(label, key)| marked(label, None, MenuAction::SetSort(key), sort == key))
+                .collect(),
+            ),
+            MenuItem {
+                children: vec![row("Folder", Ico::FolderPlus, MenuAction::NewFolder)],
+                ..MenuItem::new("New", Some(Ico::FolderPlus), None).on(writable)
+            }
+            .into(),
+            MenuRow::Separator,
+            MenuItem::new("Paste", Some(Ico::ClipboardPaste), Some(MenuAction::Paste))
+                .off()
+                .into(),
+            MenuRow::Separator,
+        ];
+        if writable {
+            rows.push(row(
+                "Open in Terminal",
+                Ico::Terminal,
+                MenuAction::OpenInTerminal(folder.clone()),
+            ));
+        }
+        rows.push(row("Refresh", Ico::Refresh, MenuAction::Refresh));
+        rows.push(row("Properties", Ico::Info, MenuAction::Properties(folder)));
+        self.show_menu(at, Vec::new(), rows, cx);
+    }
+
+    fn show_menu(
+        &mut self,
+        at: Point<Pixels>,
+        toolbar: Vec<ToolBtn>,
+        rows: Vec<MenuRow>,
+        cx: &mut Context<Self>,
+    ) {
+        self.menu = Some(Menu {
+            at,
+            toolbar,
+            rows,
+            flyout: None,
+        });
         cx.notify();
+    }
+
+    fn listing_entry(&self, path: &Path) -> Option<&Entry> {
+        match &self.listing {
+            LoadState::Ready(snap) => snap.entries.iter().find(|e| e.path == path),
+            _ => None,
+        }
     }
 
     pub fn close_menu(&mut self, cx: &mut Context<Self>) {
@@ -439,27 +586,65 @@ impl Ply {
         }
     }
 
+    pub fn set_flyout(&mut self, ix: Option<usize>, cx: &mut Context<Self>) {
+        if let Some(menu) = &mut self.menu {
+            menu.flyout = if menu.flyout == ix { None } else { ix };
+            cx.notify();
+        }
+    }
+
     pub fn run(&mut self, action: MenuAction, window: &mut Window, cx: &mut Context<Self>) {
         self.menu = None;
         match action {
             MenuAction::Open(path) => self.activate(&path, window, cx),
-            MenuAction::Rename(path) => self.begin_rename(path, window, cx),
+            MenuAction::ChooseApp(path) => {
+                self.try_fs(fs_ops::choose_another(&path), "Choose app failed", cx)
+            }
+            MenuAction::RunAsAdmin(path) => {
+                self.try_fs(fs_ops::run_as_admin(&path), "Could not elevate", cx)
+            }
+            MenuAction::OpenInTerminal(path) => {
+                self.try_fs(fs_ops::open_terminal(&path), "Terminal failed", cx)
+            }
+            MenuAction::Pin(path) => self.pin(path, cx),
+            MenuAction::Unpin(path) => self.unpin(&path, cx),
             MenuAction::CopyPath(path) => {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(
                     path.to_string_lossy().into_owned(),
                 ));
                 self.note("Path copied.", cx);
             }
-            MenuAction::Reveal(path) => {
-                if let Err(err) = fs_ops::reveal(&path) {
-                    self.fail(format!("Reveal failed: {err}"), cx);
-                }
-            }
-            MenuAction::Properties(path) => self.show_properties(&path, cx),
+            MenuAction::Cut | MenuAction::Copy | MenuAction::Paste => {}
+            MenuAction::Rename(path) => self.begin_rename(path, window, cx),
             MenuAction::Delete(paths) => self.delete(paths, cx),
-            MenuAction::Unpin(path) => self.unpin(&path, cx),
+            MenuAction::Reveal(path) => self.try_fs(fs_ops::reveal(&path), "Reveal failed", cx),
+            MenuAction::Properties(path) => self.show_properties(&path, cx),
+            MenuAction::Refresh => self.reload(cx),
+            MenuAction::SetView(view) => self.set_view(view, cx),
+            MenuAction::SetSort(key) => self.set_sort(key, cx),
+            MenuAction::NewFolder => self.new_folder(window, cx),
         }
         cx.notify();
+    }
+
+    fn try_fs(&mut self, result: anyhow::Result<()>, prefix: &str, cx: &mut Context<Self>) {
+        if let Err(err) = result {
+            self.fail(format!("{prefix}: {err}"), cx);
+        }
+    }
+
+    fn new_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(parent) = self.current_folder().map(Path::to_path_buf) else {
+            return;
+        };
+        match fs_ops::create_folder(&parent, "New folder") {
+            Ok(path) => {
+                self.reload(cx);
+                self.replace_selection(vec![path.clone()]);
+                self.begin_rename(path, window, cx);
+            }
+            Err(err) => self.fail(err.to_string(), cx),
+        }
     }
 
     pub fn begin_rename(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
@@ -544,56 +729,50 @@ impl Ply {
                 volumes::VolumeKind::Device => "Removable Device",
                 volumes::VolumeKind::Network => "Network Drive",
             };
-            self.properties = Some(Properties {
-                name: volume.name.clone().into(),
-                kind: kind.into(),
-                size: format!(
+            self.set_props(
+                volume.name.clone(),
+                kind,
+                format!(
                     "{} free of {}",
                     crate::listing::format_size(volume.free),
                     crate::listing::format_size(volume.total)
-                )
-                .into(),
-                modified: "—".into(),
-                path: path_display,
-            });
-            cx.notify();
+                ),
+                "—",
+                path_display,
+                cx,
+            );
             return;
         }
 
-        if let LoadState::Ready(snapshot) = &self.listing
-            && let Some(entry) = snapshot.entries.iter().find(|e| e.path == path)
-        {
+        if let Some(entry) = self.listing_entry(path) {
             let size = if entry.is_directory() {
                 "—".into()
             } else {
-                crate::listing::format_size(entry.size).into()
+                crate::listing::format_size(entry.size)
             };
-            self.properties = Some(Properties {
-                name: entry.name.clone().into(),
-                kind: crate::listing::kind_label(entry).into(),
+            self.set_props(
+                entry.name.clone(),
+                crate::listing::kind_label(entry),
                 size,
-                modified: crate::listing::format_mtime(entry.modified, chrono::Local::now()).into(),
-                path: path_display,
-            });
-            cx.notify();
+                crate::listing::format_mtime(entry.modified, chrono::Local::now()),
+                path_display,
+                cx,
+            );
             return;
         }
 
-        // No listing row: metadata when the OS can answer; portable paths
-        // without a listing stay honest dashes rather than a stub Entry.
         let meta = if crate::path_caps::is_portable(path) {
             None
         } else {
             std::fs::metadata(path).ok()
         };
-
         let now = chrono::Local::now();
         let name = self.display_name(path);
-        let (kind, size, modified) = match &meta {
+        let (kind, size, modified): (String, String, String) = match &meta {
             Some(m) if m.is_dir() => (
-                SharedString::from("Folder"),
-                SharedString::from("—"),
-                SharedString::from(crate::listing::format_mtime(m.modified().ok(), now)),
+                "Folder".into(),
+                "—".into(),
+                crate::listing::format_mtime(m.modified().ok(), now),
             ),
             Some(m) => {
                 let file_name = path
@@ -601,24 +780,31 @@ impl Ply {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| name.to_string());
                 (
-                    SharedString::from(crate::listing::kind_label_for_name(&file_name)),
-                    SharedString::from(crate::listing::format_size(m.len())),
-                    SharedString::from(crate::listing::format_mtime(m.modified().ok(), now)),
+                    crate::listing::kind_label_for_name(&file_name).into(),
+                    crate::listing::format_size(m.len()),
+                    crate::listing::format_mtime(m.modified().ok(), now),
                 )
             }
-            None => (
-                SharedString::from("—"),
-                SharedString::from("—"),
-                SharedString::from("—"),
-            ),
+            None => ("—".into(), "—".into(), "—".into()),
         };
+        self.set_props(name, kind, size, modified, path_display, cx);
+    }
 
+    fn set_props(
+        &mut self,
+        name: impl Into<SharedString>,
+        kind: impl Into<SharedString>,
+        size: impl Into<SharedString>,
+        modified: impl Into<SharedString>,
+        path: SharedString,
+        cx: &mut Context<Self>,
+    ) {
         self.properties = Some(Properties {
-            name,
-            kind,
-            size,
-            modified,
-            path: path_display,
+            name: name.into(),
+            kind: kind.into(),
+            size: size.into(),
+            modified: modified.into(),
+            path,
         });
         cx.notify();
     }
@@ -628,4 +814,38 @@ impl Ply {
             cx.notify();
         }
     }
+}
+
+fn btn(icon: Ico, action: MenuAction, enabled: bool, danger: bool) -> ToolBtn {
+    ToolBtn {
+        icon,
+        action,
+        enabled,
+        danger,
+    }
+}
+
+fn row(label: impl Into<SharedString>, icon: Ico, action: MenuAction) -> MenuRow {
+    MenuItem::new(label, Some(icon), Some(action)).into()
+}
+
+fn flyout(label: impl Into<SharedString>, icon: Ico, children: Vec<MenuRow>) -> MenuRow {
+    MenuItem {
+        children,
+        ..MenuItem::new(label, Some(icon), None)
+    }
+    .into()
+}
+
+fn marked(
+    label: impl Into<SharedString>,
+    icon: Option<Ico>,
+    action: MenuAction,
+    on: bool,
+) -> MenuRow {
+    MenuItem {
+        strong: on,
+        ..MenuItem::new(label, icon, Some(action))
+    }
+    .into()
 }

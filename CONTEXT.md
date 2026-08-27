@@ -31,13 +31,18 @@ _Avoid_: item, node, inode, document
 
 **Listing**:
 The ordered vector of Entries in the Current Folder: directories first, then
-name. Source of truth for both list and grid.
+the active Sort. Source of truth for both list and grid.
 _Avoid_: cache, index, worktree
 
 **Snapshot**:
-A Listing plus a fingerprint (names, kinds, sizes, mtimes, attrs). Equal
-fingerprints must not replace the Listing, so watch-driven reloads stay quiet.
+A Listing. Equal contents (names, kinds, sizes, mtimes, attrs — sort-independent)
+must not replace the Listing, so watch-driven reloads stay quiet.
 _Avoid_: state, cache
+
+**Sort**:
+How the Listing is ordered after directories-first: Name, Date modified, Type,
+or Size. Default is newest Date modified at the top.
+_Avoid_: order, rank
 
 **Selection**:
 The set of selected Entries. Plain click replaces it, ctrl-click toggles one,

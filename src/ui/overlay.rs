@@ -1,10 +1,10 @@
 use gpui::{
-    AnyElement, Context, InteractiveElement, IntoElement, ParentElement,
-    StatefulInteractiveElement, Styled, anchored, deferred, div, px,
+    AnyElement, Context, FontWeight, InteractiveElement, IntoElement, ParentElement,
+    StatefulInteractiveElement, Styled, anchored, deferred, div, prelude::FluentBuilder, px,
 };
 
 use super::icon;
-use crate::app::Ply;
+use crate::app::{MenuItem, MenuRow, Ply};
 use crate::icons::Ico;
 
 /// The layers that float above the panes: context menu, then Properties.
@@ -22,42 +22,185 @@ pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> Vec<AnyElement> {
 fn context_menu(ply: &Ply, cx: &mut Context<Ply>) -> Option<AnyElement> {
     let menu = ply.menu.as_ref()?;
     let p = ply.palette();
+    let has_toolbar = !menu.toolbar.is_empty();
+    let flyout = menu.flyout.and_then(|i| match menu.rows.get(i) {
+        Some(MenuRow::Item(item)) if !item.children.is_empty() => Some(i),
+        _ => None,
+    });
 
-    let items = menu.items.clone();
-    Some(
-        deferred(
-            anchored().position(menu.at).snap_to_window_with_margin(px(8.)).child(
+    let panel = chrome(p)
+        .when(has_toolbar, |el| {
+            el.child(
                 div()
-                    .occlude()
-                    .min_w(px(180.))
-                    .py(px(2.))
-                    .bg(p.card)
-                    .border_1()
+                    .flex()
+                    .items_center()
+                    .gap(px(2.))
+                    .px(px(6.))
+                    .py(px(4.))
+                    .border_b_1()
                     .border_color(p.border)
-                    .shadow_lg()
-                    .children(items.into_iter().enumerate().map(|(i, item)| {
-                        let action = item.action.clone();
+                    .children(menu.toolbar.iter().enumerate().map(|(i, btn)| {
+                        let action = btn.action.clone();
+                        let enabled = btn.enabled;
+                        let color = if btn.danger {
+                            p.destructive
+                        } else if enabled {
+                            p.foreground
+                        } else {
+                            p.muted_foreground
+                        };
                         div()
-                            .id(("menu", i))
-                            .px(px(12.))
-                            .py(px(7.))
-                            .text_size(px(12.5))
+                            .id(("tool", i))
+                            .w(px(32.))
+                            .h(px(32.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
                             .cursor_default()
-                            .text_color(if item.danger {
-                                p.destructive
-                            } else {
-                                p.foreground
+                            .when(enabled, |el| el.hover(|s| s.bg(p.muted)))
+                            .child(icon(btn.icon, px(16.), color))
+                            .when(enabled, |el| {
+                                el.on_click(cx.listener(move |this, _, window, cx| {
+                                    this.run(action.clone(), window, cx);
+                                }))
                             })
-                            .hover(|s| s.bg(p.muted))
-                            .child(item.label)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.run(action.clone(), window, cx);
-                            }))
                     })),
-            ),
+            )
+        })
+        .children(paint_rows(ply, &menu.rows, 0, cx));
+
+    let mut stack = vec![
+        deferred(
+            anchored()
+                .position(menu.at)
+                .snap_to_window_with_margin(px(8.))
+                .child(panel),
         )
         .into_any_element(),
+    ];
+
+    if let Some(ix) = flyout {
+        let y_off = if has_toolbar { 42. } else { 4. } + ix as f32 * 28.;
+        let at = gpui::Point::new(menu.at.x + px(172.), menu.at.y + px(y_off));
+        let kids = match &menu.rows[ix] {
+            MenuRow::Item(item) => item.children.as_slice(),
+            MenuRow::Separator => &[],
+        };
+        stack.push(
+            deferred(
+                anchored()
+                    .position(at)
+                    .snap_to_window_with_margin(px(8.))
+                    .child(chrome(p).children(paint_rows(ply, kids, 1000 + ix * 20, cx))),
+            )
+            .into_any_element(),
+        );
+    }
+
+    Some(
+        div()
+            .id("menu-dismiss")
+            .absolute()
+            .inset_0()
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.close_menu(cx)),
+            )
+            .children(stack)
+            .into_any_element(),
     )
+}
+
+fn chrome(p: crate::theme::Palette) -> gpui::Div {
+    div()
+        .occlude()
+        .flex_none()
+        .py(px(4.))
+        .bg(p.card)
+        .border_1()
+        .border_color(p.border)
+        .shadow_lg()
+}
+
+fn paint_rows(
+    ply: &Ply,
+    rows: &[MenuRow],
+    base: usize,
+    cx: &mut Context<Ply>,
+) -> Vec<AnyElement> {
+    let hair = ply.palette().border;
+    rows.iter()
+        .enumerate()
+        .map(|(i, row)| match row {
+            MenuRow::Separator => div()
+                .h(px(1.))
+                .my(px(4.))
+                .mx(px(8.))
+                .bg(hair)
+                .into_any_element(),
+            MenuRow::Item(item) => menu_row(ply, base + i, item, cx),
+        })
+        .collect()
+}
+
+fn menu_row(ply: &Ply, i: usize, item: &MenuItem, cx: &mut Context<Ply>) -> AnyElement {
+    let p = ply.palette();
+    let enabled = item.enabled;
+    let has_kids = !item.children.is_empty();
+    let action = item.action.clone();
+    let danger = item.danger;
+    let strong = item.strong;
+    let color = if !enabled {
+        p.muted_foreground
+    } else if danger {
+        p.destructive
+    } else {
+        p.foreground
+    };
+
+    div()
+        .id(("menu", i))
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .px(px(12.))
+        .py(px(6.))
+        .h(px(28.))
+        .text_size(px(12.5))
+        .cursor_default()
+        .text_color(color)
+        .when(strong, |el| el.font_weight(FontWeight::MEDIUM))
+        .when(enabled, |el| el.hover(|s| s.bg(p.muted)))
+        .map(|el| {
+            if let Some(ico) = item.icon {
+                el.child(icon(ico, px(14.), color))
+            } else if strong {
+                el.child(icon(Ico::Check, px(14.), color))
+            } else {
+                el.child(div().w(px(14.)))
+            }
+        })
+        .child(div().child(item.label.clone()))
+        .when(has_kids, |el| {
+            el.child(icon(Ico::ChevronRight, px(12.), p.muted_foreground))
+        })
+        .when(strong && item.icon.is_some() && !has_kids, |el| {
+            el.child(icon(Ico::Check, px(14.), color))
+        })
+        .when(enabled && has_kids, |el| {
+            el.on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.set_flyout(Some(i), cx);
+            }))
+        })
+        .when(enabled && !has_kids && action.is_some(), |el| {
+            let action = action.clone().unwrap();
+            el.on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.run(action.clone(), window, cx);
+            }))
+        })
+        .into_any_element()
 }
 
 fn properties(ply: &Ply, cx: &mut Context<Ply>) -> Option<AnyElement> {
@@ -126,25 +269,33 @@ fn properties(ply: &Ply, cx: &mut Context<Ply>) -> Option<AnyElement> {
                                         .child(props.name.clone()),
                                 )
                                 .children(rows.into_iter().map(|(label, value)| {
-                                    div()
-                                        .flex()
-                                        .justify_between()
-                                        .gap(px(12.))
-                                        .py(px(6.))
-                                        .border_b_1()
-                                        .border_color(p.border)
-                                        .text_size(px(12.))
-                                        .child(
-                                            div()
-                                                .flex_none()
-                                                .text_color(p.muted_foreground)
-                                                .child(label),
-                                        )
-                                        .child(div().truncate().text_right().child(value))
+                                    field(p, label, value)
                                 })),
                         ),
                 ),
         )
         .into_any_element(),
     )
+}
+
+fn field(
+    p: crate::theme::Palette,
+    label: &'static str,
+    value: gpui::SharedString,
+) -> gpui::Div {
+    div()
+        .flex()
+        .justify_between()
+        .gap(px(12.))
+        .py(px(6.))
+        .border_b_1()
+        .border_color(p.border)
+        .text_size(px(12.))
+        .child(
+            div()
+                .flex_none()
+                .text_color(p.muted_foreground)
+                .child(label),
+        )
+        .child(div().truncate().text_right().child(value))
 }

@@ -14,16 +14,11 @@ use super::icon;
 use super::sidebar::{DragLabel, PinDrag};
 use crate::app::{LoadState, Ply, ViewMode};
 use crate::icons::Ico;
-use crate::listing::{self, Entry, format_mtime, format_size, kind_label};
+use crate::listing::{Entry, SortKey, entry_icon, format_mtime, format_size, kind_label};
+use crate::theme::Palette;
 use chrono::{DateTime, Local};
 
-/// Icon for an entry — delegates to [`listing::entry_icon`] (no kind-label parsing).
-pub fn entry_icon(entry: &Entry) -> Ico {
-    listing::entry_icon(entry)
-}
-
 pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
-    let p = ply.palette();
     let list_view = ply.view == ViewMode::List;
     let count = ply.visible_len();
 
@@ -44,6 +39,7 @@ pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
             }),
         )
         .flex_1()
+        .w_full()
         .min_h_0()
         .into_any_element(),
         None => scroll_area(list_view)
@@ -63,26 +59,74 @@ pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
         .flex_col()
         .flex_1()
         .min_h_0()
-        .when(list_view, |el| {
-            el.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .h(px(28.))
-                    .px(px(12.))
-                    .flex_none()
-                    .border_b_1()
-                    .border_color(p.border)
-                    .gap(px(16.))
-                    .text_size(px(11.))
-                    .text_color(p.muted_foreground)
-                    .child(div().flex_1().min_w_0().child("Name"))
-                    .child(div().w(px(130.)).flex_none().child("Kind"))
-                    .child(div().w(px(80.)).flex_none().text_right().child("Size"))
-                    .child(div().w(px(130.)).flex_none().child("Modified")),
-            )
-        })
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                this.open_empty_menu(ev.position, cx);
+            }),
+        )
+        .when(list_view, |el| el.child(list_headers(ply)))
         .child(body)
+}
+
+/// Fixed column widths shared by the header and every list row so cells line up.
+const KIND_COL: f32 = 130.;
+const SIZE_COL: f32 = 80.;
+const MODIFIED_COL: f32 = 130.;
+
+fn list_headers(ply: &Ply) -> impl IntoElement {
+    let p = ply.palette();
+    let key = ply.sort;
+    let col = |label, w, active, right| {
+        div()
+            .w(px(w))
+            .flex_none()
+            .child(header_label(label, active, false, right, p))
+    };
+    div()
+        .w_full()
+        .flex()
+        .items_center()
+        .h(px(28.))
+        .px(px(12.))
+        .flex_none()
+        .border_b_1()
+        .border_color(p.border)
+        .gap(px(16.))
+        .text_size(px(11.))
+        .text_color(p.muted_foreground)
+        .child(header_label("Name", key == SortKey::Name, true, false, p))
+        .child(col("Kind", KIND_COL, key == SortKey::Kind, false))
+        .child(col("Size", SIZE_COL, key == SortKey::Size, true))
+        .child(col(
+            "Modified",
+            MODIFIED_COL,
+            key == SortKey::Modified,
+            false,
+        ))
+}
+
+fn header_label(
+    text: &'static str,
+    active: bool,
+    grow: bool,
+    right: bool,
+    p: Palette,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(4.))
+        .when(grow, |el| el.flex_1().min_w_0())
+        .when(!grow, |el| el.w_full())
+        .when(right, |el| el.justify_end())
+        .when(active, |el| {
+            el.font_weight(FontWeight::MEDIUM).text_color(p.foreground)
+        })
+        .child(text)
+        .when(active, |el| {
+            el.child(icon(Ico::ChevronDown, px(10.), p.muted_foreground))
+        })
 }
 
 /// Scrolling container for everything that is not the virtualized list.
@@ -130,6 +174,7 @@ fn list_row(
 
     div()
         .id(("row", super::stable_id(&entry.path)))
+        .w_full()
         .flex()
         .items_center()
         .h(px(29.))
@@ -165,7 +210,7 @@ fn list_row(
         )
         .child(
             div()
-                .w(px(130.))
+                .w(px(KIND_COL))
                 .flex_none()
                 .truncate()
                 .text_size(px(12.))
@@ -174,7 +219,7 @@ fn list_row(
         )
         .child(
             div()
-                .w(px(80.))
+                .w(px(SIZE_COL))
                 .flex_none()
                 .text_right()
                 .text_size(px(12.))
@@ -187,7 +232,7 @@ fn list_row(
         )
         .child(
             div()
-                .w(px(130.))
+                .w(px(MODIFIED_COL))
                 .flex_none()
                 .truncate()
                 .text_size(px(12.))

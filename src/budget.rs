@@ -4,11 +4,14 @@
 //! its size is gated at 10 MiB so agents see a hard fail, not a vibe.
 
 /// Soft ceiling for release `ply` on disk (ADR 0004 / AGENTS.md).
+#[allow(dead_code)]
 pub const MAX_RELEASE_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Non-GPU working-set ceiling. GPU shared memory is ignored by product policy.
+#[allow(dead_code)]
 pub const MAX_NON_GPU_WORKING_SET_BYTES: u64 = 100 * 1024 * 1024;
 
+#[cfg(test)]
 fn release_bin_path() -> std::path::PathBuf {
     let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.push("target");

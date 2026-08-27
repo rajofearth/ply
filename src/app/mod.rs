@@ -13,7 +13,7 @@ use gpui::{
 };
 use gpui_component::input::{InputEvent, InputState};
 
-use crate::listing::Snapshot;
+use crate::listing::{Snapshot, SortKey};
 use crate::theme::{Mode, Palette};
 use crate::volumes::{self, Volume};
 use crate::watch::FolderWatch;
@@ -24,7 +24,7 @@ pub enum LoadState<T> {
     Failed(SharedString),
 }
 
-/// Where the centre pane is pointed. Home is the drive dashboard, not a folder.
+/// Where the centre pane is pointed. Home is the idle Location, not a folder.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Location {
     Home,
@@ -37,28 +37,101 @@ pub enum ViewMode {
     Grid,
 }
 
-/// A right-click menu, positioned in window space.
+/// A right-click menu: optional icon toolbar, then a vertical list.
 pub struct Menu {
     pub at: Point<Pixels>,
-    pub items: Vec<MenuItem>,
+    pub toolbar: Vec<ToolBtn>,
+    pub rows: Vec<MenuRow>,
+    pub flyout: Option<usize>,
+}
+
+#[derive(Clone)]
+pub struct ToolBtn {
+    pub icon: crate::icons::Ico,
+    pub action: MenuAction,
+    pub enabled: bool,
+    pub danger: bool,
+}
+
+#[derive(Clone)]
+pub enum MenuRow {
+    Separator,
+    Item(MenuItem),
 }
 
 #[derive(Clone)]
 pub struct MenuItem {
     pub label: SharedString,
-    pub action: MenuAction,
+    pub icon: Option<crate::icons::Ico>,
+    pub action: Option<MenuAction>,
+    pub children: Vec<MenuRow>,
+    pub enabled: bool,
     pub danger: bool,
+    pub strong: bool,
+}
+
+impl MenuItem {
+    pub(super) fn new(
+        label: impl Into<SharedString>,
+        icon: Option<crate::icons::Ico>,
+        action: Option<MenuAction>,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            icon,
+            action,
+            children: Vec::new(),
+            enabled: true,
+            danger: false,
+            strong: false,
+        }
+    }
+
+    pub(super) fn off(self) -> Self {
+        Self {
+            enabled: false,
+            ..self
+        }
+    }
+
+    pub(super) fn on(self, enabled: bool) -> Self {
+        Self { enabled, ..self }
+    }
+
+    pub(super) fn danger(self) -> Self {
+        Self {
+            danger: true,
+            ..self
+        }
+    }
+}
+
+impl From<MenuItem> for MenuRow {
+    fn from(item: MenuItem) -> Self {
+        Self::Item(item)
+    }
 }
 
 #[derive(Clone)]
 pub enum MenuAction {
     Open(PathBuf),
-    Rename(PathBuf),
+    ChooseApp(PathBuf),
+    RunAsAdmin(PathBuf),
+    OpenInTerminal(PathBuf),
+    Pin(PathBuf),
+    Unpin(PathBuf),
     CopyPath(PathBuf),
+    Cut,
+    Copy,
+    Paste,
+    Rename(PathBuf),
+    Delete(Vec<PathBuf>),
     Reveal(PathBuf),
     Properties(PathBuf),
-    Delete(Vec<PathBuf>),
-    Unpin(PathBuf),
+    Refresh,
+    SetView(ViewMode),
+    SetSort(SortKey),
+    NewFolder,
 }
 
 /// A row being renamed inline. The subscription commits on Enter or blur and
@@ -103,6 +176,7 @@ pub struct Ply {
     selection_set: HashSet<PathBuf>,
     anchor: Option<usize>,
     pub view: ViewMode,
+    pub sort: SortKey,
 
     pub filter: Entity<InputState>,
     pub filter_text: String,
@@ -152,6 +226,7 @@ impl Ply {
             selection_set: HashSet::new(),
             anchor: None,
             view: ViewMode::List,
+            sort: SortKey::default(),
             filter,
             filter_text: String::new(),
             placeholder_for: None,
@@ -203,6 +278,15 @@ impl Ply {
         cx.notify();
     }
 
+    pub fn set_sort(&mut self, key: SortKey, cx: &mut Context<Self>) {
+        self.sort = key;
+        if let LoadState::Ready(snap) = &mut self.listing {
+            snap.resort(key);
+        }
+        self.rebuild_visible();
+        cx.notify();
+    }
+
     pub fn note(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.status = Some(message.into());
         self.clear_status_later(cx);
@@ -215,9 +299,7 @@ impl Ply {
     fn clear_status_later(&mut self, cx: &mut Context<Self>) {
         cx.notify();
         cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_secs(4))
-                .await;
+            cx.background_executor().timer(Duration::from_secs(4)).await;
             this.update(cx, |this, cx| {
                 this.status = None;
                 cx.notify();

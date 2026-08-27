@@ -69,6 +69,119 @@ pub fn delete_to_trash(paths: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
+fn refuse_mtp(path: &Path) -> Result<()> {
+    if crate::mtp::is_mtp(path) {
+        bail!("This is not available on a portable device.");
+    }
+    Ok(())
+}
+
+/// Extensions that promote Run as administrator on Windows.
+pub fn is_admin_target(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| {
+            ["exe", "msi", "bat", "cmd", "ps1"]
+                .iter()
+                .any(|ext| e.eq_ignore_ascii_case(ext))
+        })
+}
+
+/// Explorer-style ` (2)` suffix when `name` already exists in `dir`.
+fn unique_in(dir: &Path, name: &str) -> String {
+    if !dir.join(name).exists() {
+        return name.to_string();
+    }
+    let path = Path::new(name);
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(name);
+    let ext = path.extension().and_then(|s| s.to_str());
+    for i in 2..10_000 {
+        let candidate = match ext {
+            Some(e) => format!("{stem} ({i}).{e}"),
+            None => format!("{stem} ({i})"),
+        };
+        if !dir.join(&candidate).exists() {
+            return candidate;
+        }
+    }
+    name.to_string()
+}
+
+pub fn create_folder(parent: &Path, name: &str) -> Result<PathBuf> {
+    refuse_mtp(parent)?;
+    let name = unique_in(parent, name);
+    let target = parent.join(&name);
+    std::fs::create_dir(&target)?;
+    Ok(target)
+}
+
+pub fn open_terminal(dir: &Path) -> Result<()> {
+    refuse_mtp(dir)?;
+    let dir = if dir.is_file() {
+        dir.parent().unwrap_or(dir)
+    } else {
+        dir
+    };
+    #[cfg(windows)]
+    {
+        if std::process::Command::new("wt")
+            .args(["-d", &dir.display().to_string()])
+            .spawn()
+            .is_ok()
+        {
+            return Ok(());
+        }
+        std::process::Command::new("cmd")
+            .args(["/k", "cd", "/d", &dir.display().to_string()])
+            .spawn()?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = dir;
+        bail!("Open in Terminal is Windows-only for now.");
+    }
+}
+
+pub fn run_as_admin(path: &Path) -> Result<()> {
+    refuse_mtp(path)?;
+    #[cfg(windows)]
+    {
+        std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Start-Process -LiteralPath $env:PLY_RUNAS -Verb RunAs",
+            ])
+            .env("PLY_RUNAS", path.as_os_str())
+            .spawn()?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        bail!("Run as administrator is Windows-only for now.");
+    }
+}
+
+/// Native OS "Open with" picker.
+pub fn choose_another(path: &Path) -> Result<()> {
+    refuse_mtp(path)?;
+    #[cfg(windows)]
+    {
+        std::process::Command::new("rundll32")
+            .arg("shell32.dll,OpenAs_RunDLL")
+            .arg(path)
+            .spawn()?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        bail!("Choose another app is Windows-only for now.");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +223,21 @@ mod tests {
         assert_eq!(std::fs::read(&b).unwrap(), b"y");
         std::fs::remove_file(&a).ok();
         std::fs::remove_file(&b).ok();
+    }
+
+    #[test]
+    fn unique_in_adds_a_suffix() {
+        let dir = tmp();
+        std::fs::write(dir.join("New folder"), b"").unwrap();
+        assert_eq!(unique_in(&dir, "New folder"), "New folder (2)");
+        std::fs::remove_file(dir.join("New folder")).ok();
+    }
+
+    #[test]
+    fn admin_target_is_exe_or_script() {
+        assert!(is_admin_target(Path::new("setup.exe")));
+        assert!(is_admin_target(Path::new("run.ps1")));
+        assert!(!is_admin_target(Path::new("run.sh")));
+        assert!(!is_admin_target(Path::new("notes.txt")));
     }
 }

@@ -26,55 +26,94 @@ impl Entry {
     pub fn is_directory(&self) -> bool {
         matches!(self.kind, EntryKind::Directory)
     }
-
-    pub fn fingerprint(&self) -> EntryFingerprint {
-        EntryFingerprint {
-            name: self.name.clone(),
-            kind: kind_discriminant(&self.kind),
-            size: self.size,
-            modified: self.modified,
-            hidden: self.hidden,
-        }
-    }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EntryFingerprint {
-    pub name: String,
-    pub kind: u8,
-    pub size: u64,
-    pub modified: Option<SystemTime>,
-    pub hidden: bool,
-}
-
-fn kind_discriminant(kind: &EntryKind) -> u8 {
-    match kind {
-        EntryKind::File => 0,
-        EntryKind::Directory => 1,
-        EntryKind::Symlink { .. } => 2,
-    }
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum SortKey {
+    Name,
+    #[default]
+    Modified,
+    Kind,
+    Size,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
     pub entries: Vec<Entry>,
-    pub fingerprint: Vec<EntryFingerprint>,
 }
 
 impl Snapshot {
-    pub fn from_entries(mut entries: Vec<Entry>) -> Self {
-        entries.sort_by(|a, b| {
-            b.is_directory()
-                .cmp(&a.is_directory())
-                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        });
-        let fingerprint = entries.iter().map(Entry::fingerprint).collect();
-        Self {
-            entries,
-            fingerprint,
-        }
+    #[cfg(test)]
+    pub fn from_entries(entries: Vec<Entry>) -> Self {
+        Self::sorted(entries, SortKey::default())
     }
 
+    pub fn sorted(mut entries: Vec<Entry>, key: SortKey) -> Self {
+        entries.sort_by(|a, b| compare_entries(a, b, key));
+        Self { entries }
+    }
+
+    pub fn resort(&mut self, key: SortKey) {
+        self.entries.sort_by(|a, b| compare_entries(a, b, key));
+    }
+
+    /// Order-independent equality so a resorted listing is not a "change".
+    /// Same-order listings (the usual watch reload) compare in place with no extra alloc.
+    pub fn same_contents(&self, other: &Self) -> bool {
+        let a = &self.entries;
+        let b = &other.entries;
+        if a.len() != b.len() {
+            return false;
+        }
+        if a.iter().zip(b).all(|(x, y)| entry_meta_eq(x, y)) {
+            return true;
+        }
+        let mut ia: Vec<_> = (0..a.len()).collect();
+        let mut ib: Vec<_> = (0..b.len()).collect();
+        ia.sort_unstable_by(|&i, &j| cmp_name(&a[i].name, &a[j].name));
+        ib.sort_unstable_by(|&i, &j| cmp_name(&b[i].name, &b[j].name));
+        ia.iter().zip(&ib).all(|(&i, &j)| entry_meta_eq(&a[i], &b[j]))
+    }
+}
+
+fn entry_meta_eq(a: &Entry, b: &Entry) -> bool {
+    names_eq(&a.name, &b.name)
+        && a.kind == b.kind
+        && a.size == b.size
+        && a.modified == b.modified
+        && a.hidden == b.hidden
+}
+
+fn names_eq(a: &str, b: &str) -> bool {
+    if a.is_ascii() && b.is_ascii() {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a.to_lowercase() == b.to_lowercase()
+    }
+}
+
+/// ASCII names compare without allocating. Non-ASCII still Unicode-casefolds.
+fn cmp_name(a: &str, b: &str) -> std::cmp::Ordering {
+    if a.is_ascii() && b.is_ascii() {
+        a.bytes()
+            .map(|b| b.to_ascii_lowercase())
+            .cmp(b.bytes().map(|b| b.to_ascii_lowercase()))
+    } else {
+        a.to_lowercase().cmp(&b.to_lowercase())
+    }
+}
+
+fn compare_entries(a: &Entry, b: &Entry, key: SortKey) -> std::cmp::Ordering {
+    b.is_directory()
+        .cmp(&a.is_directory())
+        .then_with(|| match key {
+            SortKey::Name => cmp_name(&a.name, &b.name),
+            SortKey::Modified => b.modified.cmp(&a.modified),
+            SortKey::Kind => kind_label(a)
+                .cmp(kind_label(b))
+                .then_with(|| cmp_name(&a.name, &b.name)),
+            SortKey::Size => b.size.cmp(&a.size).then_with(|| cmp_name(&a.name, &b.name)),
+        })
 }
 
 /// Coarse kind used for icons — never derived by parsing [`kind_label`] text.
@@ -91,26 +130,8 @@ pub enum KindClass {
 /// Map an entry to its icon class from [`EntryKind`] / extension, not labels.
 pub fn kind_class(entry: &Entry) -> KindClass {
     match entry.kind {
-        EntryKind::Directory => return KindClass::Folder,
-        EntryKind::Symlink { .. } | EntryKind::File => {}
-    }
-    kind_class_for_name(&entry.name)
-}
-
-fn kind_class_for_name(name: &str) -> KindClass {
-    let ext = extension_lower(name);
-    match ext.as_str() {
-        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "svg" | "ico" => KindClass::Image,
-        "mp4" | "m4v" | "mkv" | "mov" | "avi" | "webm" | "wmv" => KindClass::Video,
-        "mp3" | "wav" | "flac" | "ogg" | "m4a" | "aac" | "m3u" | "m3u8" | "pls" => {
-            KindClass::Audio
-        }
-        "txt" | "log" | "ini" | "cfg" | "toml" | "yaml" | "yml" | "md" | "json" | "xml"
-        | "csv" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "pdf" | "rs" | "py"
-        | "js" | "ts" | "tsx" | "jsx" | "c" | "cpp" | "h" | "go" | "java" | "sh" => {
-            KindClass::Document
-        }
-        _ => KindClass::File,
+        EntryKind::Directory => KindClass::Folder,
+        EntryKind::Symlink { .. } | EntryKind::File => classify_name(&entry.name).0,
     }
 }
 
@@ -127,62 +148,70 @@ pub fn entry_icon(entry: &Entry) -> crate::icons::Ico {
     }
 }
 
-fn extension_lower(name: &str) -> String {
-    Path::new(name)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase()
+fn extension_lower<'a>(name: &'a str, buf: &'a mut [u8; 8]) -> &'a str {
+    let Some(raw) = Path::new(name).extension().and_then(|e| e.to_str()) else {
+        return "";
+    };
+    if raw.len() > buf.len() {
+        return "";
+    }
+    for (i, b) in raw.bytes().enumerate() {
+        buf[i] = b.to_ascii_lowercase();
+    }
+    std::str::from_utf8(&buf[..raw.len()]).unwrap_or("")
 }
 
 /// Human-readable type for the Kind column, e.g. `"JPEG Image"`.
 pub fn kind_label(entry: &Entry) -> &'static str {
     match entry.kind {
-        EntryKind::Directory => return "Folder",
-        EntryKind::Symlink { .. } => return "Shortcut",
-        EntryKind::File => {}
+        EntryKind::Directory => "Folder",
+        EntryKind::Symlink { .. } => "Shortcut",
+        EntryKind::File => classify_name(&entry.name).1,
     }
-    // From the name, not the path: on a portable device the path component is
-    // an opaque object ID and carries no extension.
-    kind_label_for_name(&entry.name)
 }
 
 /// Kind from a bare file name / extension. Prefer [`kind_label`] when an
 /// [`Entry`] is available so folders and shortcuts stay correct.
 pub fn kind_label_for_name(name: &str) -> &'static str {
-    match extension_lower(name).as_str() {
-        "jpg" | "jpeg" => "JPEG Image",
-        "png" => "PNG Image",
-        "gif" => "GIF Image",
-        "webp" => "WebP Image",
-        "bmp" => "Bitmap Image",
-        "svg" => "SVG Image",
-        "ico" => "Icon",
-        "mp4" | "m4v" => "MPEG Video",
-        "mkv" => "Matroska Video",
-        "mov" => "QuickTime Video",
-        "avi" | "webm" | "wmv" => "Video",
-        "mp3" => "MP3 Audio",
-        "wav" => "Wave Audio",
-        "flac" | "ogg" | "m4a" | "aac" => "Audio",
-        "m3u" | "m3u8" | "pls" => "Playlist",
-        "txt" | "log" | "ini" | "cfg" | "toml" | "yaml" | "yml" => "Text Document",
-        "md" => "Markdown Document",
-        "json" => "JSON Document",
-        "xml" | "csv" => "Data Document",
-        "doc" | "docx" => "Word Document",
-        "xls" | "xlsx" => "Excel Workbook",
-        "ppt" | "pptx" => "PowerPoint Presentation",
-        "pdf" => "PDF Document",
-        "zip" | "7z" | "rar" | "tar" | "gz" => "Archive",
-        "exe" | "msi" => "Application",
-        "dll" => "System File",
-        "lnk" => "Shortcut",
-        "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "c" | "cpp" | "h" | "go" | "java" | "sh" => {
-            "Source File"
+    classify_name(name).1
+}
+
+fn classify_name(name: &str) -> (KindClass, &'static str) {
+    let mut buf = [0u8; 8];
+    match extension_lower(name, &mut buf) {
+        "jpg" | "jpeg" => (KindClass::Image, "JPEG Image"),
+        "png" => (KindClass::Image, "PNG Image"),
+        "gif" => (KindClass::Image, "GIF Image"),
+        "webp" => (KindClass::Image, "WebP Image"),
+        "bmp" => (KindClass::Image, "Bitmap Image"),
+        "svg" => (KindClass::Image, "SVG Image"),
+        "ico" => (KindClass::Image, "Icon"),
+        "mp4" | "m4v" => (KindClass::Video, "MPEG Video"),
+        "mkv" => (KindClass::Video, "Matroska Video"),
+        "mov" => (KindClass::Video, "QuickTime Video"),
+        "avi" | "webm" | "wmv" => (KindClass::Video, "Video"),
+        "mp3" => (KindClass::Audio, "MP3 Audio"),
+        "wav" => (KindClass::Audio, "Wave Audio"),
+        "flac" | "ogg" | "m4a" | "aac" => (KindClass::Audio, "Audio"),
+        "m3u" | "m3u8" | "pls" => (KindClass::Audio, "Playlist"),
+        "txt" | "log" | "ini" | "cfg" | "toml" | "yaml" | "yml" => {
+            (KindClass::Document, "Text Document")
         }
-        "" => "File",
-        _ => "File",
+        "md" => (KindClass::Document, "Markdown Document"),
+        "json" => (KindClass::Document, "JSON Document"),
+        "xml" | "csv" => (KindClass::Document, "Data Document"),
+        "doc" | "docx" => (KindClass::Document, "Word Document"),
+        "xls" | "xlsx" => (KindClass::Document, "Excel Workbook"),
+        "ppt" | "pptx" => (KindClass::Document, "PowerPoint Presentation"),
+        "pdf" => (KindClass::Document, "PDF Document"),
+        "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "c" | "cpp" | "h" | "go" | "java" | "sh" => {
+            (KindClass::Document, "Source File")
+        }
+        "zip" | "7z" | "rar" | "tar" | "gz" => (KindClass::File, "Archive"),
+        "exe" | "msi" => (KindClass::File, "Application"),
+        "dll" => (KindClass::File, "System File"),
+        "lnk" => (KindClass::File, "Shortcut"),
+        _ => (KindClass::File, "File"),
     }
 }
 
@@ -261,8 +290,8 @@ fn entries_of(path: &Path) -> anyhow::Result<Vec<Entry>> {
     collect_entries(path)
 }
 
-pub fn list_dir(path: &Path) -> anyhow::Result<Snapshot> {
-    Ok(Snapshot::from_entries(entries_of(path)?))
+pub fn list_sorted(path: &Path, key: SortKey) -> anyhow::Result<Snapshot> {
+    Ok(Snapshot::sorted(entries_of(path)?, key))
 }
 
 /// Direct subdirectories only. Does not recurse or follow symlinks.
@@ -271,7 +300,7 @@ pub fn list_dirs(path: &Path) -> anyhow::Result<Snapshot> {
         .into_iter()
         .filter(Entry::is_directory)
         .collect();
-    Ok(Snapshot::from_entries(dirs))
+    Ok(Snapshot::sorted(dirs, SortKey::Name))
 }
 
 pub fn format_size(n: u64) -> String {
@@ -335,6 +364,10 @@ mod tests {
         assert_eq!(kind_label(&file("a.docx")), "Word Document");
         assert_eq!(kind_label(&file("a.unknown")), "File");
         assert_eq!(kind_label(&file("noext")), "File");
+        assert_eq!(kind_label(&file("a.zip")), "Archive");
+        assert_eq!(kind_label(&file("setup.EXE")), "Application");
+        assert_eq!(kind_label(&file("ntdll.dll")), "System File");
+        assert_eq!(kind_label(&file("link.lnk")), "Shortcut");
     }
 
     #[test]
@@ -377,7 +410,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("visible.txt"), b"a").unwrap();
         std::fs::write(dir.join(".hidden"), b"b").unwrap();
-        let snap = list_dir(&dir).unwrap();
+        let snap = list_sorted(&dir, SortKey::default()).unwrap();
         let names: Vec<_> = snap.entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"visible.txt"));
         assert!(!names.contains(&".hidden"));
@@ -404,11 +437,57 @@ mod tests {
         let meta = std::fs::symlink_metadata(&path).unwrap();
         assert!(is_hidden(&path, "secret.txt", Some(&meta)));
         // Listing should also exclude it without a second independent path.
-        let snap = list_dir(&dir).unwrap();
+        let snap = list_sorted(&dir, SortKey::default()).unwrap();
         assert!(!snap.entries.iter().any(|e| e.name == "secret.txt"));
         let _ = Command::new("attrib")
             .args(["-H", &path.to_string_lossy()])
             .status();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_sort_is_dirs_then_newest_mtime() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let older = UNIX_EPOCH + Duration::from_secs(10);
+        let newer = UNIX_EPOCH + Duration::from_secs(50);
+        let mut a = file("a.txt");
+        a.modified = Some(older);
+        let mut b = file("b.txt");
+        b.modified = Some(newer);
+        let mut dir = file("z-folder");
+        dir.kind = EntryKind::Directory;
+        dir.modified = Some(older);
+        let snap = Snapshot::from_entries(vec![a, b, dir]);
+        let names: Vec<_> = snap.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["z-folder", "b.txt", "a.txt"]);
+    }
+
+    #[test]
+    fn same_contents_ignores_order_and_name_case() {
+        let mut a = file("Readme.TXT");
+        a.size = 12;
+        let mut b = file("notes.md");
+        b.size = 3;
+        let left = Snapshot {
+            entries: vec![a.clone(), b.clone()],
+        };
+        let mut b2 = b;
+        b2.name = "NOTES.md".into();
+        let right = Snapshot {
+            entries: vec![b2, a.clone()],
+        };
+        assert!(left.same_contents(&right));
+        let mut other = file("notes.md");
+        other.size = 99;
+        assert!(!left.same_contents(&Snapshot {
+            entries: vec![a, other],
+        }));
+    }
+
+    #[test]
+    fn name_sort_is_case_insensitive() {
+        let snap = Snapshot::sorted(vec![file("b.txt"), file("A.txt"), file("c.txt")], SortKey::Name);
+        let names: Vec<_> = snap.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["A.txt", "b.txt", "c.txt"]);
     }
 }
