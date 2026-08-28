@@ -1,12 +1,14 @@
-//! Raster thumbnails for media entries and per-file shell icons (executables,
-//! shortcuts), drawn from Windows Explorer's own thumbnail/icon pipeline via
-//! `IShellItemImageFactory`.
+//! Raster thumbnails and shell icons drawn from Windows Explorer's own
+//! thumbnail/icon pipeline via `IShellItemImageFactory`.
 //!
 //! A single size is extracted per path (clamped by Explorer to the larger
 //! side) and the UI scales it down; this keeps the working set small and the
-//! extraction fast. Results are cached in [`ThumbCache`], keyed by path plus a
-//! stamp: the own-file mtime for media/executables, or the resolved icon-source
+//! extraction fast. Per-file results (media, documents, executables,
+//! shortcuts) are cached in [`ThumbCache`], keyed by path plus a stamp: the
+//! own-file mtime for media/documents/executables, or the resolved icon-source
 //! identity for `.lnk` shortcuts so a rebuilt icon invalidates on its own.
+//! File types with no content preview (archives, unknowns) get one shared
+//! per-extension class icon from the system image list instead.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -64,6 +66,10 @@ pub struct ThumbCache {
     /// Resolved icon-source stamp per `.lnk` path, so the render probe can key
     /// on the source identity without re-reading the link on every paint.
     lnk_stamp: HashMap<PathBuf, u64>,
+    /// Per-extension "class" icons from the system image list, shared across
+    /// all files of a type. Extension set is small, so no LRU is needed.
+    class_icons: HashMap<String, Arc<RenderImage>>,
+    class_inflight: HashSet<String>,
 }
 
 impl ThumbCache {
@@ -74,6 +80,8 @@ impl ThumbCache {
             inflight: HashSet::new(),
             bytes: 0,
             lnk_stamp: HashMap::new(),
+            class_icons: HashMap::new(),
+            class_inflight: HashSet::new(),
         }
     }
 
@@ -107,6 +115,19 @@ impl ThumbCache {
 
     fn set_lnk_stamp(&mut self, path: &Path, stamp: u64) {
         self.lnk_stamp.insert(path.to_path_buf(), stamp);
+    }
+
+    /// Cached class icon for an extension, if resolved.
+    pub fn class_icon(&self, ext: &str) -> Option<Arc<RenderImage>> {
+        self.class_icons.get(ext).cloned()
+    }
+
+    pub fn class_is_inflight(&self, ext: &str) -> bool {
+        self.class_inflight.contains(ext)
+    }
+
+    pub fn mark_class_inflight(&mut self, ext: String) {
+        self.class_inflight.insert(ext);
     }
 
     pub fn insert(&mut self, key: CacheKey, img: Arc<RenderImage>) {
@@ -150,15 +171,37 @@ fn byte_size(img: &Arc<RenderImage>) -> usize {
     w.saturating_mul(h).max(1) * 4
 }
 
-/// Entries whose per-file image should be extracted: media thumbnails, plus
-/// executables and shortcuts with their own shell icon.
-fn wants_shell_icon(entry: &Entry) -> bool {
-    matches!(kind_class(entry), KindClass::Image | KindClass::Video)
-        || is_executable_or_shortcut(entry)
+/// Entries whose per-file image should be extracted: media thumbnails and
+/// document/audio previews, plus executables and shortcuts with their own
+/// shell icon. The shell decides whether it returns a real content thumbnail
+/// or a per-file icon; either is better than the themed glyph.
+pub(crate) fn wants_shell_icon(entry: &Entry) -> bool {
+    matches!(
+        kind_class(entry),
+        KindClass::Image | KindClass::Video | KindClass::Audio | KindClass::Document
+    ) || is_executable_or_shortcut(entry)
 }
 
 fn is_lnk(entry: &Entry) -> bool {
     Path::new(&entry.name).extension().is_some_and(|e| e.eq_ignore_ascii_case("lnk"))
+}
+
+/// Entries that show a per-extension "class" icon from the system image list
+/// instead of a themed glyph: the generic file bucket (archives, unknown
+/// types). These have no content thumbnail, so a single shared icon per
+/// extension beats one per file. Media, docs, audio, exe and shortcuts are
+/// handled by the per-file path; folders keep their glyph.
+pub(crate) fn wants_class_icon(entry: &Entry) -> bool {
+    kind_class(entry) == KindClass::File
+}
+
+/// Lowercased extension of an entry's name, or "" if it has none. In-memory
+/// only, never touches disk, so it is safe on the render thread.
+pub(crate) fn extension_of(entry: &Entry) -> String {
+    Path::new(&entry.name)
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default()
 }
 
 /// The cache key to probe for a visible entry. For `.lnk` shortcuts this uses
@@ -246,6 +289,47 @@ pub fn request_thumbnail(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) {
     .detach();
 }
 
+/// Returns the cached per-extension class icon for an entry if it is ready,
+/// otherwise kicks off resolution and returns `None` so the UI keeps the
+/// themed glyph until the icon lands.
+pub fn class_icon(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) -> Option<Arc<RenderImage>> {
+    let ext = extension_of(entry);
+    if ext.is_empty() {
+        return None;
+    }
+    let cache_entity = ply.thumb_cache();
+    let (cached, inflight) = {
+        let c = cache_entity.read(cx);
+        (c.class_icon(&ext), c.class_is_inflight(&ext))
+    };
+    if let Some(img) = cached {
+        return Some(img);
+    }
+    if inflight {
+        return None;
+    }
+    cache_entity.update(cx, |c, _| c.mark_class_inflight(ext.clone()));
+
+    let worker_ext = ext.clone();
+    cx.spawn(async move |this, cx| {
+        let got = cx
+            .background_spawn(async move { request_class_icon(worker_ext) })
+            .await
+            .and_then(|(bytes, w, h)| to_render_image(bytes, w, h));
+        let _ = this.update(cx, |this, cx| {
+            this.thumb_cache().update(cx, |c, _| {
+                c.class_inflight.remove(&ext);
+                if let Some(img) = got {
+                    c.class_icons.insert(ext, img);
+                }
+            });
+        });
+        let _ = this.update(cx, |_, cx| cx.notify());
+    })
+    .detach();
+    None
+}
+
 /// Re-resolve the icon-source stamp for the given `.lnk` paths and re-extract
 /// any whose source changed. Called periodically so a rebuilt target or a
 /// replaced icon file refreshes without the link's own mtime budging.
@@ -317,18 +401,34 @@ mod backend {
     use std::sync::mpsc::{channel, Sender};
     use std::sync::LazyLock;
     use std::thread;
-    use std::time::UNIX_EPOCH;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use windows::core::PCWSTR;
-    use windows::Win32::Foundation::SIZE;
+    use windows::Win32::Foundation::{FILETIME, SIZE};
     use windows::Win32::Graphics::Gdi::{
         BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CreateCompatibleDC, DIB_RGB_COLORS,
         DeleteDC, DeleteObject, GetDIBits, GetObjectW, SelectObject, HBITMAP, HGDIOBJ,
     };
-    use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+    use windows::Win32::Storage::EnhancedStorage::{
+        PKEY_Author, PKEY_Comment, PKEY_DateCreated, PKEY_Image_Dimensions, PKEY_Title,
+    };
+    use windows::Win32::System::Com::{
+        CoInitializeEx, COINIT_APARTMENTTHREADED, StructuredStorage::{
+            PropVariantToFileTime, PropVariantToString, PROPVARIANT,
+        },
+    };
+    use windows::Win32::System::Variant::PSTIME_FLAGS;
+    use windows::Win32::UI::Controls::{IImageList, ILD_TRANSPARENT};
+    use windows::Win32::UI::Shell::PropertiesSystem::{
+        GETPROPERTYSTOREFLAGS, IPropertyStore,
+    };
     use windows::Win32::UI::Shell::{
-        IShellItemImageFactory, SHCreateItemFromParsingName, SHFILEINFOW, SHGetFileInfoW, SIIGBF,
-        SHGFI_ICONLOCATION,
+        IShellItem2, IShellItemImageFactory, SHCreateItemFromParsingName, SHFILEINFOW,
+        SHGetFileInfoW, SHGetImageList, SIIGBF, SHGFI_FLAGS, SHGFI_ICONLOCATION,
+        SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES, SHIL_EXTRALARGE,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DestroyIcon, GetIconInfo, HICON, ICONINFO,
     };
     use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
 
@@ -352,6 +452,18 @@ mod backend {
         ResolveLnkSource {
             path: PathBuf,
             reply: Sender<Option<u64>>,
+        },
+        /// Resolve the per-extension "class" icon from the system image list,
+        /// keyed by extension alone and shared across all files of that type.
+        ResolveClassIcon {
+            ext: String,
+            reply: Sender<Option<ThumbPixels>>,
+        },
+        /// Read a few shell properties for a real on-disk file (Properties
+        /// dialog). Runs on the STA worker, like the other shell calls.
+        ReadProperties {
+            path: PathBuf,
+            reply: Sender<Vec<(String, String)>>,
         },
     }
 
@@ -377,6 +489,12 @@ mod backend {
                     }
                     Job::ResolveLnkSource { path, reply } => {
                         let _ = reply.send(lnk_source_stamp(&path));
+                    }
+                    Job::ResolveClassIcon { ext, reply } => {
+                        let _ = reply.send(class_pixels(&ext));
+                    }
+                    Job::ReadProperties { path, reply } => {
+                        let _ = reply.send(read_properties_impl(&path));
                     }
                 }
             }
@@ -433,7 +551,162 @@ mod backend {
         rx.recv().ok().flatten()
     }
 
-    /// Identity of a `.lnk`'s icon source: the path plus mtime of the file it
+    /// Resolve the per-extension class icon (shared across all files of that
+    /// type), as `None` on any failure so callers fall back to the SVG glyph.
+    pub(super) fn request_class_icon(ext: String) -> Option<ThumbPixels> {
+        let (tx, rx) = channel();
+        if WORKER
+            .send(Job::ResolveClassIcon {
+                ext,
+                reply: tx,
+            })
+            .is_err()
+        {
+            return None;
+        }
+        rx.recv().ok().flatten()
+    }
+
+    /// Dispatch a shell property read to the STA worker and block for the rows.
+    pub(super) fn request_properties(path: &Path) -> Vec<(String, String)> {
+        let (tx, rx) = channel();
+        if WORKER
+            .send(Job::ReadProperties {
+                path: path.to_path_buf(),
+                reply: tx,
+            })
+            .is_err()
+        {
+            return Vec::new();
+        }
+        rx.recv().unwrap_or_default()
+    }
+
+    /// The shell reads themselves, run on the STA worker. Returns non-empty
+    /// `(label, value)` rows; callers guard out MTP/portable paths.
+    fn read_properties_impl(path: &Path) -> Vec<(String, String)> {
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let item: IShellItem2 = match unsafe { SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None) } {
+            Ok(i) => i,
+            Err(_) => return Vec::new(),
+        };
+        let store: IPropertyStore = match unsafe {
+            item.GetPropertyStore(GETPROPERTYSTOREFLAGS::default())
+        } {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut rows: Vec<(String, String)> = Vec::new();
+        for (label, key) in [
+            ("Author", &PKEY_Author),
+            ("Title", &PKEY_Title),
+            ("Comment", &PKEY_Comment),
+            ("Dimensions", &PKEY_Image_Dimensions),
+        ] {
+            if let Ok(pv) = unsafe { store.GetValue(key) } {
+                let s = pv_string(&pv);
+                if !s.is_empty() {
+                    rows.push((label.to_string(), s));
+                }
+            }
+        }
+        if let Ok(pv) = unsafe { store.GetValue(&PKEY_DateCreated) }
+            && let Ok(ft) = unsafe { PropVariantToFileTime(&pv, PSTIME_FLAGS(0)) }
+            && let Some(st) = ft_to_systemtime(ft)
+        {
+            rows.push((
+                "Created".to_string(),
+                crate::listing::format_mtime(Some(st), chrono::Local::now()),
+            ));
+        }
+        rows
+    }
+
+    /// A `PROPVARIANT` as a plain string (strings and most scalar types), or
+    /// empty when it cannot be read as one.
+    fn pv_string(pv: &PROPVARIANT) -> String {
+        let mut buf = [0u16; 1024];
+        if unsafe { PropVariantToString(pv, &mut buf) }.is_ok() {
+            let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+            String::from_utf16_lossy(&buf[..len])
+        } else {
+            String::new()
+        }
+    }
+
+    /// A `FILETIME` (100ns since 1601) as a Unix `SystemTime`, if it is a sane
+    /// date.
+    fn ft_to_systemtime(ft: FILETIME) -> Option<SystemTime> {
+        let t: u64 = ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64;
+        if t < 116444736000000000 {
+            return None;
+        }
+        SystemTime::UNIX_EPOCH
+            .checked_add(std::time::Duration::from_secs((t - 116444736000000000) / 10_000_000))
+    }
+
+    /// The "class" (per-file-type) icon from the system image list, resolved
+    /// for a made-up name so no real file is needed. `SHGFI_SYSICONINDEX` finds
+    /// the index the shell uses for that extension (via `SHGFI_USEFILEATTRIBUTES`
+    /// it needs no real file); we then pull the 48px extralarge icon for that
+    /// index, the same artwork Explorer shows.
+    fn class_pixels(ext: &str) -> Option<ThumbPixels> {
+        if ext.is_empty() {
+            return None;
+        }
+        let name: Vec<u16> = format!("C:\\classicon.{ext}\0").encode_utf16().collect();
+        let mut sfi: SHFILEINFOW = unsafe { std::mem::zeroed() };
+        let index = unsafe {
+            SHGetFileInfoW(
+                PCWSTR(name.as_ptr()),
+                FILE_ATTRIBUTE_NORMAL,
+                Some(&mut sfi as *mut _ as *mut _),
+                std::mem::size_of::<SHFILEINFOW>() as u32,
+                SHGFI_FLAGS(SHGFI_SYSICONINDEX.0 | SHGFI_USEFILEATTRIBUTES.0),
+            )
+        };
+        if index == 0 {
+            return None;
+        }
+        let list: IImageList =
+            unsafe { SHGetImageList::<IImageList>(SHIL_EXTRALARGE as i32) }.ok()?;
+        let hicon: HICON = unsafe { list.GetIcon(index as i32, ILD_TRANSPARENT.0) }.ok()?;
+        let res = hicon_to_pixels(hicon);
+        unsafe {
+            let _ = DestroyIcon(hicon);
+        }
+        res
+    }
+
+    /// Draw a `HICON` into BA pixels via its color bitmap, reusing the same
+    /// BMP decode as `extract`.
+    fn hicon_to_pixels(hicon: HICON) -> Option<ThumbPixels> {
+        let mut info: ICONINFO = unsafe { std::mem::zeroed() };
+        if unsafe { GetIconInfo(hicon, &mut info) }.is_err() {
+            return None;
+        }
+        let bits = if info.hbmColor.0.is_null() {
+            // Monochrome icons have only a mask; fall back to the mask.
+            info.hbmMask
+        } else {
+            info.hbmColor
+        };
+        let res = hbitmap_to_bgra(bits);
+        unsafe {
+            if !info.hbmColor.0.is_null() {
+                let _ = DeleteObject(HGDIOBJ(info.hbmColor.0));
+            }
+            if !info.hbmMask.0.is_null() {
+                let _ = DeleteObject(HGDIOBJ(info.hbmMask.0));
+            }
+        }
+        res
+    }
     /// draws its icon from, folded with the icon index. This is what moves when
     /// a target is rebuilt or an icon file is replaced, and is the same
     /// (source file, index) tuple the shell itself keys its icon cache by.
@@ -601,8 +874,72 @@ fn resolve_lnk_source(_path: &Path) -> Option<u64> {
     None
 }
 
+#[cfg(not(windows))]
+fn request_class_icon(_ext: String) -> Option<(Vec<u8>, u32, u32)> {
+    None
+}
+
 #[cfg(windows)]
-use backend::{request, request_lnk, resolve_lnk_source};
+use backend::{request, request_class_icon, request_lnk, resolve_lnk_source};
 
 #[cfg(not(windows))]
-use {request, request_lnk, resolve_lnk_source};
+use {request, request_class_icon, request_lnk, resolve_lnk_source};
+
+/// Read a few common shell properties for a real on-disk file, returning
+/// `(label, value)` rows for the Properties dialog. Runs on the STA worker;
+/// no-ops on non-Windows.
+pub fn read_properties(path: &Path) -> Vec<(String, String)> {
+    #[cfg(windows)]
+    {
+        backend::request_properties(path)
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::listing::{Entry, EntryKind};
+
+    fn entry(name: &str) -> Entry {
+        Entry {
+            path: PathBuf::from(name),
+            name: name.into(),
+            kind: EntryKind::File,
+            size: 0,
+            modified: None,
+            hidden: false,
+        }
+    }
+
+    #[test]
+    fn extension_of_lowercases_and_handles_missing() {
+        assert_eq!(extension_of(&entry("report.PDF")), "pdf");
+        assert_eq!(extension_of(&entry("archive.ZIP")), "zip");
+        assert_eq!(extension_of(&entry("noext")), "");
+    }
+
+    #[test]
+    fn class_icon_is_the_shared_bucket_only() {
+        assert!(wants_class_icon(&entry("data.bin")), "unknown extension");
+        assert!(wants_class_icon(&entry("archive.zip")), "archives have no thumbnail");
+        assert!(
+            !wants_class_icon(&entry("plain.txt")),
+            "document goes per-file"
+        );
+        assert!(!wants_class_icon(&entry("song.mp3")), "audio goes per-file");
+        assert!(!wants_class_icon(&entry("photo.jpg")), "image goes per-file");
+    }
+
+    #[test]
+    fn shell_icon_covers_documents_and_audio() {
+        assert!(wants_shell_icon(&entry("report.pdf")));
+        assert!(wants_shell_icon(&entry("song.mp3")));
+        assert!(wants_shell_icon(&entry("photo.jpg")));
+        assert!(!wants_shell_icon(&entry("archive.zip")), "archive uses class icon");
+        assert!(!wants_shell_icon(&entry("data.bin")), "unknown uses class icon");
+    }
+}

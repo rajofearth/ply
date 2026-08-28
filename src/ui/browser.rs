@@ -162,8 +162,9 @@ fn message(text: impl Into<gpui::SharedString>, ply: &Ply) -> AnyElement {
         .into_any_element()
 }
 
-/// Shows a decoded media thumbnail when one is cached, otherwise the generic
-/// SVG icon. Triggers extraction on demand for image/video entries.
+/// Shows a decoded media thumbnail when one is cached, a per-extension class
+/// icon for plain files, otherwise the generic SVG icon. Triggers extraction
+/// on demand for image/video/doc/audio entries.
 fn icon_or_thumb(
     ply: &Ply,
     entry: &Entry,
@@ -172,19 +173,31 @@ fn icon_or_thumb(
     cx: &mut Context<Ply>,
 ) -> AnyElement {
     let p = ply.palette();
-    let key = thumbs::probe_key(ply, entry, cx);
-    let cached = ply.thumb_cache().read(cx).get(&key);
-    if cached.is_none() {
-        thumbs::request_thumbnail(ply, entry, cx);
+    if thumbs::wants_shell_icon(entry) {
+        let key = thumbs::probe_key(ply, entry, cx);
+        let cached = ply.thumb_cache().read(cx).get(&key);
+        if cached.is_none() {
+            thumbs::request_thumbnail(ply, entry, cx);
+        }
+        return match cached {
+            Some(thumb) => img(thumb)
+                .size(px(box_px))
+                .rounded(px(2.))
+                .object_fit(ObjectFit::Cover)
+                .into_any_element(),
+            None => icon(entry_icon(entry), px(icon_px), p.muted_foreground).into_any_element(),
+        };
     }
-    match cached {
-        Some(thumb) => img(thumb)
+    if thumbs::wants_class_icon(entry)
+        && let Some(thumb) = thumbs::class_icon(ply, entry, cx)
+    {
+        return img(thumb)
             .size(px(box_px))
             .rounded(px(2.))
             .object_fit(ObjectFit::Cover)
-            .into_any_element(),
-        None => icon(entry_icon(entry), px(icon_px), p.muted_foreground).into_any_element(),
+            .into_any_element();
     }
+    icon(entry_icon(entry), px(icon_px), p.muted_foreground).into_any_element()
 }
 
 fn list_row(

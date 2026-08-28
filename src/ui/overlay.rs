@@ -211,7 +211,6 @@ fn properties(ply: &Ply, cx: &mut Context<Ply>) -> Option<AnyElement> {
         ("Modified", props.modified.clone()),
         ("Path", props.path.clone()),
     ];
-
     Some(
         deferred(
             div()
@@ -268,7 +267,12 @@ fn properties(ply: &Ply, cx: &mut Context<Ply>) -> Option<AnyElement> {
                                 )
                                 .children(
                                     rows.into_iter()
-                                        .map(|(label, value)| field(p, label, value)),
+                                        .map(|(label, value)| field(p, label.into(), value)),
+                                )
+                                .children(
+                                    props.details.iter().map(|(label, value)| {
+                                        field(p, label.clone(), value.clone())
+                                    }),
                                 ),
                         ),
                 ),
@@ -277,7 +281,7 @@ fn properties(ply: &Ply, cx: &mut Context<Ply>) -> Option<AnyElement> {
     )
 }
 
-fn field(p: crate::theme::Palette, label: &'static str, value: gpui::SharedString) -> gpui::Div {
+fn field(p: crate::theme::Palette, label: gpui::SharedString, value: gpui::SharedString) -> gpui::Div {
     div()
         .flex()
         .justify_between()

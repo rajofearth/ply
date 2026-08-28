@@ -149,6 +149,9 @@ pub struct Properties {
     pub size: SharedString,
     pub modified: SharedString,
     pub path: SharedString,
+    /// Extra shell-sourced facts (author, title, created, ...) filled in
+    /// asynchronously after the dialog opens.
+    pub details: Vec<(SharedString, SharedString)>,
 }
 
 /// What confirming a [`ConfirmDialog`] runs.

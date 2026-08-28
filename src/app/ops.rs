@@ -1005,6 +1005,7 @@ impl Ply {
                 path_display,
                 cx,
             );
+            self.fill_properties(path, cx);
             return;
         }
 
@@ -1035,6 +1036,7 @@ impl Ply {
             None => ("—".into(), "—".into(), "—".into()),
         };
         self.set_props(name, kind, size, modified, path_display, cx);
+        self.fill_properties(path, cx);
     }
 
     fn set_props(
@@ -1052,8 +1054,35 @@ impl Ply {
             size: size.into(),
             modified: modified.into(),
             path,
+            details: Vec::new(),
         });
         cx.notify();
+    }
+
+    /// Asynchronously enrich an open Properties dialog with shell-sourced
+    /// facts (author, title, created, ...) read via `IPropertyStore` on the
+    /// STA worker, so the dialog never blocks on the shell.
+    pub fn fill_properties(&mut self, path: &Path, cx: &mut Context<Self>) {
+        if crate::path_caps::is_portable(path) {
+            return;
+        }
+        let path = path.to_path_buf();
+        cx.spawn(async move |this, cx| {
+            let rows = cx.background_spawn(async move { crate::thumbs::read_properties(&path) }).await;
+            if rows.is_empty() {
+                return;
+            }
+            let _ = this.update(cx, |this, cx| {
+                if let Some(props) = this.properties.as_mut() {
+                    props.details = rows
+                        .into_iter()
+                        .map(|(k, v)| (k.into(), v.into()))
+                        .collect();
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     pub fn close_properties(&mut self, cx: &mut Context<Self>) {
