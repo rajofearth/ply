@@ -263,6 +263,7 @@ impl Ply {
         ply.refresh_volumes(cx);
         ply.start_watch_poll(cx);
         ply.start_volume_poll(cx);
+        ply.start_lnk_refresh(cx);
         ply.update_window_title(window);
         window.focus(&ply.focus, cx);
         ply

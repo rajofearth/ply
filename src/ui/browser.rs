@@ -172,7 +172,7 @@ fn icon_or_thumb(
     cx: &mut Context<Ply>,
 ) -> AnyElement {
     let p = ply.palette();
-    let key = thumbs::cache_key(&entry.path, entry.modified);
+    let key = thumbs::probe_key(ply, entry, cx);
     let cached = ply.thumb_cache().read(cx).get(&key);
     if cached.is_none() {
         thumbs::request_thumbnail(ply, entry, cx);

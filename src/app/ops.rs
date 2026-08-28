@@ -106,6 +106,42 @@ impl Ply {
         .detach();
     }
 
+    /// Periodically re-resolve `.lnk` icon sources so a rebuilt target or a
+    /// replaced icon file refreshes on its own, without the link's mtime
+    /// changing or the folder being touched.
+    pub(super) fn start_lnk_refresh(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(4000))
+                    .await;
+                let lnks = this
+                    .update(cx, |this, _| {
+                        this.visible()
+                            .into_iter()
+                            .filter(|e| {
+                                Path::new(&e.name)
+                                    .extension()
+                                    .is_some_and(|x| x.eq_ignore_ascii_case("lnk"))
+                            })
+                            .map(|e| e.path.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .ok();
+                let Some(lnks) = lnks else {
+                    break;
+                };
+                if lnks.is_empty() {
+                    continue;
+                }
+                let _ = this.update(cx, |_this, cx| {
+                    crate::thumbs::refresh_lnk(&lnks, cx)
+                });
+            }
+        })
+        .detach();
+    }
+
     /// Notice drives appearing and disappearing. Windows delivers this as
     /// `WM_DEVICECHANGE`, which GPUI does not surface, so poll instead.
     /// Lettered discover runs only when `GetLogicalDrives` changes; MTP refreshes

@@ -149,6 +149,18 @@ pub enum KindClass {
     File,
 }
 
+/// Whether an entry carries its own shell icon — an executable (.exe/.msi) or
+/// a Windows shortcut (.lnk). These resolve to a real per-file icon via
+/// `IShellItemImageFactory` (the same path Explorer uses), rather than a
+/// generic glyph.
+pub fn is_executable_or_shortcut(entry: &Entry) -> bool {
+    let mut buf = [0u8; 8];
+    matches!(
+        extension_lower(&entry.name, &mut buf),
+        "exe" | "msi" | "lnk"
+    )
+}
+
 /// Map an entry to its icon class from [`EntryKind`] / extension, not labels.
 pub fn kind_class(entry: &Entry) -> KindClass {
     match entry.kind {
@@ -401,6 +413,19 @@ mod tests {
         let mut dir = file("Pictures.jpg");
         dir.kind = EntryKind::Directory;
         assert_eq!(kind_label(&dir), "Folder");
+    }
+
+    #[test]
+    fn is_executable_or_shortcut_detects_common_types() {
+        assert!(is_executable_or_shortcut(&file("setup.exe")));
+        assert!(is_executable_or_shortcut(&file("installer.msi")));
+        assert!(is_executable_or_shortcut(&file("App.lnk")));
+        assert!(!is_executable_or_shortcut(&file("photo.jpg")));
+        assert!(!is_executable_or_shortcut(&file("doc.txt")));
+        assert!(!is_executable_or_shortcut(&file("noext")));
+        let mut dir = file("App.exe");
+        dir.kind = EntryKind::Directory;
+        assert!(is_executable_or_shortcut(&dir), "shortcut check is name-based");
     }
 
     #[test]
