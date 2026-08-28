@@ -7,9 +7,12 @@ mod sidebar;
 mod status;
 mod titlebar;
 
+use std::sync::Arc;
+
 use gpui::{
-    Hsla, InteractiveElement, IntoElement, ParentElement, Pixels, Render, StatefulInteractiveElement,
-    Styled, Svg, Window, actions, div, prelude::FluentBuilder, px, svg,
+    Hsla, InteractiveElement, IntoElement, ObjectFit, ParentElement, Pixels, Render, RenderImage,
+    StatefulInteractiveElement, Styled, StyledImage, Svg, Window, actions, div, img,
+    prelude::FluentBuilder, px, svg,
 };
 
 use crate::app::{Location, Ply, ViewMode, dismiss_topmost};
@@ -58,6 +61,14 @@ pub fn icon(ico: Ico, size: Pixels, color: Hsla) -> Svg {
         .size(size)
         .flex_none()
         .text_color(color)
+}
+
+/// A cached raster (thumbnail, shell icon) as a fixed-size image element.
+pub(crate) fn thumb_img(thumb: &Arc<RenderImage>, size: f32) -> impl IntoElement {
+    img(thumb.clone())
+        .size(px(size))
+        .rounded(px(2.))
+        .object_fit(ObjectFit::Cover)
 }
 
 /// The small uppercase headings above each sidebar/home section.

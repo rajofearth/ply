@@ -6,7 +6,8 @@ use gpui::{
 use super::{icon, section_label};
 use crate::app::Ply;
 use crate::listing::format_size;
-use crate::volumes::{self, Volume};
+use crate::thumbs;
+use crate::volumes::{self, Volume, VolumeKind};
 
 /// The idle dashboard: drives and devices only, and no status bar.
 pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
@@ -53,7 +54,11 @@ fn card(ply: &Ply, v: &Volume, cx: &mut Context<Ply>) -> AnyElement {
     let p = ply.palette();
     let ico = v.ico();
     let pct = v.pct_used();
-    let fill = if pct >= 81.0 { p.destructive } else { p.chart_bar };
+    let fill = if pct >= 81.0 {
+        p.destructive
+    } else {
+        p.chart_bar
+    };
     let path = v.path.clone();
     let id = super::stable_id(&v.path);
 
@@ -71,7 +76,18 @@ fn card(ply: &Ply, v: &Volume, cx: &mut Context<Ply>) -> AnyElement {
                 .items_center()
                 .gap(px(8.))
                 .mb(px(10.))
-                .child(icon(ico, px(16.), p.muted_foreground))
+                .child(
+                    // Real shell icon for local volumes; a Network share must
+                    // never block the shared shell worker.
+                    if v.kind != VolumeKind::Network {
+                        match thumbs::path_icon(ply, &v.path, 0, cx) {
+                            Some(t) => super::thumb_img(&t, 16.).into_any_element(),
+                            None => icon(ico, px(16.), p.muted_foreground).into_any_element(),
+                        }
+                    } else {
+                        icon(ico, px(16.), p.muted_foreground).into_any_element()
+                    },
+                )
                 .child(
                     div()
                         .text_size(px(13.))

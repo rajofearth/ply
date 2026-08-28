@@ -9,11 +9,20 @@ use gpui::{
 use super::{icon, section_label};
 use crate::app::Ply;
 use crate::icons::Ico;
-use crate::volumes;
+use crate::thumbs;
+use crate::volumes::{self, VolumeKind};
 
 /// A folder being dragged onto Home to pin it.
 #[derive(Clone)]
 pub struct PinDrag(pub PathBuf);
+
+/// A sidebar row's lead icon: a themed glyph, or the real shell icon for a
+/// local path once its raster is cached. Only local paths — never a network
+/// share — go through the shared shell worker.
+enum RowIcon {
+    Glyph(Ico),
+    Path(PathBuf),
+}
 
 pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
     let p = ply.palette();
@@ -22,17 +31,32 @@ pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
     let mut pinned = Vec::new();
     for path in ply.quick_access.clone() {
         let label = ply.display_name(&path);
-        push_branch(ply, &mut pinned, path, label, Ico::Folder, 0, cx);
+        push_branch(
+            ply,
+            &mut pinned,
+            path.clone(),
+            label,
+            RowIcon::Path(path),
+            0,
+            cx,
+        );
     }
 
     let mut drive_rows = Vec::new();
     for v in drives {
+        // Only local volumes get a real shell icon; a Network share must never
+        // block the shared shell worker. (Drive for now, kept for safety.)
+        let icon = if v.kind != VolumeKind::Network {
+            RowIcon::Path(v.path.clone())
+        } else {
+            RowIcon::Glyph(v.ico())
+        };
         push_branch(
             ply,
             &mut drive_rows,
             v.path.clone(),
             v.name.clone().into(),
-            v.ico(),
+            icon,
             0,
             cx,
         );
@@ -40,12 +64,13 @@ pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
 
     let mut device_rows = Vec::new();
     for v in devices {
+        // Devices (MTP, network) keep their glyph: no local path to icon.
         push_branch(
             ply,
             &mut device_rows,
             v.path.clone(),
             v.name.clone().into(),
-            v.ico(),
+            RowIcon::Glyph(v.ico()),
             0,
             cx,
         );
@@ -132,17 +157,25 @@ fn push_branch(
     out: &mut Vec<AnyElement>,
     path: PathBuf,
     label: SharedString,
-    ico: Ico,
+    row_icon: RowIcon,
     depth: usize,
     cx: &mut Context<Ply>,
 ) {
-    out.push(row(ply, &path, label, ico, depth, cx));
+    out.push(row(ply, &path, label, row_icon, depth, cx));
     if !ply.is_expanded(&path) {
         return;
     }
     for child in ply.child_folders(&path).to_vec() {
         let label = ply.display_name(&child);
-        push_branch(ply, out, child, label, Ico::Folder, depth + 1, cx);
+        push_branch(
+            ply,
+            out,
+            child.clone(),
+            label,
+            RowIcon::Path(child),
+            depth + 1,
+            cx,
+        );
     }
 }
 
@@ -150,7 +183,7 @@ fn row(
     ply: &Ply,
     path: &Path,
     label: SharedString,
-    ico: Ico,
+    row_icon: RowIcon,
     depth: usize,
     cx: &mut Context<Ply>,
 ) -> AnyElement {
@@ -201,7 +234,13 @@ fn row(
                     })
                 }),
         )
-        .child(icon(ico, px(14.), p.muted_foreground))
+        .child(match &row_icon {
+            RowIcon::Glyph(ico) => icon(*ico, px(14.), p.muted_foreground).into_any_element(),
+            RowIcon::Path(pth) => match thumbs::path_icon(ply, pth, 0, cx) {
+                Some(t) => super::thumb_img(&t, 14.).into_any_element(),
+                None => icon(Ico::Folder, px(14.), p.muted_foreground).into_any_element(),
+            },
+        })
         .child(div().truncate().child(label))
         .on_click({
             let path = path.to_path_buf();
@@ -252,7 +291,10 @@ fn recycle_bin_row(ply: &Ply, cx: &mut Context<Ply>) -> AnyElement {
         .when(!active, |el| {
             el.text_color(p.muted_foreground).hover(|s| s.bg(p.muted))
         })
-        .child(icon(Ico::Trash, px(14.), p.muted_foreground))
+        .child(match thumbs::recycle_bin_icon(ply, cx) {
+            Some(t) => super::thumb_img(&t, 14.).into_any_element(),
+            None => icon(Ico::Trash, px(14.), p.muted_foreground).into_any_element(),
+        })
         .child("Recycle Bin")
         .on_click(cx.listener(|this, _, window, cx| {
             this.open_folder(crate::recycle_bin::root(), window, cx);

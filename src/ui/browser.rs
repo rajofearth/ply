@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use gpui::AppContext;
 use gpui::{
     AnyElement, ClickEvent, Context, Div, FontWeight, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ObjectFit, ParentElement, Stateful, StatefulInteractiveElement, Styled,
-    StyledImage, div, img, prelude::FluentBuilder, px, uniform_list,
+    MouseDownEvent, ParentElement, Stateful, StatefulInteractiveElement, Styled, div,
+    prelude::FluentBuilder, px, uniform_list,
 };
 use gpui_component::Sizable;
 use gpui_component::input::Input;
@@ -173,6 +173,11 @@ fn icon_or_thumb(
     cx: &mut Context<Ply>,
 ) -> AnyElement {
     let p = ply.palette();
+    if entry.is_directory()
+        && let Some(thumb) = thumbs::folder_icon(ply, entry, cx)
+    {
+        return super::thumb_img(&thumb, box_px).into_any_element();
+    }
     if thumbs::wants_shell_icon(entry) {
         let key = thumbs::probe_key(ply, entry, cx);
         let cached = ply.thumb_cache().read(cx).get(&key);
@@ -180,22 +185,14 @@ fn icon_or_thumb(
             thumbs::request_thumbnail(ply, entry, cx);
         }
         return match cached {
-            Some(thumb) => img(thumb)
-                .size(px(box_px))
-                .rounded(px(2.))
-                .object_fit(ObjectFit::Cover)
-                .into_any_element(),
+            Some(thumb) => super::thumb_img(&thumb, box_px).into_any_element(),
             None => icon(entry_icon(entry), px(icon_px), p.muted_foreground).into_any_element(),
         };
     }
     if thumbs::wants_class_icon(entry)
         && let Some(thumb) = thumbs::class_icon(ply, entry, cx)
     {
-        return img(thumb)
-            .size(px(box_px))
-            .rounded(px(2.))
-            .object_fit(ObjectFit::Cover)
-            .into_any_element();
+        return super::thumb_img(&thumb, box_px).into_any_element();
     }
     icon(entry_icon(entry), px(icon_px), p.muted_foreground).into_any_element()
 }

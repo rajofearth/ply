@@ -52,8 +52,20 @@ pub(crate) fn stamped_key(path: &Path, stamp: u64) -> CacheKey {
 }
 
 fn mtime_nanos(t: Option<SystemTime>) -> u64 {
-    t.and_then(|t| t.duration_since(UNIX_EPOCH).ok().map(|d| d.as_nanos() as u64))
-        .unwrap_or(0)
+    t.and_then(|t| {
+        t.duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_nanos() as u64)
+    })
+    .unwrap_or(0)
+}
+
+/// A fixed, environment-independent shell icon shared across all folders or
+/// entries that resolve to it. The UI never distinguishes the variants (e.g.
+/// an empty vs full Recycle Bin); the worker decides which artwork to use.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum StockIcon {
+    RecycleBin,
 }
 
 /// Per-window cache of decoded rasters, kept inside [`Ply`] so it is dropped
@@ -70,6 +82,9 @@ pub struct ThumbCache {
     /// all files of a type. Extension set is small, so no LRU is needed.
     class_icons: HashMap<String, Arc<RenderImage>>,
     class_inflight: HashSet<String>,
+    /// Fixed stock icons (e.g. the Recycle Bin), one per [`StockIcon`].
+    stock_icons: HashMap<StockIcon, Arc<RenderImage>>,
+    stock_inflight: HashSet<StockIcon>,
 }
 
 impl ThumbCache {
@@ -82,6 +97,8 @@ impl ThumbCache {
             lnk_stamp: HashMap::new(),
             class_icons: HashMap::new(),
             class_inflight: HashSet::new(),
+            stock_icons: HashMap::new(),
+            stock_inflight: HashSet::new(),
         }
     }
 
@@ -128,6 +145,19 @@ impl ThumbCache {
 
     pub fn mark_class_inflight(&mut self, ext: String) {
         self.class_inflight.insert(ext);
+    }
+
+    /// Cached stock icon (e.g. Recycle Bin), if resolved.
+    pub fn stock_icon(&self, stock: StockIcon) -> Option<Arc<RenderImage>> {
+        self.stock_icons.get(&stock).cloned()
+    }
+
+    pub fn stock_is_inflight(&self, stock: StockIcon) -> bool {
+        self.stock_inflight.contains(&stock)
+    }
+
+    pub fn mark_stock_inflight(&mut self, stock: StockIcon) {
+        self.stock_inflight.insert(stock);
     }
 
     pub fn insert(&mut self, key: CacheKey, img: Arc<RenderImage>) {
@@ -183,7 +213,9 @@ pub(crate) fn wants_shell_icon(entry: &Entry) -> bool {
 }
 
 fn is_lnk(entry: &Entry) -> bool {
-    Path::new(&entry.name).extension().is_some_and(|e| e.eq_ignore_ascii_case("lnk"))
+    Path::new(&entry.name)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("lnk"))
 }
 
 /// Entries that show a per-extension "class" icon from the system image list
@@ -254,10 +286,8 @@ pub fn request_thumbnail(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) {
             cx.background_spawn(async move { request_lnk(worker_path, THUMB_SIZE) })
                 .await
         } else {
-            cx.background_spawn(
-                async move { request(worker_path, THUMB_SIZE).map(|p| (p, None)) },
-            )
-            .await
+            cx.background_spawn(async move { request(worker_path, THUMB_SIZE).map(|p| (p, None)) })
+                .await
         };
         match got {
             Some(((bytes, w, h), stamp)) => {
@@ -280,7 +310,8 @@ pub fn request_thumbnail(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) {
             }
             None => {
                 let _ = this.update(cx, |this, cx| {
-                    this.thumb_cache().update(cx, |c, _| c.unmark_inflight(&key));
+                    this.thumb_cache()
+                        .update(cx, |c, _| c.unmark_inflight(&key));
                 });
             }
         }
@@ -349,40 +380,41 @@ pub fn refresh_lnk(paths: &[PathBuf], cx: &mut Context<Ply>) {
             else {
                 return;
             };
-            let _ = this.update(cx, |this, cx| {
-                let cache = this.thumb_cache();
-                let (current, busy) = {
-                    let c = cache.read(cx);
-                    (c.lnk_stamp(&path), c.inflight_path(&path))
-                };
-                // Unchanged source, or a request already in flight: skip.
-                if busy || current == Some(stamp) {
-                    return;
-                }
-                let store_key = stamped_key(&path, stamp);
-                cache.update(cx, |c, _| {
-                    c.mark_inflight(store_key.clone());
-                    c.set_lnk_stamp(&path, stamp);
-                });
-                let path = path.clone();
-                cx.spawn(async move |this, cx| {
-                    let got = cx
-                        .background_spawn(async move { request_lnk(path, THUMB_SIZE) })
-                        .await;
-                    let img = got.and_then(|((bytes, w, h), _)| to_render_image(bytes, w, h));
-                    let _ = this.update(cx, |this, cx| {
-                        this.thumb_cache().update(cx, |c, _| {
-                            c.unmark_inflight(&store_key);
-                            if let Some(img) = img {
-                                c.insert_force(store_key.clone(), img);
-                            }
-                        });
+            let _ = this
+                .update(cx, |this, cx| {
+                    let cache = this.thumb_cache();
+                    let (current, busy) = {
+                        let c = cache.read(cx);
+                        (c.lnk_stamp(&path), c.inflight_path(&path))
+                    };
+                    // Unchanged source, or a request already in flight: skip.
+                    if busy || current == Some(stamp) {
+                        return;
+                    }
+                    let store_key = stamped_key(&path, stamp);
+                    cache.update(cx, |c, _| {
+                        c.mark_inflight(store_key.clone());
+                        c.set_lnk_stamp(&path, stamp);
                     });
-                    let _ = this.update(cx, |_, cx| cx.notify());
+                    let path = path.clone();
+                    cx.spawn(async move |this, cx| {
+                        let got = cx
+                            .background_spawn(async move { request_lnk(path, THUMB_SIZE) })
+                            .await;
+                        let img = got.and_then(|((bytes, w, h), _)| to_render_image(bytes, w, h));
+                        let _ = this.update(cx, |this, cx| {
+                            this.thumb_cache().update(cx, |c, _| {
+                                c.unmark_inflight(&store_key);
+                                if let Some(img) = img {
+                                    c.insert_force(store_key.clone(), img);
+                                }
+                            });
+                        });
+                        let _ = this.update(cx, |_, cx| cx.notify());
+                    })
+                    .detach();
                 })
-                .detach();
-            })
-            .ok();
+                .ok();
         })
         .detach();
     }
@@ -398,39 +430,35 @@ fn to_render_image(bytes: Vec<u8>, w: u32, h: u32) -> Option<Arc<RenderImage>> {
 mod backend {
     use std::os::windows::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
-    use std::sync::mpsc::{channel, Sender};
     use std::sync::LazyLock;
+    use std::sync::mpsc::{Sender, channel};
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use windows::core::PCWSTR;
     use windows::Win32::Foundation::{FILETIME, SIZE};
     use windows::Win32::Graphics::Gdi::{
-        BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CreateCompatibleDC, DIB_RGB_COLORS,
-        DeleteDC, DeleteObject, GetDIBits, GetObjectW, SelectObject, HBITMAP, HGDIOBJ,
+        BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC,
+        DeleteObject, GetDIBits, GetObjectW, HBITMAP, HGDIOBJ, SelectObject,
     };
     use windows::Win32::Storage::EnhancedStorage::{
         PKEY_Author, PKEY_Comment, PKEY_DateCreated, PKEY_Image_Dimensions, PKEY_Title,
     };
+    use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
     use windows::Win32::System::Com::{
-        CoInitializeEx, COINIT_APARTMENTTHREADED, StructuredStorage::{
-            PropVariantToFileTime, PropVariantToString, PROPVARIANT,
-        },
+        COINIT_APARTMENTTHREADED, CoInitializeEx,
+        StructuredStorage::{PROPVARIANT, PropVariantToFileTime, PropVariantToString},
     };
     use windows::Win32::System::Variant::PSTIME_FLAGS;
     use windows::Win32::UI::Controls::{IImageList, ILD_TRANSPARENT};
-    use windows::Win32::UI::Shell::PropertiesSystem::{
-        GETPROPERTYSTOREFLAGS, IPropertyStore,
-    };
+    use windows::Win32::UI::Shell::PropertiesSystem::{GETPROPERTYSTOREFLAGS, IPropertyStore};
     use windows::Win32::UI::Shell::{
-        IShellItem2, IShellItemImageFactory, SHCreateItemFromParsingName, SHFILEINFOW,
-        SHGetFileInfoW, SHGetImageList, SIIGBF, SHGFI_FLAGS, SHGFI_ICONLOCATION,
-        SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES, SHIL_EXTRALARGE,
+        IShellItem2, IShellItemImageFactory, SHCreateItemFromParsingName, SHFILEINFOW, SHGFI_FLAGS,
+        SHGFI_ICONLOCATION, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES, SHGSI_ICON,
+        SHGetFileInfoW, SHGetImageList, SHGetStockIconInfo, SHIL_EXTRALARGE, SHSTOCKICONINFO,
+        SIID_RECYCLER, SIID_RECYCLERFULL, SIIGBF,
     };
-    use windows::Win32::UI::WindowsAndMessaging::{
-        DestroyIcon, GetIconInfo, HICON, ICONINFO,
-    };
-    use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
+    use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, ICONINFO};
+    use windows::core::PCWSTR;
 
     /// Decoded BGRA pixels plus dimensions.
     type ThumbPixels = (Vec<u8>, u32, u32);
@@ -459,6 +487,14 @@ mod backend {
             ext: String,
             reply: Sender<Option<ThumbPixels>>,
         },
+        /// Resolve the shell icon for a real path (a folder or drive root),
+        /// honoring `desktop.ini` custom icons the way Explorer does.
+        ResolvePathIcon {
+            path: PathBuf,
+            reply: Sender<Option<ThumbPixels>>,
+        },
+        /// Resolve a fixed stock icon (Recycle Bin for now).
+        ResolveStockIcon { reply: Sender<Option<ThumbPixels>> },
         /// Read a few shell properties for a real on-disk file (Properties
         /// dialog). Runs on the STA worker, like the other shell calls.
         ReadProperties {
@@ -492,6 +528,12 @@ mod backend {
                     }
                     Job::ResolveClassIcon { ext, reply } => {
                         let _ = reply.send(class_pixels(&ext));
+                    }
+                    Job::ResolvePathIcon { path, reply } => {
+                        let _ = reply.send(path_icon_pixels(&path));
+                    }
+                    Job::ResolveStockIcon { reply } => {
+                        let _ = reply.send(recycle_stock_pixels());
                     }
                     Job::ReadProperties { path, reply } => {
                         let _ = reply.send(read_properties_impl(&path));
@@ -556,12 +598,31 @@ mod backend {
     pub(super) fn request_class_icon(ext: String) -> Option<ThumbPixels> {
         let (tx, rx) = channel();
         if WORKER
-            .send(Job::ResolveClassIcon {
-                ext,
-                reply: tx,
-            })
+            .send(Job::ResolveClassIcon { ext, reply: tx })
             .is_err()
         {
+            return None;
+        }
+        rx.recv().ok().flatten()
+    }
+
+    /// Resolve the shell icon for a real path (folder or drive root), as `None`
+    /// on any failure so callers fall back to the themed glyph.
+    pub(super) fn request_path_icon_pixels(path: PathBuf) -> Option<ThumbPixels> {
+        let (tx, rx) = channel();
+        if WORKER
+            .send(Job::ResolvePathIcon { path, reply: tx })
+            .is_err()
+        {
+            return None;
+        }
+        rx.recv().ok().flatten()
+    }
+
+    /// Resolve a fixed stock icon (Recycle Bin), as `None` on any failure.
+    pub(super) fn request_stock_icon_pixels() -> Option<ThumbPixels> {
+        let (tx, rx) = channel();
+        if WORKER.send(Job::ResolveStockIcon { reply: tx }).is_err() {
             return None;
         }
         rx.recv().ok().flatten()
@@ -590,16 +651,16 @@ mod backend {
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
-        let item: IShellItem2 = match unsafe { SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None) } {
-            Ok(i) => i,
-            Err(_) => return Vec::new(),
-        };
-        let store: IPropertyStore = match unsafe {
-            item.GetPropertyStore(GETPROPERTYSTOREFLAGS::default())
-        } {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
+        let item: IShellItem2 =
+            match unsafe { SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None) } {
+                Ok(i) => i,
+                Err(_) => return Vec::new(),
+            };
+        let store: IPropertyStore =
+            match unsafe { item.GetPropertyStore(GETPROPERTYSTOREFLAGS::default()) } {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
 
         let mut rows: Vec<(String, String)> = Vec::new();
         for (label, key) in [
@@ -646,8 +707,9 @@ mod backend {
         if t < 116444736000000000 {
             return None;
         }
-        SystemTime::UNIX_EPOCH
-            .checked_add(std::time::Duration::from_secs((t - 116444736000000000) / 10_000_000))
+        SystemTime::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(
+            (t - 116444736000000000) / 10_000_000,
+        ))
     }
 
     /// The "class" (per-file-type) icon from the system image list, resolved
@@ -661,7 +723,9 @@ mod backend {
         }
         let name: Vec<u16> = format!("C:\\classicon.{ext}\0").encode_utf16().collect();
         let mut sfi: SHFILEINFOW = unsafe { std::mem::zeroed() };
-        let index = unsafe {
+        // Nonzero return means the call succeeded; the index is in `sfi.iIcon`.
+        // The DWORD_PTR return value is not reliably the index on 64-bit.
+        let ok = unsafe {
             SHGetFileInfoW(
                 PCWSTR(name.as_ptr()),
                 FILE_ATTRIBUTE_NORMAL,
@@ -670,17 +734,101 @@ mod backend {
                 SHGFI_FLAGS(SHGFI_SYSICONINDEX.0 | SHGFI_USEFILEATTRIBUTES.0),
             )
         };
-        if index == 0 {
+        if ok == 0 {
             return None;
         }
+        list_icon_at(sfi.iIcon)
+    }
+
+    /// Pull the extralarge (48px) system-image-list icon at `index` and decode
+    /// it to BGRA, destroying the `HICON` afterwards. Shared by the class icon
+    /// and the real-path (folder/drive) icon paths.
+    fn list_icon_at(index: i32) -> Option<ThumbPixels> {
         let list: IImageList =
             unsafe { SHGetImageList::<IImageList>(SHIL_EXTRALARGE as i32) }.ok()?;
-        let hicon: HICON = unsafe { list.GetIcon(index as i32, ILD_TRANSPARENT.0) }.ok()?;
+        let hicon: HICON = unsafe { list.GetIcon(index, ILD_TRANSPARENT.0) }.ok()?;
         let res = hicon_to_pixels(hicon);
         unsafe {
             let _ = DestroyIcon(hicon);
         }
         res
+    }
+
+    /// The shell icon for a real path (a folder or drive root), which honors
+    /// `desktop.ini` custom icons the way Explorer shows them. Uses the real
+    /// path (not a made-up name) with `SHGFI_SYSICONINDEX` so the shell resolves
+    /// the folder's own icon, pulled from the extralarge system image list.
+    fn path_icon_pixels(path: &Path) -> Option<ThumbPixels> {
+        if crate::mtp::is_mtp(path) {
+            return None;
+        }
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut sfi: SHFILEINFOW = unsafe { std::mem::zeroed() };
+        // Nonzero return means the call succeeded; the index is in `sfi.iIcon`.
+        // The DWORD_PTR return value is not reliably the index on 64-bit.
+        let ok = unsafe {
+            SHGetFileInfoW(
+                PCWSTR(wide.as_ptr()),
+                FILE_ATTRIBUTE_NORMAL,
+                Some(&mut sfi as *mut _ as *mut _),
+                std::mem::size_of::<SHFILEINFOW>() as u32,
+                SHGFI_FLAGS(SHGFI_SYSICONINDEX.0),
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        list_icon_at(sfi.iIcon)
+    }
+
+    /// The stock Recycle Bin icon. Which artwork (empty vs full) is decided by
+    /// scanning whether the bin holds anything; the caller never cares.
+    fn recycle_stock_pixels() -> Option<ThumbPixels> {
+        let id = if recycle_bin_has_items() {
+            SIID_RECYCLERFULL
+        } else {
+            SIID_RECYCLER
+        };
+        let mut info: SHSTOCKICONINFO = unsafe { std::mem::zeroed() };
+        info.cbSize = std::mem::size_of::<SHSTOCKICONINFO>() as u32;
+        if unsafe { SHGetStockIconInfo(id, SHGSI_ICON, &mut info) }.is_err() {
+            return None;
+        }
+        let res = hicon_to_pixels(info.hIcon);
+        unsafe {
+            let _ = DestroyIcon(info.hIcon);
+        }
+        res
+    }
+
+    /// Heuristic for whether any Recycle Bin holds items. For each present drive
+    /// letter, look at `X:\$Recycle.Bin`; each of its subdirectories is one user
+    /// SID, and a bin with anything in it has an entry there (even an empty bin
+    /// keeps its SID folder, so the check goes one level deeper).
+    fn recycle_bin_has_items() -> bool {
+        let mask = crate::volumes::logical_drives_mask();
+        for letter in 0..26u8 {
+            if mask & (1 << letter) == 0 {
+                continue;
+            }
+            let drive = format!("{}:\\", (b'A' + letter) as char);
+            let bin = format!("{drive}$Recycle.Bin");
+            let Ok(users) = std::fs::read_dir(&bin) else {
+                continue;
+            };
+            for dir in users.flatten() {
+                if let Ok(entries) = std::fs::read_dir(dir.path())
+                    && entries.into_iter().next().is_some()
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Draw a `HICON` into BA pixels via its color bitmap, reusing the same
@@ -830,7 +978,7 @@ mod backend {
                 0,
                 h,
                 Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
-                &mut bmi as *mut _ as *mut BITMAPINFO,
+                &mut bmi as *mut _,
                 DIB_RGB_COLORS,
             )
         };
@@ -851,7 +999,7 @@ mod backend {
         }
         let all_zero_alpha = out.iter().step_by(4).skip(1).all(|a| *a == 0);
         if all_zero_alpha {
-            for px in out.chunks_exact_mut(4) {
+            for px in out.as_chunks_mut::<4>().0 {
                 px[3] = 255;
             }
         }
@@ -879,6 +1027,16 @@ fn request_class_icon(_ext: String) -> Option<(Vec<u8>, u32, u32)> {
     None
 }
 
+#[cfg(not(windows))]
+fn request_path_icon_pixels(_path: PathBuf) -> Option<(Vec<u8>, u32, u32)> {
+    None
+}
+
+#[cfg(not(windows))]
+fn request_stock_icon_pixels() -> Option<(Vec<u8>, u32, u32)> {
+    None
+}
+
 #[cfg(windows)]
 use backend::{request, request_class_icon, request_lnk, resolve_lnk_source};
 
@@ -897,6 +1055,116 @@ pub fn read_properties(path: &Path) -> Vec<(String, String)> {
     {
         Vec::new()
     }
+}
+
+/// The shell icon for an arbitrary real path — a folder or a drive root like
+/// `C:\` — honoring `desktop.ini` custom icons the way Explorer shows them.
+/// Returns `Some` when the raster is already cached; otherwise kicks off an
+/// async extraction and returns `None` so the caller falls back to an SVG
+/// glyph until it lands.
+pub fn path_icon(
+    ply: &Ply,
+    path: &Path,
+    stamp: u64,
+    cx: &mut Context<Ply>,
+) -> Option<Arc<RenderImage>> {
+    let key = stamped_key(path, stamp);
+    let cache_entity = ply.thumb_cache();
+    let (cached, inflight) = {
+        let c = cache_entity.read(cx);
+        (c.get(&key), c.is_inflight(&key))
+    };
+    if let Some(img) = cached {
+        return Some(img);
+    }
+    if inflight {
+        return None;
+    }
+    if crate::mtp::is_mtp(path) {
+        // Never queue an MTP request; the shell read would hang on it. Leave
+        // the key unmarked so a later non-in-flight call can still probe.
+        return None;
+    }
+    cache_entity.update(cx, |c, _| c.mark_inflight(key.clone()));
+
+    let path = path.to_path_buf();
+    cx.spawn(async move |this, cx| {
+        let got = cx
+            .background_spawn(async move {
+                #[cfg(windows)]
+                {
+                    backend::request_path_icon_pixels(path.clone())
+                }
+                #[cfg(not(windows))]
+                {
+                    None
+                }
+            })
+            .await
+            .and_then(|(bytes, w, h)| to_render_image(bytes, w, h));
+        let _ = this.update(cx, |this, cx| {
+            this.thumb_cache().update(cx, |c, _| {
+                c.unmark_inflight(&key);
+                if let Some(img) = got {
+                    c.insert(key.clone(), img);
+                }
+            });
+        });
+        let _ = this.update(cx, |_, cx| cx.notify());
+    })
+    .detach();
+    None
+}
+
+/// The shell icon for a folder entry, keyed by the folder's own mtime so a
+/// changed `desktop.ini` re-extracts the icon. Thin wrapper over [`path_icon`].
+pub fn folder_icon(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) -> Option<Arc<RenderImage>> {
+    path_icon(ply, &entry.path, mtime_nanos(entry.modified), cx)
+}
+
+/// The stock Recycle Bin icon, cached in the small per-cache stock map. Whether
+/// it shows empty or full is decided in the worker; the UI never cares.
+pub fn recycle_bin_icon(ply: &Ply, cx: &mut Context<Ply>) -> Option<Arc<RenderImage>> {
+    let stock = StockIcon::RecycleBin;
+    let cache_entity = ply.thumb_cache();
+    let (cached, inflight) = {
+        let c = cache_entity.read(cx);
+        (c.stock_icon(stock), c.stock_is_inflight(stock))
+    };
+    if let Some(img) = cached {
+        return Some(img);
+    }
+    if inflight {
+        return None;
+    }
+    cache_entity.update(cx, |c, _| c.mark_stock_inflight(stock));
+
+    cx.spawn(async move |this, cx| {
+        let got = cx
+            .background_spawn(async move {
+                #[cfg(windows)]
+                {
+                    backend::request_stock_icon_pixels()
+                }
+                #[cfg(not(windows))]
+                {
+                    None
+                }
+            })
+            .await
+            .and_then(|(bytes, w, h)| to_render_image(bytes, w, h));
+        let _ = this.update(cx, |this, cx| {
+            this.thumb_cache().update(cx, |c, _| {
+                c.stock_inflight.remove(&stock);
+                if let Some(img) = got {
+                    c.stock_icons.insert(stock, img);
+                }
+            });
+        });
+        let _ = this.update(cx, |_, cx| cx.notify());
+    })
+    .detach();
+    None
 }
 
 #[cfg(test)]
@@ -925,13 +1193,19 @@ mod tests {
     #[test]
     fn class_icon_is_the_shared_bucket_only() {
         assert!(wants_class_icon(&entry("data.bin")), "unknown extension");
-        assert!(wants_class_icon(&entry("archive.zip")), "archives have no thumbnail");
+        assert!(
+            wants_class_icon(&entry("archive.zip")),
+            "archives have no thumbnail"
+        );
         assert!(
             !wants_class_icon(&entry("plain.txt")),
             "document goes per-file"
         );
         assert!(!wants_class_icon(&entry("song.mp3")), "audio goes per-file");
-        assert!(!wants_class_icon(&entry("photo.jpg")), "image goes per-file");
+        assert!(
+            !wants_class_icon(&entry("photo.jpg")),
+            "image goes per-file"
+        );
     }
 
     #[test]
@@ -939,7 +1213,53 @@ mod tests {
         assert!(wants_shell_icon(&entry("report.pdf")));
         assert!(wants_shell_icon(&entry("song.mp3")));
         assert!(wants_shell_icon(&entry("photo.jpg")));
-        assert!(!wants_shell_icon(&entry("archive.zip")), "archive uses class icon");
-        assert!(!wants_shell_icon(&entry("data.bin")), "unknown uses class icon");
+        assert!(
+            !wants_shell_icon(&entry("archive.zip")),
+            "archive uses class icon"
+        );
+        assert!(
+            !wants_shell_icon(&entry("data.bin")),
+            "unknown uses class icon"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn shell_icon_pipeline_decodes_on_windows() {
+        // Regression: SHGetFileInfoW's DWORD_PTR return value is not reliably
+        // the icon index on 64-bit; the index must come from `sfi.iIcon`.
+        // Folders, per-type class icons and the stock recycle-bin icon must all
+        // decode to real pixels through the STA worker.
+        for dir in [std::env::temp_dir(), dirs::home_dir().unwrap()] {
+            let got = super::backend::request_path_icon_pixels(dir.clone());
+            assert!(
+                got.is_some(),
+                "path icon must decode for {:?}",
+                dir.display()
+            );
+        }
+        let cls = super::backend::request_class_icon("zip".into());
+        assert!(cls.is_some(), "class icon must decode for .zip");
+        let stock = super::backend::request_stock_icon_pixels();
+        assert!(stock.is_some(), "stock recycle-bin icon must decode");
+    }
+
+    #[test]
+    fn folder_stamp_is_zero_when_no_mtime_and_distinct_when_set() {
+        // `folder_icon` keys by the entry's own mtime, so a changed
+        // `desktop.ini` re-extracts the icon. Unknown mtime stamps as 0.
+        assert_eq!(mtime_nanos(None), 0);
+        let known = Some(
+            std::time::UNIX_EPOCH
+                .checked_add(std::time::Duration::from_secs(1_700_000_000))
+                .unwrap(),
+        );
+        let nanos = mtime_nanos(known);
+        assert!(nanos > 0, "a known mtime must not stamp as 0");
+        let p = Path::new("C:\\some-folder");
+        assert!(
+            stamped_key(p, 0) != stamped_key(p, nanos),
+            "different stamps must key different cache entries"
+        );
     }
 }
