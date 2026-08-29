@@ -105,7 +105,7 @@ pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
                 .when(!ply.is_home(), |el| {
                     el.text_color(p.muted_foreground).hover(|s| s.bg(p.muted))
                 })
-                .child(icon(Ico::Home, px(14.), p.muted_foreground))
+                .child(icon(Ico::Home, px(16.), p.muted_foreground))
                 .child("Home")
                 .on_click(cx.listener(|this, _, window, cx| this.go_home(window, cx))),
         )
@@ -235,10 +235,13 @@ fn row(
                 }),
         )
         .child(match &row_icon {
-            RowIcon::Glyph(ico) => icon(*ico, px(14.), p.muted_foreground).into_any_element(),
-            RowIcon::Path(pth) => match thumbs::path_icon(ply, pth, 0, cx) {
-                Some(t) => super::thumb_img(&t, 14.).into_any_element(),
-                None => icon(Ico::Folder, px(14.), p.muted_foreground).into_any_element(),
+            RowIcon::Glyph(ico) => icon(*ico, px(16.), p.muted_foreground).into_any_element(),
+            RowIcon::Path(pth) => match thumbs::path_icon_probe(ply, pth, 0, cx) {
+                thumbs::IconProbe::Ready(img) => super::thumb_img(&img, 16.).into_any_element(),
+                thumbs::IconProbe::Loading => super::icon_slot(16.).into_any_element(),
+                thumbs::IconProbe::Glyph => {
+                    icon(Ico::Folder, px(16.), p.muted_foreground).into_any_element()
+                }
             },
         })
         .child(div().truncate().child(label))
@@ -291,9 +294,12 @@ fn recycle_bin_row(ply: &Ply, cx: &mut Context<Ply>) -> AnyElement {
         .when(!active, |el| {
             el.text_color(p.muted_foreground).hover(|s| s.bg(p.muted))
         })
-        .child(match thumbs::recycle_bin_icon(ply, cx) {
-            Some(t) => super::thumb_img(&t, 14.).into_any_element(),
-            None => icon(Ico::Trash, px(14.), p.muted_foreground).into_any_element(),
+        .child(match thumbs::recycle_bin_probe(ply, cx) {
+            thumbs::IconProbe::Ready(img) => super::thumb_img(&img, 16.).into_any_element(),
+            thumbs::IconProbe::Loading => super::icon_slot(16.).into_any_element(),
+            thumbs::IconProbe::Glyph => {
+                icon(Ico::Trash, px(16.), p.muted_foreground).into_any_element()
+            }
         })
         .child("Recycle Bin")
         .on_click(cx.listener(|this, _, window, cx| {

@@ -24,6 +24,13 @@ use chrono::{DateTime, Local};
 pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
     let list_view = ply.view == ViewMode::List;
     let count = ply.visible_len();
+    let entries = ply.visible();
+
+    // Prefetch: kick off icon extraction for the near window up front so icons
+    // resolve quickly; the rest request on demand as they render.
+    for e in entries.iter().take(PREFETCH_SCAN) {
+        thumbs::ensure_entry_icons(ply, e, cx);
+    }
 
     // The list view is virtualized: `uniform_list` scrolls itself and only asks
     // for the rows it is about to paint, so it must not sit inside another
@@ -48,7 +55,7 @@ pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
         None => scroll_area(list_view)
             .child(
                 div().flex().flex_wrap().gap(px(4.)).children(
-                    ply.visible()
+                    entries
                         .iter()
                         .enumerate()
                         .map(|(ix, e)| grid_cell(ply, e, ix, cx)),
@@ -76,6 +83,11 @@ pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
 const KIND_COL: f32 = 130.;
 const SIZE_COL: f32 = 80.;
 const MODIFIED_COL: f32 = 130.;
+
+/// How many listing entries get their icon extraction kicked off up front so
+/// icons resolve quickly; the rest request on demand as they render. Covers
+/// roughly two viewport-fulls of list rows without stalling media-heavy folders.
+const PREFETCH_SCAN: usize = 48;
 
 fn list_headers(ply: &Ply) -> impl IntoElement {
     let p = ply.palette();
@@ -165,6 +177,11 @@ fn message(text: impl Into<gpui::SharedString>, ply: &Ply) -> AnyElement {
 /// Shows a decoded media thumbnail when one is cached, a per-extension class
 /// icon for plain files, otherwise the generic SVG icon. Triggers extraction
 /// on demand for image/video/doc/audio entries.
+///
+/// A slot renders its real raster the moment it is cached; while it loads the
+/// slot is an invisible placeholder so geometry stays put. The themed glyph is
+/// only the terminal state, for entries that will never have a shell icon or
+/// whose resolution permanently failed.
 fn icon_or_thumb(
     ply: &Ply,
     entry: &Entry,
@@ -173,28 +190,13 @@ fn icon_or_thumb(
     cx: &mut Context<Ply>,
 ) -> AnyElement {
     let p = ply.palette();
-    if entry.is_directory()
-        && let Some(thumb) = thumbs::folder_icon(ply, entry, cx)
-    {
-        return super::thumb_img(&thumb, box_px).into_any_element();
-    }
-    if thumbs::wants_shell_icon(entry) {
-        let key = thumbs::probe_key(ply, entry, cx);
-        let cached = ply.thumb_cache().read(cx).get(&key);
-        if cached.is_none() {
-            thumbs::request_thumbnail(ply, entry, cx);
+    match thumbs::entry_icon_probe(ply, entry, cx) {
+        thumbs::IconProbe::Ready(img) => super::thumb_img(&img, box_px).into_any_element(),
+        thumbs::IconProbe::Loading => super::icon_slot(box_px).into_any_element(),
+        thumbs::IconProbe::Glyph => {
+            icon(entry_icon(entry), px(icon_px), p.muted_foreground).into_any_element()
         }
-        return match cached {
-            Some(thumb) => super::thumb_img(&thumb, box_px).into_any_element(),
-            None => icon(entry_icon(entry), px(icon_px), p.muted_foreground).into_any_element(),
-        };
     }
-    if thumbs::wants_class_icon(entry)
-        && let Some(thumb) = thumbs::class_icon(ply, entry, cx)
-    {
-        return super::thumb_img(&thumb, box_px).into_any_element();
-    }
-    icon(entry_icon(entry), px(icon_px), p.muted_foreground).into_any_element()
 }
 
 fn list_row(

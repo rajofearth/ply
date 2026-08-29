@@ -85,6 +85,11 @@ pub struct ThumbCache {
     /// Fixed stock icons (e.g. the Recycle Bin), one per [`StockIcon`].
     stock_icons: HashMap<StockIcon, Arc<RenderImage>>,
     stock_inflight: HashSet<StockIcon>,
+    /// Keys whose shell extraction permanently failed; a failed key renders the
+    /// themed glyph and is never re-requested.
+    failed: HashSet<CacheKey>,
+    /// Extensions whose class-icon resolution permanently failed.
+    class_failed: HashSet<String>,
 }
 
 impl ThumbCache {
@@ -99,6 +104,8 @@ impl ThumbCache {
             class_inflight: HashSet::new(),
             stock_icons: HashMap::new(),
             stock_inflight: HashSet::new(),
+            failed: HashSet::new(),
+            class_failed: HashSet::new(),
         }
     }
 
@@ -158,6 +165,24 @@ impl ThumbCache {
 
     pub fn mark_stock_inflight(&mut self, stock: StockIcon) {
         self.stock_inflight.insert(stock);
+    }
+
+    /// True if extraction for `key` permanently failed, so its slot settles on
+    /// the themed glyph instead of re-requesting on every render.
+    pub fn is_failed(&self, key: &CacheKey) -> bool {
+        self.failed.contains(key)
+    }
+
+    pub fn mark_failed(&mut self, key: CacheKey) {
+        if self.failed.len() >= 512 {
+            self.failed.clear();
+        }
+        self.failed.insert(key);
+    }
+
+    /// True if the per-extension class icon for `ext` permanently failed.
+    pub fn class_is_failed(&self, ext: &str) -> bool {
+        self.class_failed.contains(ext)
     }
 
     pub fn insert(&mut self, key: CacheKey, img: Arc<RenderImage>) {
@@ -269,11 +294,15 @@ pub fn request_thumbnail(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) {
     }
     let key = probe_key(ply, entry, cx);
     let cache_entity = ply.thumb_cache();
-    let (cached, inflight) = {
+    let (cached, inflight, failed) = {
         let c = cache_entity.read(cx);
-        (c.get(&key).is_some(), c.is_inflight(&key))
+        (
+            c.get(&key).is_some(),
+            c.is_inflight(&key),
+            c.is_failed(&key),
+        )
     };
-    if cached || inflight {
+    if cached || inflight || failed {
         return;
     }
     cache_entity.update(cx, |c, _| c.mark_inflight(key.clone()));
@@ -303,15 +332,21 @@ pub fn request_thumbnail(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) {
                             (Some(image), None) => {
                                 c.insert(key.clone(), image);
                             }
-                            _ => {}
+                            _ => {
+                                c.mark_failed(key.clone());
+                            }
                         }
                     });
                 });
             }
             None => {
                 let _ = this.update(cx, |this, cx| {
-                    this.thumb_cache()
-                        .update(cx, |c, _| c.unmark_inflight(&key));
+                    this.thumb_cache().update(cx, |c, _| {
+                        c.unmark_inflight(&key);
+                        // Remember the failure so the probe settles on the
+                        // themed glyph instead of re-requesting every render.
+                        c.mark_failed(key.clone());
+                    });
                 });
             }
         }
@@ -329,14 +364,18 @@ pub fn class_icon(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) -> Option<Arc
         return None;
     }
     let cache_entity = ply.thumb_cache();
-    let (cached, inflight) = {
+    let (cached, inflight, failed) = {
         let c = cache_entity.read(cx);
-        (c.class_icon(&ext), c.class_is_inflight(&ext))
+        (
+            c.class_icon(&ext),
+            c.class_is_inflight(&ext),
+            c.class_is_failed(&ext),
+        )
     };
     if let Some(img) = cached {
         return Some(img);
     }
-    if inflight {
+    if inflight || failed {
         return None;
     }
     cache_entity.update(cx, |c, _| c.mark_class_inflight(ext.clone()));
@@ -352,6 +391,11 @@ pub fn class_icon(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) -> Option<Arc
                 c.class_inflight.remove(&ext);
                 if let Some(img) = got {
                     c.class_icons.insert(ext, img);
+                } else {
+                    if c.class_failed.len() >= 512 {
+                        c.class_failed.clear();
+                    }
+                    c.class_failed.insert(ext);
                 }
             });
         });
@@ -361,9 +405,130 @@ pub fn class_icon(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) -> Option<Arc
     None
 }
 
-/// Re-resolve the icon-source stamp for the given `.lnk` paths and re-extract
-/// any whose source changed. Called periodically so a rebuilt target or a
-/// replaced icon file refreshes without the link's own mtime budging.
+/// Fire any icon extraction still pending for an entry — a folder's path icon,
+/// a per-extension class icon, or a content thumbnail — without deciding what
+/// to render. Idempotent; the reveal gate's prefetch pass calls this so every
+/// icon in the window starts resolving at once instead of one row at a time.
+pub(crate) fn ensure_entry_icons(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) {
+    if entry.is_directory() {
+        let _ = folder_icon(ply, entry, cx);
+    } else if wants_class_icon(entry) {
+        let _ = class_icon(ply, entry, cx);
+    } else if wants_shell_icon(entry) {
+        request_thumbnail(ply, entry, cx);
+    }
+}
+
+/// Whether the shell icon for an entry is still being extracted right now.
+/// The reveal gate holds back resolved rasters until no entry in the visible
+/// window is pending, so the listing swaps to real icons in one frame instead
+/// of a per-row pop-in.
+pub(crate) fn entry_icon_pending(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) -> bool {
+    if entry.is_directory() {
+        let key = stamped_key(&entry.path, mtime_nanos(entry.modified));
+        return ply.thumb_cache().read(cx).is_inflight(&key);
+    }
+    if wants_class_icon(entry) {
+        let ext = extension_of(entry);
+        return !ext.is_empty() && ply.thumb_cache().read(cx).class_is_inflight(&ext);
+    }
+    if wants_shell_icon(entry) {
+        let key = probe_key(ply, entry, cx);
+        return ply.thumb_cache().read(cx).is_inflight(&key);
+    }
+    false
+}
+
+/// What a slot should render while a shell icon is, or is not, resolved.
+/// The UI shows a blank placeholder for `Loading` so the themed fallback never
+/// flashes first and then gets replaced by the real raster.
+pub(crate) enum IconProbe {
+    /// A real shell raster is cached.
+    Ready(Arc<RenderImage>),
+    /// A real shell raster is being extracted; the slot stays blank meanwhile.
+    Loading,
+    /// No shell icon applies (or it permanently failed); the themed glyph is
+    /// the correct, final rendering.
+    Glyph,
+}
+
+/// Probe an entry's icon: ensure its extraction is running, then classify it
+/// for rendering. The single source of truth for both the reveal gate's
+/// prefetch and the row renderer, so they can never disagree on a slot.
+pub(crate) fn entry_icon_probe(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) -> IconProbe {
+    if entry.is_directory() {
+        if let Some(img) = folder_icon(ply, entry, cx) {
+            return IconProbe::Ready(img);
+        }
+        if entry_icon_pending(ply, entry, cx) {
+            IconProbe::Loading
+        } else {
+            IconProbe::Glyph
+        }
+    } else if wants_class_icon(entry) {
+        if let Some(img) = class_icon(ply, entry, cx) {
+            return IconProbe::Ready(img);
+        }
+        let ext = extension_of(entry);
+        if !ext.is_empty() && ply.thumb_cache().read(cx).class_is_inflight(&ext) {
+            IconProbe::Loading
+        } else {
+            IconProbe::Glyph
+        }
+    } else if wants_shell_icon(entry) {
+        let cache_entity = ply.thumb_cache();
+        let key = probe_key(ply, entry, cx);
+        if let Some(img) = cache_entity.read(cx).get(&key) {
+            return IconProbe::Ready(img);
+        }
+        request_thumbnail(ply, entry, cx);
+        if entry_icon_pending(ply, entry, cx) {
+            IconProbe::Loading
+        } else {
+            IconProbe::Glyph
+        }
+    } else {
+        IconProbe::Glyph
+    }
+}
+
+/// Probe a real path (folder / drive root) the same way [`entry_icon_probe`]
+/// probes an entry, for the sidebar and Home rows.
+pub(crate) fn path_icon_probe(
+    ply: &Ply,
+    path: &Path,
+    stamp: u64,
+    cx: &mut Context<Ply>,
+) -> IconProbe {
+    let cache_entity = ply.thumb_cache();
+    let key = stamped_key(path, stamp);
+    if let Some(img) = cache_entity.read(cx).get(&key) {
+        return IconProbe::Ready(img);
+    }
+    let _ = path_icon(ply, path, stamp, cx);
+    if cache_entity.read(cx).is_inflight(&key) {
+        IconProbe::Loading
+    } else {
+        IconProbe::Glyph
+    }
+}
+
+/// Probe the Recycle Bin stock icon for the sidebar row.
+pub(crate) fn recycle_bin_probe(ply: &Ply, cx: &mut Context<Ply>) -> IconProbe {
+    if let Some(img) = recycle_bin_icon(ply, cx) {
+        return IconProbe::Ready(img);
+    }
+    if ply
+        .thumb_cache()
+        .read(cx)
+        .stock_is_inflight(StockIcon::RecycleBin)
+    {
+        IconProbe::Loading
+    } else {
+        IconProbe::Glyph
+    }
+}
+
 pub fn refresh_lnk(paths: &[PathBuf], cx: &mut Context<Ply>) {
     for path in paths {
         if crate::mtp::is_mtp(path) {
@@ -1070,14 +1235,14 @@ pub fn path_icon(
 ) -> Option<Arc<RenderImage>> {
     let key = stamped_key(path, stamp);
     let cache_entity = ply.thumb_cache();
-    let (cached, inflight) = {
+    let (cached, inflight, failed) = {
         let c = cache_entity.read(cx);
-        (c.get(&key), c.is_inflight(&key))
+        (c.get(&key), c.is_inflight(&key), c.is_failed(&key))
     };
     if let Some(img) = cached {
         return Some(img);
     }
-    if inflight {
+    if inflight || failed {
         return None;
     }
     if crate::mtp::is_mtp(path) {
@@ -1107,6 +1272,8 @@ pub fn path_icon(
                 c.unmark_inflight(&key);
                 if let Some(img) = got {
                     c.insert(key.clone(), img);
+                } else {
+                    c.mark_failed(key);
                 }
             });
         });

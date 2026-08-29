@@ -78,14 +78,20 @@ fn card(ply: &Ply, v: &Volume, cx: &mut Context<Ply>) -> AnyElement {
                 .mb(px(10.))
                 .child(
                     // Real shell icon for local volumes; a Network share must
-                    // never block the shared shell worker.
+                    // never block the shared shell worker. The slot stays blank
+                    // while the icon loads — no themed glyph flash.
                     if v.kind != VolumeKind::Network {
-                        match thumbs::path_icon(ply, &v.path, 0, cx) {
-                            Some(t) => super::thumb_img(&t, 16.).into_any_element(),
-                            None => icon(ico, px(16.), p.muted_foreground).into_any_element(),
+                        match thumbs::path_icon_probe(ply, &v.path, 0, cx) {
+                            thumbs::IconProbe::Ready(img) => {
+                                super::thumb_img(&img, 24.).into_any_element()
+                            }
+                            thumbs::IconProbe::Loading => super::icon_slot(24.).into_any_element(),
+                            thumbs::IconProbe::Glyph => {
+                                icon(ico, px(24.), p.muted_foreground).into_any_element()
+                            }
                         }
                     } else {
-                        icon(ico, px(16.), p.muted_foreground).into_any_element()
+                        icon(ico, px(24.), p.muted_foreground).into_any_element()
                     },
                 )
                 .child(

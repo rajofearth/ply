@@ -71,6 +71,13 @@ pub(crate) fn thumb_img(thumb: &Arc<RenderImage>, size: f32) -> impl IntoElement
         .object_fit(ObjectFit::Cover)
 }
 
+/// An invisible, fixed-size slot that reserves an icon's box while its real
+/// shell raster resolves. Nothing is painted; the slot only keeps row/cell
+/// geometry stable so the icons swap in without layout jumps.
+pub(crate) fn icon_slot(size: f32) -> impl IntoElement {
+    div().flex_none().size(px(size))
+}
+
 /// The small uppercase headings above each sidebar/home section.
 ///
 /// The web build letter-spaces these; GPUI has no letter-spacing, so the
