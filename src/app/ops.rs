@@ -39,14 +39,15 @@ impl Ply {
             self.listing = LoadState::Loading;
         }
         self.list_task = Some(cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_spawn(async move { list_sorted(&folder, key) })
+            let scan_folder = folder.clone();
+            let snapshot = cx
+                .background_spawn(async move { list_sorted(&scan_folder, key) })
                 .await;
             this.update(cx, |this, cx| {
                 if this.list_generation != generation {
                     return;
                 }
-                match result {
+                match snapshot {
                     Ok(snapshot) => {
                         // A watch-driven reload usually finds nothing new;
                         // replacing an identical listing only causes churn.
@@ -55,9 +56,43 @@ impl Ply {
                         {
                             return;
                         }
+                        let batch_entries: Vec<_> = snapshot
+                            .entries
+                            .iter()
+                            .take(crate::thumbs::TYPE_ICON_BATCH_CAP)
+                            .cloned()
+                            .collect();
                         this.remember_names(&snapshot);
+                        // Commit names now. Type icons are pre-resolved by the
+                        // detached batch below and steered in when they land;
+                        // they never gate this paint (a stuck thumbnail can
+                        // no longer hold the listing at "Loading").
                         this.listing = LoadState::Ready(snapshot);
                         this.rebuild_visible();
+                        let folder = folder.clone();
+                        cx.spawn(async move |this, cx| {
+                            let icons = cx
+                                .background_spawn(async move {
+                                    crate::thumbs::resolve_listing_type_icons(&batch_entries)
+                                })
+                                .await;
+                            let _ = this.update(cx, |this, cx| {
+                                if this.list_generation != generation
+                                    || this.current_folder() != Some(folder.as_path())
+                                {
+                                    return;
+                                }
+                                if let Some(icons) = icons
+                                    && let LoadState::Ready(snapshot) = &this.listing
+                                {
+                                    this.thumb_cache().update(cx, |c, _| {
+                                        c.apply_listing_icons(&snapshot.entries, &icons);
+                                    });
+                                    cx.notify();
+                                }
+                            });
+                        })
+                        .detach();
                     }
                     Err(err) => {
                         this.listing = LoadState::Failed(err.to_string().into());
@@ -134,9 +169,7 @@ impl Ply {
                 if lnks.is_empty() {
                     continue;
                 }
-                let _ = this.update(cx, |_this, cx| {
-                    crate::thumbs::refresh_lnk(&lnks, cx)
-                });
+                let _ = this.update(cx, |_this, cx| crate::thumbs::refresh_lnk(&lnks, cx));
             }
         })
         .detach();
@@ -1068,7 +1101,9 @@ impl Ply {
         }
         let path = path.to_path_buf();
         cx.spawn(async move |this, cx| {
-            let rows = cx.background_spawn(async move { crate::thumbs::read_properties(&path) }).await;
+            let rows = cx
+                .background_spawn(async move { crate::thumbs::read_properties(&path) })
+                .await;
             if rows.is_empty() {
                 return;
             }

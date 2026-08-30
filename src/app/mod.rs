@@ -267,6 +267,11 @@ impl Ply {
         ply.start_watch_poll(cx);
         ply.start_volume_poll(cx);
         ply.start_lnk_refresh(cx);
+        cx.spawn(async move |_, cx| {
+            cx.background_spawn(async move { crate::thumbs::warm_shell() })
+                .await;
+        })
+        .detach();
         ply.update_window_title(window);
         window.focus(&ply.focus, cx);
         ply

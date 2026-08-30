@@ -1,14 +1,23 @@
 //! Raster thumbnails and shell icons drawn from Windows Explorer's own
-//! thumbnail/icon pipeline via `IShellItemImageFactory`.
+//! thumbnail/icon pipeline via `IShellItemImageFactory` and `SHGetFileInfoW`.
 //!
-//! A single size is extracted per path (clamped by Explorer to the larger
-//! side) and the UI scales it down; this keeps the working set small and the
-//! extraction fast. Per-file results (media, documents, executables,
-//! shortcuts) are cached in [`ThumbCache`], keyed by path plus a stamp: the
-//! own-file mtime for media/documents/executables, or the resolved icon-source
-//! identity for `.lnk` shortcuts so a rebuilt icon invalidates on its own.
-//! File types with no content preview (archives, unknowns) get one shared
-//! per-extension class icon from the system image list instead.
+//! Icons fall into two tiers, mirroring Explorer:
+//!
+//! * **Type icons** — folders, executables and per-extension class icons —
+//!   resolve off the system image list *before* a listing paints. [`reload`]
+//!   (`src/app/ops.rs`) resolves them in one batched worker round trip and
+//!   stores them in [`ThumbCache`], so names and icons land on the same frame.
+//!   Path icons are keyed by path plus mtime (folders honor `desktop.ini`,
+//!   exes their embedded artwork); class icons are one shared raster per
+//!   extension.
+//! * **Content thumbnails** — real media previews for images/videos/audio —
+//!   are extracted async via `IShellItemImageFactory` and swap in over the
+//!   type icon when they land, exactly like Explorer fills previews later.
+//!
+//! `.lnk` shortcuts resolve their target's icon through the same
+//! `IShellItemImageFactory` call, keyed by the resolved icon-source identity so
+//! a rebuilt target invalidates on its own. Everything that has no shell
+//! artwork (or whose resolution failed) renders the themed glyph.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -18,7 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use gpui::{AppContext, Context, RenderImage};
 
 use crate::app::Ply;
-use crate::listing::{Entry, KindClass, is_executable_or_shortcut, kind_class};
+use crate::listing::{Entry, KindClass, kind_class};
 
 /// One thumbnail size, in device-independent pixels on the larger side.
 pub const THUMB_SIZE: u32 = 96;
@@ -41,6 +50,33 @@ pub struct CacheKey {
 /// dimensions. The index is `SHFILEINFOW.iIcon`; many paths share one index,
 /// so the decoded raster is shared and the index lets caches dedup on it.
 type IndexedPixels = (i32, Vec<u8>, u32, u32);
+
+/// What a batched type-icon resolution should resolve for one listing entry:
+/// the shell icon of its real path (a folder honoring `desktop.ini`, or an
+/// executable's embedded artwork) or the per-extension class icon.
+pub(crate) enum IconTarget {
+    Path(PathBuf),
+    Class(String),
+}
+
+/// The result of a batched type-icon resolution: for each entry that resolved,
+/// which system-image-list index its icon is, plus the decoded raster per
+/// *distinct* index so the UI uploads each shell icon once and shares it.
+pub(crate) struct ListingIcons {
+    pub per_entry: Vec<(usize, i32)>,
+    pub decoded: Vec<IndexedPixels>,
+}
+
+/// Up-front cap on how many listing entries pre-resolve type icons. Beyond it
+/// the on-demand probe path covers scrolling rows. Dir/exe lookups are ~25µs
+/// each and class lookups dedup by extension, so 512 stays well under a frame.
+pub(crate) const TYPE_ICON_BATCH_CAP: usize = 512;
+
+/// How many content extractions (GetImage) may be queued to the thumbnail pool
+/// at once. Above this, render-driven probes yield until a completion frees a
+/// slot, so a media-heavy folder drains steadily instead of lining up hundreds
+/// of jobs that would starve names on the old single worker.
+pub(crate) const CONTENT_CAP: usize = 24;
 
 /// Default key: a path plus its own mtime (media, executables, fallback).
 pub fn cache_key(path: &Path, mtime: Option<SystemTime>) -> CacheKey {
@@ -99,6 +135,10 @@ pub struct ThumbCache {
     failed: HashSet<CacheKey>,
     /// Extensions whose class-icon resolution permanently failed.
     class_failed: HashSet<String>,
+    /// Content extractions currently dispatched to the thumbnail pool. Cap
+    /// guards opening a folder full of media from lining up hundreds of
+    /// GetImage jobs; the drain releases a slot on each completion.
+    content_pending: usize,
 }
 
 impl ThumbCache {
@@ -116,6 +156,7 @@ impl ThumbCache {
             stock_inflight: HashSet::new(),
             failed: HashSet::new(),
             class_failed: HashSet::new(),
+            content_pending: 0,
         }
     }
 
@@ -140,6 +181,18 @@ impl ThumbCache {
 
     fn unmark_inflight(&mut self, key: &CacheKey) {
         self.inflight.remove(key);
+    }
+
+    pub fn content_pending(&self) -> usize {
+        self.content_pending
+    }
+
+    fn reserve_content(&mut self) {
+        self.content_pending += 1;
+    }
+
+    fn release_content(&mut self) {
+        self.content_pending = self.content_pending.saturating_sub(1);
     }
 
     /// Stamp a `.lnk` resolves to; `None` means not resolved yet.
@@ -246,6 +299,46 @@ impl ThumbCache {
             None => img,
         }
     }
+
+    /// Fold pre-resolved listing type icons into the caches, one shared texture
+    /// per distinct shell index: path-keyed for folders/executables (so the
+    /// render probe's `folder_icon` hit is a plain map lookup) and
+    /// extension-keyed for everything else (docs, media, generic files). Runs
+    /// on the reload path before the listing paints, so icons appear frame 1.
+    /// Idempotent: already-present keys are left alone.
+    pub(crate) fn apply_listing_icons(&mut self, entries: &[Entry], icons: &ListingIcons) {
+        if icons.decoded.is_empty() || icons.per_entry.is_empty() {
+            return;
+        }
+        let mut by_index: HashMap<i32, Arc<RenderImage>> =
+            HashMap::with_capacity(icons.decoded.len());
+        for (index, bytes, w, h) in &icons.decoded {
+            if let Some(img) = to_render_image(bytes.clone(), *w, *h) {
+                let shared = self.share_index(Some(*index), img);
+                by_index.insert(*index, shared);
+            }
+        }
+        if by_index.is_empty() {
+            return;
+        }
+        for (ordinal, index) in &icons.per_entry {
+            let Some(entry) = entries.get(*ordinal) else {
+                continue;
+            };
+            let Some(img) = by_index.get(index) else {
+                continue;
+            };
+            if wants_path_icon(entry) {
+                let key = stamped_key(&entry.path, mtime_nanos(entry.modified));
+                self.insert(key, img.clone());
+            } else {
+                let ext = extension_of(entry);
+                if !ext.is_empty() {
+                    self.class_icons.insert(ext.clone(), img.clone());
+                }
+            }
+        }
+    }
 }
 
 fn byte_size(img: &Arc<RenderImage>) -> usize {
@@ -255,30 +348,42 @@ fn byte_size(img: &Arc<RenderImage>) -> usize {
     w.saturating_mul(h).max(1) * 4
 }
 
-/// Entries whose per-file image should be extracted: media thumbnails and
-/// document/audio previews, plus executables and shortcuts with their own
-/// shell icon. The shell decides whether it returns a real content thumbnail
-/// or a per-file icon; either is better than the themed glyph.
-pub(crate) fn wants_shell_icon(entry: &Entry) -> bool {
-    matches!(
-        kind_class(entry),
-        KindClass::Image | KindClass::Video | KindClass::Audio | KindClass::Document
-    ) || is_executable_or_shortcut(entry)
-}
-
 fn is_lnk(entry: &Entry) -> bool {
     Path::new(&entry.name)
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("lnk"))
 }
 
-/// Entries that show a per-extension "class" icon from the system image list
-/// instead of a themed glyph: the generic file bucket (archives, unknown
-/// types). These have no content thumbnail, so a single shared icon per
-/// extension beats one per file. Media, docs, audio, exe and shortcuts are
-/// handled by the per-file path; folders keep their glyph.
+/// Executables whose icon is their own embedded/associated artwork, resolved by
+/// real path (the way Explorer indexes them) rather than a per-extension class.
+fn is_executable_like(entry: &Entry) -> bool {
+    matches!(extension_of(entry).as_str(), "exe" | "msi")
+}
+
+/// Entries whose icon is the shell icon of their real path: folders (honoring
+/// `desktop.ini`) and executables. Resolved in the pre-paint batch.
+pub(crate) fn wants_path_icon(entry: &Entry) -> bool {
+    entry.is_directory() || is_executable_like(entry)
+}
+
+/// Media that deserve a real content thumbnail: the per-extension type icon
+/// shows first, then the thumbnail swaps in async, like Explorer fills previews
+/// later. MTP paths get the type icon only (no content pipeline for them).
+pub(crate) fn wants_content_thumbnail(entry: &Entry) -> bool {
+    !is_lnk(entry)
+        && !crate::mtp::is_mtp(&entry.path)
+        && matches!(
+            kind_class(entry),
+            KindClass::Image | KindClass::Video | KindClass::Audio
+        )
+}
+
+/// Entries that show a per-extension class icon, type-final: documents and
+/// generic files (archives, unknown types). Media/exe/shortcuts are handled by
+/// their own paths, folders keep a real path icon. Files with no extension
+/// resolve nothing and keep the themed glyph.
 pub(crate) fn wants_class_icon(entry: &Entry) -> bool {
-    kind_class(entry) == KindClass::File
+    !is_lnk(entry) && !wants_path_icon(entry) && !wants_content_thumbnail(entry)
 }
 
 /// Lowercased extension of an entry's name, or "" if it has none. In-memory
@@ -306,16 +411,12 @@ pub(crate) fn probe_key(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) -> Cach
     }
 }
 
-/// Kicks off extraction for an image, video, executable, or shortcut entry if
-/// it is not already cached or in flight, then notifies the window when it
-/// lands. Everything else falls back to the SVG icon in the UI.
-///
-/// Executables and `.lnk` shortcuts resolve their own shell icon (embedded
-/// exe icon / shortcut target icon) through the same `IShellItemImageFactory`
-/// call as media, so e.g. an app shows its real icon rather than a generic
-/// file glyph.
+/// Kicks off content extraction for a `.lnk` shortcut (its target icon) or a
+/// media entry (a real preview thumbnail) if it is not already cached or in
+/// flight, then notifies the window when it lands. Type icons are resolved by
+/// the pre-paint batch instead; this is the slow per-file tier.
 pub fn request_thumbnail(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) {
-    if !wants_shell_icon(entry) {
+    if !(is_lnk(entry) || wants_content_thumbnail(entry)) {
         return;
     }
     if crate::mtp::is_mtp(&entry.path) {
@@ -323,18 +424,22 @@ pub fn request_thumbnail(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) {
     }
     let key = probe_key(ply, entry, cx);
     let cache_entity = ply.thumb_cache();
-    let (cached, inflight, failed) = {
+    let (cached, inflight, failed, over_cap) = {
         let c = cache_entity.read(cx);
         (
             c.get(&key).is_some(),
             c.is_inflight(&key),
             c.is_failed(&key),
+            c.content_pending() >= CONTENT_CAP,
         )
     };
-    if cached || inflight || failed {
+    if cached || inflight || failed || over_cap {
         return;
     }
-    cache_entity.update(cx, |c, _| c.mark_inflight(key.clone()));
+    cache_entity.update(cx, |c, _| {
+        c.mark_inflight(key.clone());
+        c.reserve_content();
+    });
 
     let path = entry.path.clone();
     let worker_path = path.clone();
@@ -353,6 +458,7 @@ pub fn request_thumbnail(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) {
                 let _ = this.update(cx, |this, cx| {
                     this.thumb_cache().update(cx, |c, _| {
                         c.unmark_inflight(&key);
+                        c.release_content();
                         match (img, stamp) {
                             (Some(image), Some(stamp)) => {
                                 c.set_lnk_stamp(&path, stamp);
@@ -372,6 +478,7 @@ pub fn request_thumbnail(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) {
                 let _ = this.update(cx, |this, cx| {
                     this.thumb_cache().update(cx, |c, _| {
                         c.unmark_inflight(&key);
+                        c.release_content();
                         // Remember the failure so the probe settles on the
                         // themed glyph instead of re-requesting every render.
                         c.mark_failed(key.clone());
@@ -435,36 +542,40 @@ pub fn class_icon(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) -> Option<Arc
     None
 }
 
-/// Fire any icon extraction still pending for an entry — a folder's path icon,
-/// a per-extension class icon, or a content thumbnail — without deciding what
-/// to render. Idempotent; the reveal gate's prefetch pass calls this so every
-/// icon in the window starts resolving at once instead of one row at a time.
+/// Fire any icon extraction still pending for an entry — a path icon (folder /
+/// executable), a media content thumbnail, or a per-extension class icon —
+/// without deciding what to render. Idempotent; the prefetch pass calls this so
+/// every icon in the window starts resolving at once instead of one row at a
+/// time. After the pre-paint batch these mostly no-op on already-cached type
+/// icons.
 pub(crate) fn ensure_entry_icons(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) {
-    if entry.is_directory() {
+    if wants_path_icon(entry) {
         let _ = folder_icon(ply, entry, cx);
-    } else if wants_class_icon(entry) {
-        let _ = class_icon(ply, entry, cx);
-    } else if wants_shell_icon(entry) {
+    } else if is_lnk(entry) {
         request_thumbnail(ply, entry, cx);
+    } else if wants_content_thumbnail(entry) {
+        let _ = class_icon(ply, entry, cx);
+        request_thumbnail(ply, entry, cx);
+    } else {
+        let _ = class_icon(ply, entry, cx);
     }
 }
 
-/// Whether the shell icon for an entry is still being extracted right now.
-/// The reveal gate holds back resolved rasters until no entry in the visible
-/// window is pending, so the listing swaps to real icons in one frame instead
-/// of a per-row pop-in.
+/// Whether the icon for an entry is still being extracted right now. The row
+/// renderers use this to show a blank placeholder instead of flashing the
+/// themed glyph before the real raster lands.
 pub(crate) fn entry_icon_pending(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) -> bool {
-    if entry.is_directory() {
+    if wants_path_icon(entry) {
         let key = stamped_key(&entry.path, mtime_nanos(entry.modified));
+        return ply.thumb_cache().read(cx).is_inflight(&key);
+    }
+    if is_lnk(entry) || wants_content_thumbnail(entry) {
+        let key = probe_key(ply, entry, cx);
         return ply.thumb_cache().read(cx).is_inflight(&key);
     }
     if wants_class_icon(entry) {
         let ext = extension_of(entry);
         return !ext.is_empty() && ply.thumb_cache().read(cx).class_is_inflight(&ext);
-    }
-    if wants_shell_icon(entry) {
-        let key = probe_key(ply, entry, cx);
-        return ply.thumb_cache().read(cx).is_inflight(&key);
     }
     false
 }
@@ -483,13 +594,45 @@ pub(crate) enum IconProbe {
 }
 
 /// Probe an entry's icon: ensure its extraction is running, then classify it
-/// for rendering. The single source of truth for both the reveal gate's
-/// prefetch and the row renderer, so they can never disagree on a slot.
+/// for rendering. The single source of truth for both the prefetch pass and
+/// the row renderer, so they can never disagree on a slot.
 pub(crate) fn entry_icon_probe(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) -> IconProbe {
-    if entry.is_directory() {
+    if wants_path_icon(entry) {
+        // Folders and executables: a real path icon, pre-resolved by the batch
+        // so this is a plain map hit on freshly painted listings.
         if let Some(img) = folder_icon(ply, entry, cx) {
             return IconProbe::Ready(img);
         }
+        if entry_icon_pending(ply, entry, cx) {
+            IconProbe::Loading
+        } else {
+            IconProbe::Glyph
+        }
+    } else if is_lnk(entry) {
+        let cache_entity = ply.thumb_cache();
+        let key = probe_key(ply, entry, cx);
+        if let Some(img) = cache_entity.read(cx).get(&key) {
+            return IconProbe::Ready(img);
+        }
+        request_thumbnail(ply, entry, cx);
+        if entry_icon_pending(ply, entry, cx) {
+            IconProbe::Loading
+        } else {
+            IconProbe::Glyph
+        }
+    } else if wants_content_thumbnail(entry) {
+        let cache_entity = ply.thumb_cache();
+        let key = probe_key(ply, entry, cx);
+        // A real preview wins over the type icon.
+        if let Some(img) = cache_entity.read(cx).get(&key) {
+            return IconProbe::Ready(img);
+        }
+        // Type icon as the placeholder while the thumbnail extracts async.
+        if let Some(img) = class_icon(ply, entry, cx) {
+            request_thumbnail(ply, entry, cx);
+            return IconProbe::Ready(img);
+        }
+        request_thumbnail(ply, entry, cx);
         if entry_icon_pending(ply, entry, cx) {
             IconProbe::Loading
         } else {
@@ -501,18 +644,6 @@ pub(crate) fn entry_icon_probe(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) 
         }
         let ext = extension_of(entry);
         if !ext.is_empty() && ply.thumb_cache().read(cx).class_is_inflight(&ext) {
-            IconProbe::Loading
-        } else {
-            IconProbe::Glyph
-        }
-    } else if wants_shell_icon(entry) {
-        let cache_entity = ply.thumb_cache();
-        let key = probe_key(ply, entry, cx);
-        if let Some(img) = cache_entity.read(cx).get(&key) {
-            return IconProbe::Ready(img);
-        }
-        request_thumbnail(ply, entry, cx);
-        if entry_icon_pending(ply, entry, cx) {
             IconProbe::Loading
         } else {
             IconProbe::Glyph
@@ -623,15 +754,16 @@ fn to_render_image(bytes: Vec<u8>, w: u32, h: u32) -> Option<Arc<RenderImage>> {
 
 #[cfg(windows)]
 mod backend {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::os::windows::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc::{Sender, channel};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, LazyLock};
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::IndexedPixels;
+    use super::{IconTarget, IndexedPixels, ListingIcons};
 
     use windows::Win32::Foundation::{FILETIME, SIZE};
     use windows::Win32::Graphics::Gdi::{
@@ -665,7 +797,13 @@ mod backend {
     /// means the source identity could not be determined (fall back to mtime).
     type ExtractResult = (ThumbPixels, Option<u64>);
 
-    enum Job {
+    /// Thumbnail extraction runs on a small STA pool: each worker owns its own
+    /// apartment and queue, jobs are spread round-robin. A GetImage that hangs
+    /// (e.g. a synced/on-demand cloud file) stalls one thread; the others keep
+    /// draining, and names/type icons never share this pool at all.
+    const CONTENT_THREADS: usize = 4;
+
+    enum ContentJob {
         /// Extract the shell image for a path (media / executable). For a
         /// `.lnk` also resolve the icon source and fold it into the stamp.
         Extract {
@@ -674,6 +812,9 @@ mod backend {
             lnk: bool,
             reply: Sender<Option<ExtractResult>>,
         },
+    }
+
+    enum ShellJob {
         /// Resolve only the `.lnk` icon-source stamp, without extracting.
         ResolveLnkSource {
             path: PathBuf,
@@ -693,18 +834,28 @@ mod backend {
         },
         /// Resolve a fixed stock icon (Recycle Bin for now).
         ResolveStockIcon { reply: Sender<Option<ThumbPixels>> },
+        /// Resolve the type icons for a whole listing up front: real-path
+        /// icons (folders/executables) plus one class index per extension, all
+        /// in a single round trip, decoding each distinct index once.
+        ResolveListingTypeIcons {
+            targets: Vec<(u32, IconTarget)>,
+            reply: Sender<Option<ListingIcons>>,
+        },
         /// Read a few shell properties for a real on-disk file (Properties
-        /// dialog). Runs on the STA worker, like the other shell calls.
+        /// dialog). Runs on the shell worker.
         ReadProperties {
             path: PathBuf,
             reply: Sender<Vec<(String, String)>>,
         },
     }
 
-    static WORKER: LazyLock<Sender<Job>> = LazyLock::new(|| {
-        let (tx, rx) = channel::<Job>();
+    /// One STA thread for the fast shell-index work (type icons, lnk sources,
+    /// properties). Kept single: the lookups are ~microsecond rank shell cache
+    /// hits, and the shared per-index decode cache lives here with it.
+    static SHELL_WORKER: LazyLock<Sender<ShellJob>> = LazyLock::new(|| {
+        let (tx, rx) = channel::<ShellJob>();
         thread::spawn(move || {
-            // STA: IShellItemImageFactory/SHGetFileInfo expect an
+            // STA: SHGetFileInfo/SHGetStockIconInfo/property stores expect an
             // apartment-threaded caller.
             unsafe {
                 let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
@@ -712,31 +863,24 @@ mod backend {
             // Decoded BGRA per shell icon index, so a second folder/class that
             // lands on an already-seen index skips GetIcon+GetDIBits entirely.
             let mut index_cache: HashMap<i32, (Arc<Vec<u8>>, u32, u32)> = HashMap::new();
-            while let Ok(job) = rx.recv() {
+            for job in rx {
                 match job {
-                    Job::Extract {
-                        path,
-                        size,
-                        lnk,
-                        reply,
-                    } => {
-                        let pixels = extract(&path, size);
-                        let stamp = if lnk { lnk_source_stamp(&path) } else { None };
-                        let _ = reply.send(pixels.map(|p| (p, stamp)));
-                    }
-                    Job::ResolveLnkSource { path, reply } => {
+                    ShellJob::ResolveLnkSource { path, reply } => {
                         let _ = reply.send(lnk_source_stamp(&path));
                     }
-                    Job::ResolveClassIcon { ext, reply } => {
+                    ShellJob::ResolveClassIcon { ext, reply } => {
                         let _ = reply.send(class_pixels(&ext, &mut index_cache));
                     }
-                    Job::ResolvePathIcon { path, reply } => {
+                    ShellJob::ResolvePathIcon { path, reply } => {
                         let _ = reply.send(path_icon_pixels(&path, &mut index_cache));
                     }
-                    Job::ResolveStockIcon { reply } => {
+                    ShellJob::ResolveStockIcon { reply } => {
                         let _ = reply.send(recycle_stock_pixels());
                     }
-                    Job::ReadProperties { path, reply } => {
+                    ShellJob::ResolveListingTypeIcons { targets, reply } => {
+                        let _ = reply.send(listing_type_icons(&targets, &mut index_cache));
+                    }
+                    ShellJob::ReadProperties { path, reply } => {
                         let _ = reply.send(read_properties_impl(&path));
                     }
                 }
@@ -745,18 +889,65 @@ mod backend {
         tx
     });
 
+    /// Next worker to hand a content job to. Indexed into [`CONTENT_POOL`].
+    static CONTENT_NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    static CONTENT_POOL: LazyLock<Vec<Sender<ContentJob>>> = LazyLock::new(|| {
+        (0..CONTENT_THREADS)
+            .map(|_| {
+                let (tx, rx) = channel::<ContentJob>();
+                thread::spawn(move || {
+                    // STA: IShellItemImageFactory expects an apartment-threaded
+                    // caller; every worker initialises its own apartment.
+                    unsafe {
+                        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+                    }
+                    for job in rx {
+                        match job {
+                            ContentJob::Extract {
+                                path,
+                                size,
+                                lnk,
+                                reply,
+                            } => {
+                                let pixels = extract(&path, size);
+                                let stamp = if lnk { lnk_source_stamp(&path) } else { None };
+                                let _ = reply.send(pixels.map(|p| (p, stamp)));
+                            }
+                        }
+                    }
+                });
+                tx
+            })
+            .collect()
+    });
+
+    /// Spreads a content job over the pool. Round-robin load is even enough,
+    /// since extractions cost about the same per item.
+    fn content_dispatch(job: ContentJob) -> bool {
+        let senders = &CONTENT_POOL;
+        if senders.is_empty() {
+            return false;
+        }
+        let ix =
+            CONTENT_NEXT.fetch_add(1, Ordering::Relaxed) % senders.len();
+        senders[ix].send(job).is_ok()
+    }
+
+    /// Respects the single-writer rule for the shell worker's decode cache.
+    fn shell_dispatch(job: ShellJob) -> bool {
+        SHELL_WORKER.send(job).is_ok()
+    }
+
     /// Extract a media/executable raster. Returns `(pixels, None)`.
     pub(super) fn request(path: PathBuf, size: u32) -> Option<(Vec<u8>, u32, u32)> {
         let (tx, rx) = channel();
-        if WORKER
-            .send(Job::Extract {
-                path,
-                size,
-                lnk: false,
-                reply: tx,
-            })
-            .is_err()
-        {
+        if !content_dispatch(ContentJob::Extract {
+            path,
+            size,
+            lnk: false,
+            reply: tx,
+        }) {
             return None;
         }
         rx.recv().ok().flatten().map(|(p, _)| p)
@@ -765,15 +956,12 @@ mod backend {
     /// Extract a `.lnk` icon and its resolved source stamp.
     pub(super) fn request_lnk(path: PathBuf, size: u32) -> Option<ExtractResult> {
         let (tx, rx) = channel();
-        if WORKER
-            .send(Job::Extract {
-                path,
-                size,
-                lnk: true,
-                reply: tx,
-            })
-            .is_err()
-        {
+        if !content_dispatch(ContentJob::Extract {
+            path,
+            size,
+            lnk: true,
+            reply: tx,
+        }) {
             return None;
         }
         rx.recv().ok().flatten()
@@ -782,13 +970,10 @@ mod backend {
     /// Resolve only the `.lnk` icon-source stamp, without extracting.
     pub(super) fn resolve_lnk_source(path: &Path) -> Option<u64> {
         let (tx, rx) = channel();
-        if WORKER
-            .send(Job::ResolveLnkSource {
-                path: path.to_path_buf(),
-                reply: tx,
-            })
-            .is_err()
-        {
+        if !shell_dispatch(ShellJob::ResolveLnkSource {
+            path: path.to_path_buf(),
+            reply: tx,
+        }) {
             return None;
         }
         rx.recv().ok().flatten()
@@ -798,10 +983,7 @@ mod backend {
     /// type), as `None` on any failure so callers fall back to the SVG glyph.
     pub(super) fn request_class_icon(ext: String) -> Option<IndexedPixels> {
         let (tx, rx) = channel();
-        if WORKER
-            .send(Job::ResolveClassIcon { ext, reply: tx })
-            .is_err()
-        {
+        if !shell_dispatch(ShellJob::ResolveClassIcon { ext, reply: tx }) {
             return None;
         }
         rx.recv().ok().flatten()
@@ -811,10 +993,7 @@ mod backend {
     /// on any failure so callers fall back to the themed glyph.
     pub(super) fn request_path_icon_pixels(path: PathBuf) -> Option<IndexedPixels> {
         let (tx, rx) = channel();
-        if WORKER
-            .send(Job::ResolvePathIcon { path, reply: tx })
-            .is_err()
-        {
+        if !shell_dispatch(ShellJob::ResolvePathIcon { path, reply: tx }) {
             return None;
         }
         rx.recv().ok().flatten()
@@ -823,22 +1002,30 @@ mod backend {
     /// Resolve a fixed stock icon (Recycle Bin), as `None` on any failure.
     pub(super) fn request_stock_icon_pixels() -> Option<ThumbPixels> {
         let (tx, rx) = channel();
-        if WORKER.send(Job::ResolveStockIcon { reply: tx }).is_err() {
+        if !shell_dispatch(ShellJob::ResolveStockIcon { reply: tx }) {
             return None;
         }
         rx.recv().ok().flatten()
     }
 
-    /// Dispatch a shell property read to the STA worker and block for the rows.
+    /// Resolve a batch of listing type icons in one shell worker round trip.
+    pub(super) fn request_listing_type_icons(
+        targets: Vec<(u32, IconTarget)>,
+    ) -> Option<ListingIcons> {
+        let (tx, rx) = channel();
+        if !shell_dispatch(ShellJob::ResolveListingTypeIcons { targets, reply: tx }) {
+            return None;
+        }
+        rx.recv().ok().flatten()
+    }
+
+    /// Dispatch a shell property read to the shell worker and block for the rows.
     pub(super) fn request_properties(path: &Path) -> Vec<(String, String)> {
         let (tx, rx) = channel();
-        if WORKER
-            .send(Job::ReadProperties {
-                path: path.to_path_buf(),
-                reply: tx,
-            })
-            .is_err()
-        {
+        if !shell_dispatch(ShellJob::ReadProperties {
+            path: path.to_path_buf(),
+            reply: tx,
+        }) {
             return Vec::new();
         }
         rx.recv().unwrap_or_default()
@@ -913,15 +1100,42 @@ mod backend {
         ))
     }
 
-    /// The "class" (per-file-type) icon from the system image list, resolved
-    /// for a made-up name so no real file is needed. `SHGFI_SYSICONINDEX` finds
-    /// the index the shell uses for that extension (via `SHGFI_USEFILEATTRIBUTES`
-    /// it needs no real file); we then pull the 48px extralarge icon for that
-    /// index, the same artwork Explorer shows.
-    fn class_pixels(
-        ext: &str,
+    /// Resolve the type icons for a user listing in one pass: each target maps
+    /// to a system-image-list index (deduped by index when decoding), so the
+    /// UI uploads every distinct shell icon once and shares it. Entries that
+    /// fail to resolve are simply omitted.
+    fn listing_type_icons(
+        targets: &[(u32, IconTarget)],
         cache: &mut HashMap<i32, (Arc<Vec<u8>>, u32, u32)>,
-    ) -> Option<IndexedPixels> {
+    ) -> Option<ListingIcons> {
+        let mut per_entry: Vec<(usize, i32)> = Vec::with_capacity(targets.len());
+        let mut indices: Vec<i32> = Vec::with_capacity(targets.len());
+        for (ordinal, target) in targets {
+            let index = match target {
+                IconTarget::Path(path) => path_icon_index(path),
+                IconTarget::Class(ext) => class_icon_index(ext),
+            };
+            if let Some(index) = index {
+                per_entry.push((*ordinal as usize, index));
+                indices.push(index);
+            }
+        }
+        let mut decoded: Vec<IndexedPixels> = Vec::new();
+        let mut seen: HashSet<i32> = HashSet::new();
+        for index in indices {
+            if seen.insert(index)
+                && let Some((bytes, w, h)) = index_icon_at(index, cache)
+            {
+                decoded.push((index, bytes.as_ref().clone(), w, h));
+            }
+        }
+        Some(ListingIcons { per_entry, decoded })
+    }
+
+    /// The system-image-list index of the class icon for an extension, via a
+    /// made-up name so no real file is needed. `SHGFI_SYSICONINDEX` finds the
+    /// index the shell uses for that extension; the same artwork Explorer shows.
+    fn class_icon_index(ext: &str) -> Option<i32> {
         if ext.is_empty() {
             return None;
         }
@@ -941,8 +1155,20 @@ mod backend {
         if ok == 0 {
             return None;
         }
-        let (bytes, w, h) = index_icon_at(sfi.iIcon, cache)?;
-        Some((sfi.iIcon, bytes.as_ref().clone(), w, h))
+        Some(sfi.iIcon)
+    }
+
+    /// The "class" (per-file-type) icon from the system image list, resolved
+    /// for a made-up name so no real file is needed: `SHGetFileInfoW` finds the
+    /// index (shared by the batch), then the extralarge 48px icon is pulled for
+    /// that index from the system image list and decoded.
+    fn class_pixels(
+        ext: &str,
+        cache: &mut HashMap<i32, (Arc<Vec<u8>>, u32, u32)>,
+    ) -> Option<IndexedPixels> {
+        let index = class_icon_index(ext)?;
+        let (bytes, w, h) = index_icon_at(index, cache)?;
+        Some((index, bytes.as_ref().clone(), w, h))
     }
 
     /// Decoded BGRA for a system-image-list icon, cached per index so a second
@@ -977,14 +1203,10 @@ mod backend {
         res
     }
 
-    /// The shell icon for a real path (a folder or drive root), which honors
-    /// `desktop.ini` custom icons the way Explorer shows them. Uses the real
-    /// path (not a made-up name) with `SHGFI_SYSICONINDEX` so the shell resolves
-    /// the folder's own icon, pulled from the extralarge system image list.
-    fn path_icon_pixels(
-        path: &Path,
-        cache: &mut HashMap<i32, (Arc<Vec<u8>>, u32, u32)>,
-    ) -> Option<IndexedPixels> {
+    /// The system-image-list index for a real path, which honors `desktop.ini`
+    /// custom icons the way Explorer shows them. Shared by the single-path icon
+    /// request and the listing batch.
+    fn path_icon_index(path: &Path) -> Option<i32> {
         if crate::mtp::is_mtp(path) {
             return None;
         }
@@ -1008,8 +1230,20 @@ mod backend {
         if ok == 0 {
             return None;
         }
-        let (bytes, w, h) = index_icon_at(sfi.iIcon, cache)?;
-        Some((sfi.iIcon, bytes.as_ref().clone(), w, h))
+        Some(sfi.iIcon)
+    }
+
+    /// The shell icon for a real path (a folder or drive root), which honors
+    /// `desktop.ini` custom icons the way Explorer shows them: the shell
+    /// resolves the path's own index, and the extralarge 48px icon is pulled
+    /// from the system image list.
+    fn path_icon_pixels(
+        path: &Path,
+        cache: &mut HashMap<i32, (Arc<Vec<u8>>, u32, u32)>,
+    ) -> Option<IndexedPixels> {
+        let index = path_icon_index(path)?;
+        let (bytes, w, h) = index_icon_at(index, cache)?;
+        Some((index, bytes.as_ref().clone(), w, h))
     }
 
     /// The stock Recycle Bin icon. Which artwork (empty vs full) is decided by
@@ -1270,6 +1504,62 @@ use backend::{request, request_class_icon, request_lnk, resolve_lnk_source};
 #[cfg(not(windows))]
 use {request, request_class_icon, request_lnk, resolve_lnk_source};
 
+/// Warm the shell icon worker once, at startup, off the hot path. The STA
+/// worker thread and its apartment spin up lazily on the first icon request;
+/// paying that plus a cold shell lookup at launch keeps the first listing's
+/// icons from stalling a frame or two behind their names.
+pub fn warm_shell() {
+    #[cfg(windows)]
+    {
+        let dir = dirs::home_dir().unwrap_or_else(std::env::temp_dir);
+        let _ = backend::request_path_icon_pixels(dir);
+        // Pre-warm the shell's per-type association lookups (the cold ~1ms
+        // first hit per extension) so the first listing's batch is warm.
+        for ext in [
+            "zip", "pdf", "txt", "jpg", "png", "mp3", "mkv", "docx", "rar", "gif",
+        ] {
+            let _ = backend::request_class_icon(ext.into());
+        }
+    }
+    #[cfg(not(windows))]
+    {}
+}
+
+/// Resolve the *type* icons for listing entries in one batched worker round
+/// trip, so the icons are cached before the listing paints: real-path icons
+/// for folders/executables (`SHGetFileInfoW` on the actual path) and one
+/// per-extension class index for everything else. Content thumbnails are not
+/// part of the batch — media get their type icon here and swap in a preview
+/// later. Runs on the background executor in `reload`.
+pub(crate) fn resolve_listing_type_icons(entries: &[Entry]) -> Option<ListingIcons> {
+    #[cfg(windows)]
+    {
+        let mut targets: Vec<(u32, IconTarget)> = Vec::new();
+        for (ordinal, entry) in entries.iter().take(TYPE_ICON_BATCH_CAP).enumerate() {
+            if crate::mtp::is_mtp(&entry.path) || is_lnk(entry) {
+                continue;
+            }
+            if wants_path_icon(entry) {
+                targets.push((ordinal as u32, IconTarget::Path(entry.path.clone())));
+            } else if wants_class_icon(entry) || wants_content_thumbnail(entry) {
+                let ext = extension_of(entry);
+                if !ext.is_empty() {
+                    targets.push((ordinal as u32, IconTarget::Class(ext)));
+                }
+            }
+        }
+        if targets.is_empty() {
+            return None;
+        }
+        backend::request_listing_type_icons(targets)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (entries, TYPE_ICON_BATCH_CAP);
+        None
+    }
+}
+
 /// Read a few common shell properties for a real on-disk file, returning
 /// `(label, value)` rows for the Properties dialog. Runs on the STA worker;
 /// no-ops on non-Windows.
@@ -1413,6 +1703,17 @@ mod tests {
         }
     }
 
+    fn dir(name: &str) -> Entry {
+        Entry {
+            path: PathBuf::from(name),
+            name: name.into(),
+            kind: EntryKind::Directory,
+            size: 0,
+            modified: None,
+            hidden: false,
+        }
+    }
+
     #[test]
     fn extension_of_lowercases_and_handles_missing() {
         assert_eq!(extension_of(&entry("report.PDF")), "pdf");
@@ -1421,36 +1722,128 @@ mod tests {
     }
 
     #[test]
-    fn class_icon_is_the_shared_bucket_only() {
+    fn class_icon_covers_documents_and_generic_files() {
         assert!(wants_class_icon(&entry("data.bin")), "unknown extension");
         assert!(
             wants_class_icon(&entry("archive.zip")),
             "archives have no thumbnail"
         );
         assert!(
-            !wants_class_icon(&entry("plain.txt")),
-            "document goes per-file"
+            wants_class_icon(&entry("plain.txt")),
+            "documents are type-final"
         );
-        assert!(!wants_class_icon(&entry("song.mp3")), "audio goes per-file");
+        assert!(
+            !wants_class_icon(&entry("song.mp3")),
+            "audio gets a content thumbnail"
+        );
         assert!(
             !wants_class_icon(&entry("photo.jpg")),
-            "image goes per-file"
+            "image gets a content thumbnail"
         );
+        assert!(!wants_class_icon(&entry("setup.exe")), "exe is a path icon");
+        assert!(!wants_class_icon(&entry("App.lnk")), "lnk is its own tier");
     }
 
     #[test]
-    fn shell_icon_covers_documents_and_audio() {
-        assert!(wants_shell_icon(&entry("report.pdf")));
-        assert!(wants_shell_icon(&entry("song.mp3")));
-        assert!(wants_shell_icon(&entry("photo.jpg")));
+    fn path_icon_covers_folders_and_executables_only() {
         assert!(
-            !wants_shell_icon(&entry("archive.zip")),
-            "archive uses class icon"
+            wants_path_icon(&dir("Folder")),
+            "folders resolve a real path icon"
+        );
+        assert!(wants_path_icon(&entry("setup.exe")));
+        assert!(wants_path_icon(&entry("installer.msi")));
+        assert!(
+            !wants_path_icon(&entry("App.lnk")),
+            "lnk is not a batch path"
+        );
+        assert!(!wants_path_icon(&entry("photo.jpg")));
+        assert!(!wants_path_icon(&entry("doc.txt")));
+    }
+
+    #[test]
+    fn content_thumbnail_covers_local_media_only() {
+        assert!(wants_content_thumbnail(&entry("photo.jpg")));
+        assert!(wants_content_thumbnail(&entry("song.mp3")));
+        assert!(wants_content_thumbnail(&entry("clip.mkv")));
+        assert!(
+            !wants_content_thumbnail(&entry("report.pdf")),
+            "docs are type-final"
         );
         assert!(
-            !wants_shell_icon(&entry("data.bin")),
-            "unknown uses class icon"
+            !wants_content_thumbnail(&entry("setup.exe")),
+            "exe icon is resolved by path"
         );
+        assert!(!wants_content_thumbnail(&entry("App.lnk")));
+        assert!(!wants_content_thumbnail(&entry("data.bin")));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn batch_resolves_and_dedupes_listing_type_icons() {
+        // A batch over a temp dir, a subfolder and class-icon file names must
+        // resolve real indices for all of them, decode each distinct index once
+        // (no duplicate rasters), and be stable across repeats.
+        let dir = std::env::temp_dir();
+        let sub = dir.join("ply_batch_test");
+        let _ = std::fs::create_dir_all(&sub);
+        let entries = vec![
+            Entry {
+                path: dir.clone(),
+                name: "Temp".to_string(),
+                kind: EntryKind::Directory,
+                size: 0,
+                modified: None,
+                hidden: false,
+            },
+            Entry {
+                path: sub.clone(),
+                name: "sub".to_string(),
+                kind: EntryKind::Directory,
+                size: 0,
+                modified: None,
+                hidden: false,
+            },
+            Entry {
+                path: sub.join("b.pdf"),
+                name: "b.pdf".to_string(),
+                kind: EntryKind::File,
+                size: 0,
+                modified: None,
+                hidden: false,
+            },
+            Entry {
+                path: sub.join("b.jar"),
+                name: "b.jar".to_string(),
+                kind: EntryKind::File,
+                size: 0,
+                modified: None,
+                hidden: false,
+            },
+        ];
+        let icons = resolve_listing_type_icons(&entries).expect("batch must resolve");
+        assert!(
+            !icons.per_entry.is_empty(),
+            "dirs and class files must resolve"
+        );
+        assert!(!icons.decoded.is_empty(), "distinct indices must decode");
+        let decoded: std::collections::HashSet<i32> =
+            icons.decoded.iter().map(|(i, _, _, _)| *i).collect();
+        for (_, index) in &icons.per_entry {
+            assert!(
+                decoded.contains(index),
+                "every resolved entry must have its index decoded once"
+            );
+        }
+        assert!(
+            icons.decoded.len() <= icons.per_entry.len(),
+            "no more distinct rasters than entries"
+        );
+        let again = resolve_listing_type_icons(&entries).expect("batch must resolve again");
+        assert_eq!(
+            icons.per_entry, again.per_entry,
+            "the same listing resolves the same icons"
+        );
+        let _ = std::fs::remove_dir_all(&sub);
     }
 
     #[test]
