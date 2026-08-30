@@ -37,6 +37,11 @@ pub struct CacheKey {
     stamp: u64,
 }
 
+/// A decoded shell icon's system-image-list index plus its BGRA pixels and
+/// dimensions. The index is `SHFILEINFOW.iIcon`; many paths share one index,
+/// so the decoded raster is shared and the index lets caches dedup on it.
+type IndexedPixels = (i32, Vec<u8>, u32, u32);
+
 /// Default key: a path plus its own mtime (media, executables, fallback).
 pub fn cache_key(path: &Path, mtime: Option<SystemTime>) -> CacheKey {
     stamped_key(path, mtime_nanos(mtime))
@@ -82,6 +87,10 @@ pub struct ThumbCache {
     /// all files of a type. Extension set is small, so no LRU is needed.
     class_icons: HashMap<String, Arc<RenderImage>>,
     class_inflight: HashSet<String>,
+    /// One shared `RenderImage` per shell icon index (folders/classes resolving
+    /// to the same index hold one texture, not one per path). Tiny, few, and
+    /// canonical, so they are not LRU-accounted or evicted like per-path bytes.
+    index_icons: HashMap<i32, Arc<RenderImage>>,
     /// Fixed stock icons (e.g. the Recycle Bin), one per [`StockIcon`].
     stock_icons: HashMap<StockIcon, Arc<RenderImage>>,
     stock_inflight: HashSet<StockIcon>,
@@ -102,6 +111,7 @@ impl ThumbCache {
             lnk_stamp: HashMap::new(),
             class_icons: HashMap::new(),
             class_inflight: HashSet::new(),
+            index_icons: HashMap::new(),
             stock_icons: HashMap::new(),
             stock_inflight: HashSet::new(),
             failed: HashSet::new(),
@@ -215,6 +225,25 @@ impl ThumbCache {
                 }
                 None => break,
             }
+        }
+    }
+
+    /// Dedup a freshly-decoded image at `index`: once an index is seen, later
+    /// paths resolving to it reuse the stored texture and the passed `img` is
+    /// dropped (no second GPU upload). `None` (no index) passes through.
+    fn share_index(&mut self, index: Option<i32>, img: Arc<RenderImage>) -> Arc<RenderImage> {
+        match index {
+            Some(i) => {
+                if let Some(existing) = self.index_icons.get(&i) {
+                    return existing.clone();
+                }
+                if self.index_icons.len() >= 1024 {
+                    self.index_icons.clear();
+                }
+                self.index_icons.insert(i, img.clone());
+                img
+            }
+            None => img,
         }
     }
 }
@@ -385,12 +414,13 @@ pub fn class_icon(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) -> Option<Arc
         let got = cx
             .background_spawn(async move { request_class_icon(worker_ext) })
             .await
-            .and_then(|(bytes, w, h)| to_render_image(bytes, w, h));
+            .and_then(|(index, bytes, w, h)| to_render_image(bytes, w, h).map(|img| (index, img)));
         let _ = this.update(cx, |this, cx| {
             this.thumb_cache().update(cx, |c, _| {
                 c.class_inflight.remove(&ext);
-                if let Some(img) = got {
-                    c.class_icons.insert(ext, img);
+                if let Some((index, image)) = got {
+                    let shared = c.share_index(Some(index), image);
+                    c.class_icons.insert(ext, shared);
                 } else {
                     if c.class_failed.len() >= 512 {
                         c.class_failed.clear();
@@ -593,12 +623,15 @@ fn to_render_image(bytes: Vec<u8>, w: u32, h: u32) -> Option<Arc<RenderImage>> {
 
 #[cfg(windows)]
 mod backend {
+    use std::collections::HashMap;
     use std::os::windows::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
-    use std::sync::LazyLock;
     use std::sync::mpsc::{Sender, channel};
+    use std::sync::{Arc, LazyLock};
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::IndexedPixels;
 
     use windows::Win32::Foundation::{FILETIME, SIZE};
     use windows::Win32::Graphics::Gdi::{
@@ -650,13 +683,13 @@ mod backend {
         /// keyed by extension alone and shared across all files of that type.
         ResolveClassIcon {
             ext: String,
-            reply: Sender<Option<ThumbPixels>>,
+            reply: Sender<Option<IndexedPixels>>,
         },
         /// Resolve the shell icon for a real path (a folder or drive root),
         /// honoring `desktop.ini` custom icons the way Explorer does.
         ResolvePathIcon {
             path: PathBuf,
-            reply: Sender<Option<ThumbPixels>>,
+            reply: Sender<Option<IndexedPixels>>,
         },
         /// Resolve a fixed stock icon (Recycle Bin for now).
         ResolveStockIcon { reply: Sender<Option<ThumbPixels>> },
@@ -676,6 +709,9 @@ mod backend {
             unsafe {
                 let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
             }
+            // Decoded BGRA per shell icon index, so a second folder/class that
+            // lands on an already-seen index skips GetIcon+GetDIBits entirely.
+            let mut index_cache: HashMap<i32, (Arc<Vec<u8>>, u32, u32)> = HashMap::new();
             while let Ok(job) = rx.recv() {
                 match job {
                     Job::Extract {
@@ -692,10 +728,10 @@ mod backend {
                         let _ = reply.send(lnk_source_stamp(&path));
                     }
                     Job::ResolveClassIcon { ext, reply } => {
-                        let _ = reply.send(class_pixels(&ext));
+                        let _ = reply.send(class_pixels(&ext, &mut index_cache));
                     }
                     Job::ResolvePathIcon { path, reply } => {
-                        let _ = reply.send(path_icon_pixels(&path));
+                        let _ = reply.send(path_icon_pixels(&path, &mut index_cache));
                     }
                     Job::ResolveStockIcon { reply } => {
                         let _ = reply.send(recycle_stock_pixels());
@@ -760,7 +796,7 @@ mod backend {
 
     /// Resolve the per-extension class icon (shared across all files of that
     /// type), as `None` on any failure so callers fall back to the SVG glyph.
-    pub(super) fn request_class_icon(ext: String) -> Option<ThumbPixels> {
+    pub(super) fn request_class_icon(ext: String) -> Option<IndexedPixels> {
         let (tx, rx) = channel();
         if WORKER
             .send(Job::ResolveClassIcon { ext, reply: tx })
@@ -773,7 +809,7 @@ mod backend {
 
     /// Resolve the shell icon for a real path (folder or drive root), as `None`
     /// on any failure so callers fall back to the themed glyph.
-    pub(super) fn request_path_icon_pixels(path: PathBuf) -> Option<ThumbPixels> {
+    pub(super) fn request_path_icon_pixels(path: PathBuf) -> Option<IndexedPixels> {
         let (tx, rx) = channel();
         if WORKER
             .send(Job::ResolvePathIcon { path, reply: tx })
@@ -882,7 +918,10 @@ mod backend {
     /// the index the shell uses for that extension (via `SHGFI_USEFILEATTRIBUTES`
     /// it needs no real file); we then pull the 48px extralarge icon for that
     /// index, the same artwork Explorer shows.
-    fn class_pixels(ext: &str) -> Option<ThumbPixels> {
+    fn class_pixels(
+        ext: &str,
+        cache: &mut HashMap<i32, (Arc<Vec<u8>>, u32, u32)>,
+    ) -> Option<IndexedPixels> {
         if ext.is_empty() {
             return None;
         }
@@ -902,7 +941,26 @@ mod backend {
         if ok == 0 {
             return None;
         }
-        list_icon_at(sfi.iIcon)
+        let (bytes, w, h) = index_icon_at(sfi.iIcon, cache)?;
+        Some((sfi.iIcon, bytes.as_ref().clone(), w, h))
+    }
+
+    /// Decoded BGRA for a system-image-list icon, cached per index so a second
+    /// hit reuses the raster. `Some` when the icon decodes.
+    fn index_icon_at(
+        index: i32,
+        cache: &mut HashMap<i32, (Arc<Vec<u8>>, u32, u32)>,
+    ) -> Option<(Arc<Vec<u8>>, u32, u32)> {
+        if let Some(hit) = cache.get(&index) {
+            return Some(hit.clone());
+        }
+        let (bytes, w, h) = list_icon_at(index)?;
+        if cache.len() >= 1024 {
+            cache.clear();
+        }
+        let bytes = Arc::new(bytes);
+        cache.insert(index, (bytes.clone(), w, h));
+        Some((bytes, w, h))
     }
 
     /// Pull the extralarge (48px) system-image-list icon at `index` and decode
@@ -923,7 +981,10 @@ mod backend {
     /// `desktop.ini` custom icons the way Explorer shows them. Uses the real
     /// path (not a made-up name) with `SHGFI_SYSICONINDEX` so the shell resolves
     /// the folder's own icon, pulled from the extralarge system image list.
-    fn path_icon_pixels(path: &Path) -> Option<ThumbPixels> {
+    fn path_icon_pixels(
+        path: &Path,
+        cache: &mut HashMap<i32, (Arc<Vec<u8>>, u32, u32)>,
+    ) -> Option<IndexedPixels> {
         if crate::mtp::is_mtp(path) {
             return None;
         }
@@ -947,7 +1008,8 @@ mod backend {
         if ok == 0 {
             return None;
         }
-        list_icon_at(sfi.iIcon)
+        let (bytes, w, h) = index_icon_at(sfi.iIcon, cache)?;
+        Some((sfi.iIcon, bytes.as_ref().clone(), w, h))
     }
 
     /// The stock Recycle Bin icon. Which artwork (empty vs full) is decided by
@@ -1188,12 +1250,12 @@ fn resolve_lnk_source(_path: &Path) -> Option<u64> {
 }
 
 #[cfg(not(windows))]
-fn request_class_icon(_ext: String) -> Option<(Vec<u8>, u32, u32)> {
+fn request_class_icon(_ext: String) -> Option<IndexedPixels> {
     None
 }
 
 #[cfg(not(windows))]
-fn request_path_icon_pixels(_path: PathBuf) -> Option<(Vec<u8>, u32, u32)> {
+fn request_path_icon_pixels(_path: PathBuf) -> Option<IndexedPixels> {
     None
 }
 
@@ -1266,12 +1328,13 @@ pub fn path_icon(
                 }
             })
             .await
-            .and_then(|(bytes, w, h)| to_render_image(bytes, w, h));
+            .and_then(|(index, bytes, w, h)| to_render_image(bytes, w, h).map(|img| (index, img)));
         let _ = this.update(cx, |this, cx| {
             this.thumb_cache().update(cx, |c, _| {
                 c.unmark_inflight(&key);
-                if let Some(img) = got {
-                    c.insert(key.clone(), img);
+                if let Some((index, image)) = got {
+                    let shared = c.share_index(Some(index), image);
+                    c.insert(key.clone(), shared);
                 } else {
                     c.mark_failed(key);
                 }
@@ -1409,6 +1472,20 @@ mod tests {
         assert!(cls.is_some(), "class icon must decode for .zip");
         let stock = super::backend::request_stock_icon_pixels();
         assert!(stock.is_some(), "stock recycle-bin icon must decode");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn path_icon_index_is_stable_across_repeats() {
+        // The same shell index must resolve to the same decoder each time,
+        // so re-requesting a folder is free after the first decode.
+        let dir = std::env::temp_dir();
+        let (i1, pixels, w, h) =
+            super::backend::request_path_icon_pixels(dir.clone()).expect("path icon must decode");
+        let (i2, _, _, _) =
+            super::backend::request_path_icon_pixels(dir).expect("path icon must decode again");
+        assert_eq!(i1, i2, "same path must resolve to the same index");
+        assert!(w >= 16 && h >= 16 && pixels.len() >= (w * h * 4) as usize);
     }
 
     #[test]
