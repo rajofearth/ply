@@ -91,13 +91,12 @@ pub fn section_label(text: &'static str, color: Hsla) -> impl IntoElement {
         .child(text.to_uppercase())
 }
 
-/// Estimate the number of grid columns from the window width.
-const CELL_W: f32 = 96.;
-const CELL_GAP: f32 = 4.;
-const SIDEBAR_W: f32 = 220.;
+/// Estimate the number of grid columns from the window width. The centre pane
+/// spans the viewport minus the fixed sidebar, so row width is `viewport -
+/// SIDEBAR_W`; `grid_cols_from_width` turns that into columns. Shared with the
+/// virtualized grid layout in `browser.rs` so navigation and rendering agree.
 fn grid_cols(window: &Window) -> usize {
-    let avail = f32::from(window.viewport_size().width) - SIDEBAR_W;
-    ((avail / (CELL_W + CELL_GAP)).floor() as usize).max(1)
+    browser::grid_cols_from_width(f32::from(window.viewport_size().width) - browser::SIDEBAR_W)
 }
 
 impl Render for Ply {
@@ -249,7 +248,7 @@ impl Render for Ply {
                             .map(|el| match self.location {
                                 Location::Home => el.child(home::render(self, cx)),
                                 Location::Folder(_) => el
-                                    .child(browser::render(self, cx))
+                                    .child(browser::render(self, window, cx))
                                     .child(status::render(self, cx)),
                             }),
                     ),

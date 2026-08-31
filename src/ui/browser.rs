@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use gpui::AppContext;
 use gpui::{
     AnyElement, ClickEvent, Context, Div, FontWeight, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, Stateful, StatefulInteractiveElement, Styled, div,
+    MouseDownEvent, ParentElement, Stateful, StatefulInteractiveElement, Styled, Window, div,
     prelude::FluentBuilder, px, uniform_list,
 };
 use gpui_component::Sizable;
@@ -21,7 +21,7 @@ use crate::theme::Palette;
 use crate::thumbs;
 use chrono::{DateTime, Local};
 
-pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
+pub fn render(ply: &Ply, window: &Window, cx: &mut Context<Ply>) -> impl IntoElement {
     let list_view = ply.view == ViewMode::List;
     let count = ply.visible_len();
     let entries = ply.visible();
@@ -32,9 +32,15 @@ pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
         thumbs::ensure_entry_icons(ply, e, cx);
     }
 
-    // The list view is virtualized: `uniform_list` scrolls itself and only asks
-    // for the rows it is about to paint, so it must not sit inside another
-    // scroll area. Grid stays a plain wrapped flow for now.
+    // Both views are virtualized through `uniform_list`, which scrolls itself
+    // and only asks for the rows it is about to paint, so neither sits inside
+    // another scroll area. The grid has no virtualized primitive of its own, so
+    // it reuses `uniform_list` by packing a fixed number of cells per row: each
+    // list item is one row of `cols` cells laid out horizontally, mapped over
+    // the flat `visible_indices`. `cols` follows the same width rule the arrow
+    // keys use (`grid_cols_from_width`), so navigation and layout stay aligned.
+    let cols = grid_cols_from_width(avail_width(window));
+    let row_count = grid_row_count(count, cols);
     let body: AnyElement = match empty_message(ply, count) {
         Some(text) => scroll_area(list_view).child(text).into_any_element(),
         None if list_view => uniform_list(
@@ -52,16 +58,27 @@ pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
         .w_full()
         .min_h_0()
         .into_any_element(),
-        None => scroll_area(list_view)
-            .child(
-                div().flex().flex_wrap().gap(px(4.)).children(
-                    entries
-                        .iter()
-                        .enumerate()
-                        .map(|(ix, e)| grid_cell(ply, e, ix, cx)),
-                ),
-            )
-            .into_any_element(),
+        None => uniform_list(
+            "grid_rows",
+            row_count,
+            cx.processor(move |this, range: Range<usize>, _window, cx| {
+                let entries = this.visible();
+                range
+                    .map(|row_ix| {
+                        let rng = grid_row_range(row_ix, cols, entries.len());
+                        div()
+                            .flex()
+                            .gap(px(4.))
+                            .children(rng.map(|ix| grid_cell(this, entries[ix], ix, cx)))
+                            .into_any_element()
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .flex_1()
+        .w_full()
+        .min_h_0()
+        .into_any_element(),
     };
 
     div()
@@ -88,6 +105,46 @@ const MODIFIED_COL: f32 = 130.;
 /// icons resolve quickly; the rest request on demand as they render. Covers
 /// roughly two viewport-fulls of list rows without stalling media-heavy folders.
 const PREFETCH_SCAN: usize = 48;
+
+/// Grid cell geometry. `GRID_CELL_STRIDE` is the horizontal span one cell
+/// claims including the gap after it, so a row of `cols` cells is `cols*96 +
+/// (cols-1)*4` wide. Shared with the arrow-key navigation so navigation and
+/// layout agree on the column count.
+pub(crate) const GRID_CELL_W: f32 = 96.;
+pub(crate) const GRID_CELL_GAP: f32 = 4.;
+pub(crate) const SIDEBAR_W: f32 = 220.;
+
+/// The width the centre grid actually lays out into: the whole viewport minus
+/// the fixed sidebar. `grid_cell` doesn't add its own margin, so this is what a
+/// full row of cells can span.
+fn avail_width(window: &Window) -> f32 {
+    f32::from(window.viewport_size().width) - SIDEBAR_W
+}
+
+/// Number of grid columns a given available width can hold, never below one
+/// so a tiny window still gets a usable single-column grid.
+pub(crate) fn grid_cols_from_width(avail: f32) -> usize {
+    ((avail / (GRID_CELL_W + GRID_CELL_GAP)).floor() as usize).max(1)
+}
+
+/// Number of packed rows needed to hold `item_count` cells at `cols` per row.
+pub(crate) fn grid_row_count(item_count: usize, cols: usize) -> usize {
+    if item_count == 0 || cols == 0 {
+        return 0;
+    }
+    item_count.div_ceil(cols)
+}
+
+/// The flat visible-index range (start..end) a single packed row covers. `start`
+/// is `row_ix*cols`; the last row is truncated to the item count. Rows past the
+/// end produce an empty range.
+pub(crate) fn grid_row_range(row_ix: usize, cols: usize, item_count: usize) -> Range<usize> {
+    let start = row_ix.saturating_mul(cols);
+    if cols == 0 || start >= item_count {
+        return start..start;
+    }
+    start..(start + cols).min(item_count)
+}
 
 fn list_headers(ply: &Ply) -> impl IntoElement {
     let p = ply.palette();
@@ -385,4 +442,74 @@ fn rename_field(ply: &Ply, cx: &mut Context<Ply>) -> AnyElement {
         }))
         .child(Input::new(&rename.input).xsmall())
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grid_cols_are_at_least_one_and_floor() {
+        // Tiny widths still yield a single column.
+        assert_eq!(grid_cols_from_width(0.0), 1);
+        assert_eq!(grid_cols_from_width(50.0), 1);
+        assert_eq!(grid_cols_from_width(99.0), 1);
+        assert_eq!(grid_cols_from_width(100.0), 1);
+        // Exact stride boundaries and non-clean divisions floor down.
+        assert_eq!(grid_cols_from_width(199.0), 1);
+        assert_eq!(grid_cols_from_width(200.0), 2);
+        assert_eq!(grid_cols_from_width(250.0), 2);
+        assert_eq!(grid_cols_from_width(299.0), 2);
+        assert_eq!(grid_cols_from_width(300.0), 3);
+        assert_eq!(grid_cols_from_width(1000.5), 10);
+    }
+
+    #[test]
+    fn grid_row_count_covers_all_items() {
+        assert_eq!(grid_row_count(0, 4), 0);
+        assert_eq!(grid_row_count(1, 4), 1);
+        assert_eq!(grid_row_count(4, 4), 1);
+        assert_eq!(grid_row_count(5, 4), 2);
+        assert_eq!(grid_row_count(8, 4), 2);
+        assert_eq!(grid_row_count(9, 4), 3);
+        assert_eq!(grid_row_count(100, 5), 20);
+        assert_eq!(grid_row_count(101, 5), 21);
+        // cols is never zero in practice (grid_cols_from_width floors to >= 1),
+        // but guard against it anyway.
+        assert_eq!(grid_row_count(5, 0), 0);
+    }
+
+    #[test]
+    fn grid_row_range_maps_packed_rows_to_flat_indices() {
+        // Full middle row.
+        assert_eq!(grid_row_range(0, 4, 10), 0..4);
+        assert_eq!(grid_row_range(1, 4, 10), 4..8);
+        // Last row is truncated to the item count.
+        assert_eq!(grid_row_range(2, 4, 10), 8..10);
+        // A filter that hides rows: fewer items than cols still packs into row 0.
+        assert_eq!(grid_row_range(0, 4, 2), 0..2);
+        // Empty listing: no range.
+        assert_eq!(grid_row_range(0, 4, 0), 0..0);
+        // Rows past the end are empty, never panic.
+        assert_eq!(grid_row_range(5, 4, 10), 20..20);
+        assert_eq!(grid_row_range(3, 4, 10), 12..12);
+        // Exactly one full row.
+        assert_eq!(grid_row_range(0, 4, 4), 0..4);
+        // cols+1 items: two rows, second truncated.
+        assert_eq!(grid_row_range(0, 4, 5), 0..4);
+        assert_eq!(grid_row_range(1, 4, 5), 4..5);
+    }
+
+    #[test]
+    fn row_and_col_decompose_back_to_the_flat_index() {
+        // Every cell in a full grid maps back to the same flat index through the
+        // row it lives in, so activation/selection keep their global index.
+        let cols = 7;
+        let items = 100;
+        for row_ix in 0..grid_row_count(items, cols) {
+            for (j, ix) in grid_row_range(row_ix, cols, items).enumerate() {
+                assert_eq!(row_ix * cols + j, ix);
+            }
+        }
+    }
 }
