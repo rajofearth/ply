@@ -58,7 +58,7 @@ pub fn render(ply: &Ply, window: &Window, cx: &mut Context<Ply>) -> impl IntoEle
         let thumb = ply.thumb_cache();
         thumb.update(cx, |cache, _| {
             let mut keys = Vec::with_capacity(entries.len());
-            for e in &entries {
+            for e in entries {
                 let key = if thumbs::is_lnk(e) {
                     match cache.lnk_stamp(&e.path) {
                         Some(stamp) => thumbs::stamped_key(&e.path, stamp),
@@ -117,7 +117,7 @@ pub fn render(ply: &Ply, window: &Window, cx: &mut Context<Ply>) -> impl IntoEle
                             .flex()
                             .gap(px(4.))
                             .children(
-                                rng.map(|ix| grid_cell(this, entries[ix], ix, cx, req_gen)),
+                                rng.map(|ix| grid_cell(this, &entries[ix], ix, cx, req_gen)),
                             )
                             .into_any_element()
                     })

@@ -97,6 +97,7 @@ impl Ply {
                     Err(err) => {
                         this.listing = LoadState::Failed(err.to_string().into());
                         this.visible_indices.clear();
+                        this.visible_entries.clear();
                     }
                 }
                 cx.notify();
@@ -153,7 +154,7 @@ impl Ply {
                 let lnks = this
                     .update(cx, |this, _| {
                         this.visible()
-                            .into_iter()
+                            .iter()
                             .filter(|e| {
                                 Path::new(&e.name)
                                     .extension()
@@ -286,44 +287,45 @@ impl Ply {
         .detach();
     }
 
-    /// Rebuild [`Ply::visible_indices`] from the Ready listing and filter.
+    /// Rebuild [`Ply::visible_indices`] from the Ready listing and filter, and
+    /// mirror the result into the owned [`Ply::visible_entries`] cache so the
+    /// render path never allocates a fresh `Vec` per frame.
     pub(super) fn rebuild_visible(&mut self) {
-        self.visible_indices.clear();
+        self.visible_indices = Vec::new();
+        self.visible_entries = Vec::new();
         let LoadState::Ready(snapshot) = &self.listing else {
             return;
         };
+        let indices = filter_indices(&snapshot.entries, &self.filter_text);
         if self.filter_text.is_empty() {
-            self.visible_indices.extend(0..snapshot.entries.len());
+            // Unfiltered: `visible()` serves the snapshot's own slice, so no
+            // clone cache is kept here; only the index set needs rebuilding.
+            self.visible_indices = indices;
             return;
         }
-        let needle = self.filter_text.to_lowercase();
-        self.visible_indices.extend(
-            snapshot
-                .entries
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| e.name.to_lowercase().contains(&needle))
-                .map(|(i, _)| i),
-        );
-    }
-
-    /// Entries in the current folder that survive the filter box.
-    pub fn visible(&self) -> Vec<&Entry> {
-        let LoadState::Ready(snapshot) = &self.listing else {
-            return Vec::new();
-        };
-        self.visible_indices
+        self.visible_entries = indices
             .iter()
             .filter_map(|&i| snapshot.entries.get(i))
-            .collect()
+            .cloned()
+            .collect();
+        self.visible_indices = indices;
     }
 
-    /// Count of filtered entries without allocating the entry slice.
-    pub fn visible_len(&self) -> usize {
+    /// Entries in the current folder that survive the filter box, as a slice in
+    /// `visible_indices` order. No per-call allocation: the unfiltered case
+    /// reborrows the snapshot's own entries, and the filtered case returns the
+    /// owned cache rebuilt by [`Self::rebuild_visible`].
+    pub fn visible(&self) -> &[Entry] {
         match &self.listing {
-            LoadState::Ready(_) => self.visible_indices.len(),
-            _ => 0,
+            LoadState::Ready(snapshot) if self.filter_text.is_empty() => &snapshot.entries,
+            LoadState::Ready(_) => &self.visible_entries,
+            _ => &[],
         }
+    }
+
+    /// Count of filtered entries, matching the slice `visible()` returns.
+    pub fn visible_len(&self) -> usize {
+        self.visible().len()
     }
 
     /// Keep the filter's placeholder showing the folder's item count.
@@ -1159,4 +1161,99 @@ fn marked(
         ..MenuItem::new(label, icon, Some(action))
     }
     .into()
+}
+
+/// Indices into `entries` that survive the filter, in listing order. An empty
+/// filter keeps every index. Pure and ordered, so the owned `visible_entries`
+/// cache and the index set stay identical to the old `Vec<&Entry>` slice.
+fn filter_indices(entries: &[Entry], filter: &str) -> Vec<usize> {
+    if filter.is_empty() {
+        return (0..entries.len()).collect();
+    }
+    let needle = filter.to_lowercase();
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.name.to_lowercase().contains(&needle))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::listing::EntryKind;
+
+    fn file(name: &str) -> Entry {
+        Entry {
+            path: PathBuf::from(name),
+            name: name.into(),
+            kind: EntryKind::File,
+            size: 0,
+            modified: None,
+            hidden: false,
+        }
+    }
+
+    type FilterFn = fn(&[Entry], &str) -> Vec<usize>;
+
+    /// The plain, always-correct filter: substring match in listing order. The
+    /// cache builder must match this on every input.
+    fn reference_filter(entries: &[Entry], filter: &str) -> Vec<usize> {
+        if filter.is_empty() {
+            return (0..entries.len()).collect();
+        }
+        let needle = filter.to_lowercase();
+        entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.name.to_lowercase().contains(&needle))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    #[test]
+    fn empty_filter_keeps_every_index_in_order() {
+        let entries = [file("b.txt"), file("A.txt"), file("c.txt")];
+        assert_eq!(filter_indices(&entries, ""), [0, 1, 2]);
+    }
+
+    #[test]
+    fn filtered_index_set_matches_reference_and_keeps_order() {
+        let entries: FilterFn = filter_indices;
+        let reference: FilterFn = reference_filter;
+        let names = ["alpha.txt", "beta.mp4", "almanac.png", "delta.log"];
+        for filter in ["", "a", "AL", "pha", "mp4", "xyz", "m", "l"] {
+            let list: Vec<Entry> = names.iter().map(|n| file(n)).collect();
+            assert_eq!(
+                entries(&list, filter),
+                reference(&list, filter),
+                "filter {filter:?} must match the reference subset"
+            );
+        }
+    }
+
+    #[test]
+    fn filtered_cache_is_in_display_when_resolved_by_index() {
+        // What `rebuild_visible` does: clone entries at the returned indices
+        // and serve them in the same order as the old index-mapped slice.
+        let entries = vec![
+            file("alpha.txt"),
+            file("beta.mp4"),
+            file("almanac.png"),
+            file("delta.log"),
+        ];
+        let idx = filter_indices(&entries, "al");
+        assert_eq!(idx, [0, 2]);
+        let cached: Vec<Entry> = idx
+            .iter()
+            .filter_map(|&i| entries.get(i))
+            .cloned()
+            .collect();
+        assert_eq!(cached.len(), 2);
+        assert_eq!(cached[0].name, "alpha.txt");
+        assert_eq!(cached[1].name, "almanac.png");
+    }
 }

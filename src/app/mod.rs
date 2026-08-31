@@ -13,7 +13,7 @@ use gpui::{
 };
 use gpui_component::input::{InputEvent, InputState};
 
-use crate::listing::{Snapshot, SortKey};
+use crate::listing::{Entry, Snapshot, SortKey};
 use crate::theme::{Mode, Palette};
 use crate::volumes::{self, Volume};
 use crate::watch::FolderWatch;
@@ -202,6 +202,12 @@ pub struct Ply {
     /// Indices into the Ready listing that survive `filter_text`.
     /// Rebuilt when the listing or filter changes — not every frame.
     visible_indices: Vec<usize>,
+    /// Owned clones of `visible_indices`, kept in the same order, so the hot
+    /// render path can hand out `&[Entry]` without allocating a fresh `Vec`
+    /// every frame. Rebuilt alongside `visible_indices`; valid only when the
+    /// listing is `Ready` and a filter is active (the unfiltered case serves
+    /// the snapshot's own slice directly).
+    visible_entries: Vec<Entry>,
 
     pub menu: Option<Menu>,
     pub properties: Option<Properties>,
@@ -258,6 +264,7 @@ impl Ply {
             filter_text: String::new(),
             placeholder_for: None,
             visible_indices: Vec::new(),
+            visible_entries: Vec::new(),
             menu: None,
             properties: None,
             confirm: None,
