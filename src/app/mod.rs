@@ -287,6 +287,15 @@ impl Ply {
                 .await;
         })
         .detach();
+        // Best-effort bound on the on-disk thumbnail cache: one pass at
+        // launch, off the UI thread, evicting oldest files past the cap.
+        cx.spawn(async move |_, cx| {
+            cx.background_spawn(async move {
+                crate::cache::evict(crate::cache::DISK_CACHE_MAX_BYTES);
+            })
+            .await;
+        })
+        .detach();
         ply.update_window_title(window);
         window.focus(&ply.focus, cx);
         ply
@@ -510,6 +519,9 @@ mod tests {
         c.schedule_flush();
         c.schedule_flush();
         c.flush();
-        assert_eq!(c.notify_count, 1, "only one flush even with multiple schedule calls");
+        assert_eq!(
+            c.notify_count, 1,
+            "only one flush even with multiple schedule calls"
+        );
     }
 }

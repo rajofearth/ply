@@ -98,6 +98,16 @@ pub(crate) fn stamped_key(path: &Path, stamp: u64) -> CacheKey {
     }
 }
 
+impl CacheKey {
+    /// Stable disk-cache key for this entry: hash of the source path bytes
+    /// plus the stamp. Same (path, stamp) always maps to the same PNG file; a
+    /// changed stamp (edited file) maps to a different one, so no index table
+    /// is needed. Content thumbnails only; used by [`crate::cache`].
+    pub(crate) fn disk_key(&self) -> String {
+        crate::cache::content_key(&self.path, self.stamp)
+    }
+}
+
 fn mtime_nanos(t: Option<SystemTime>) -> u64 {
     t.and_then(|t| {
         t.duration_since(UNIX_EPOCH)
@@ -520,12 +530,7 @@ pub(crate) fn should_apply_result(request_gen: u64, current_gen: u64) -> bool {
 /// extraction completes, the result is applied only if the generation still
 /// matches; otherwise it is silently dropped (no insert, no notify), freeing
 /// the content slot and inflight mark.
-pub fn request_thumbnail(
-    ply: &Ply,
-    entry: &Entry,
-    cx: &mut Context<Ply>,
-    request_gen: u64,
-) {
+pub fn request_thumbnail(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>, request_gen: u64) {
     if !(is_lnk(entry) || wants_content_thumbnail(entry)) {
         return;
     }
@@ -552,6 +557,40 @@ pub fn request_thumbnail(
     if !should_apply_result(request_gen, current_gen) {
         return;
     }
+
+    // Persist CONTENT thumbnails (media), not `.lnk` icons and not the shell
+    // type icons. `request_thumbnail` also serves `.lnk` shortcut icons; those
+    // stay in-memory-only because their key is the resolved icon-source stamp,
+    // not a plain path+mtime.
+    let is_content = !is_lnk(entry);
+    if is_content {
+        let disk_key = key.disk_key();
+        // A known-bad file (per the freedesktop `fail/` marker) is never
+        // re-extracted; fold it into the in-memory failed set so later probes
+        // are fast. Best-effort disk read; any local/read failure just falls
+        // through to a fresh extraction.
+        if crate::cache::disk_failed(&disk_key) {
+            cache_entity.update(cx, |c, _| c.mark_failed(key.clone()));
+            return;
+        }
+        // Lookup-before-generate: a cached PNG decodes straight into the
+        // working set, skipping the shell extraction (and its content slot).
+        // Respect the generation guard: a disk hit for a now-stale folder must
+        // still not pollute the working set.
+        if should_apply_result(request_gen, current_gen)
+            && let Some((bytes, w, h)) = crate::cache::lookup(&disk_key)
+            && let Some(img) = to_render_image(bytes, w, h)
+        {
+            cache_entity.update(cx, |c, _| {
+                c.insert(key.clone(), img);
+            });
+            // Repaint so the freshly-inserted working-set entry shows. The
+            // probe path runs repeatedly, so this is cheap to coalesce via the
+            // normal repaint cycle.
+            cx.notify();
+            return;
+        }
+    }
     cache_entity.update(cx, |c, _| {
         c.mark_inflight(key.clone());
         c.reserve_content();
@@ -560,6 +599,7 @@ pub fn request_thumbnail(
     let path = entry.path.clone();
     let worker_path = path.clone();
     let lnk = is_lnk(entry);
+    let disk_key = key.disk_key();
     cx.spawn(async move |this, cx| {
         let got = if lnk {
             cx.background_spawn(async move { request_lnk(worker_path, THUMB_SIZE) })
@@ -573,7 +613,9 @@ pub fn request_thumbnail(
         // content slot and inflight mark to avoid leaks.
         let stale = {
             let gen_ok = this
-                .update(cx, |this, _| should_apply_result(request_gen, this.list_generation))
+                .update(cx, |this, _| {
+                    should_apply_result(request_gen, this.list_generation)
+                })
                 .unwrap_or(false);
             !gen_ok
         };
@@ -586,7 +628,7 @@ pub fn request_thumbnail(
                             c.release_content();
                         });
                     });
-                } else {
+                } else if lnk {
                     let img = to_render_image(bytes, w, h);
                     let _ = this.update(cx, |this, cx| {
                         this.thumb_cache().update(cx, |c, _| {
@@ -606,6 +648,31 @@ pub fn request_thumbnail(
                             }
                         });
                     });
+                } else {
+                    // Content thumbnail: persist the raster to disk off the UI
+                    // thread, then insert into the working set. Best-effort
+                    // write; a disk error never fails the app.
+                    let write_key = disk_key.clone();
+                    let write_bytes = bytes.clone();
+                    cx.background_spawn(async move {
+                        crate::cache::store(&write_key, &write_bytes, w, h);
+                    })
+                    .detach();
+                    let img = to_render_image(bytes, w, h);
+                    let _ = this.update(cx, |this, cx| {
+                        this.thumb_cache().update(cx, |c, _| {
+                            c.unmark_inflight(&key);
+                            c.release_content();
+                            match img {
+                                Some(image) => {
+                                    c.insert(key.clone(), image);
+                                }
+                                None => {
+                                    c.mark_failed(key.clone());
+                                }
+                            }
+                        });
+                    });
                 }
             }
             None => {
@@ -617,6 +684,16 @@ pub fn request_thumbnail(
                         });
                     });
                 } else {
+                    // Content thumbnail that failed to extract: memoize the
+                    // failure on disk (freedesktop `fail/` lesson) so the file
+                    // is never retried on a later open, plus mark it in-memory.
+                    if is_content {
+                        let fail_key = disk_key.clone();
+                        cx.background_spawn(async move {
+                            crate::cache::fail_mark(&fail_key);
+                        })
+                        .detach();
+                    }
                     let _ = this.update(cx, |this, cx| {
                         this.thumb_cache().update(cx, |c, _| {
                             c.unmark_inflight(&key);
@@ -921,8 +998,8 @@ mod backend {
     use std::collections::{HashMap, HashSet};
     use std::os::windows::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
-    use std::sync::mpsc::{Sender, channel};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::{Sender, channel};
     use std::sync::{Arc, LazyLock};
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1093,8 +1170,7 @@ mod backend {
         if senders.is_empty() {
             return false;
         }
-        let ix =
-            CONTENT_NEXT.fetch_add(1, Ordering::Relaxed) % senders.len();
+        let ix = CONTENT_NEXT.fetch_add(1, Ordering::Relaxed) % senders.len();
         senders[ix].send(job).is_ok()
     }
 
@@ -2101,10 +2177,7 @@ mod tests {
             make_thumb(&mut c, &format!("x{i}.png"), i + 10);
         }
 
-        assert!(
-            c.get(&k0).is_some(),
-            "locked entry must survive eviction"
-        );
+        assert!(c.get(&k0).is_some(), "locked entry must survive eviction");
         assert!(
             c.get(&k1).is_none(),
             "unlocked entry should be evicted under pressure"
