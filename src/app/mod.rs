@@ -216,6 +216,12 @@ pub struct Ply {
 
     /// Decoded media thumbnails, keyed by path + mtime. Dropped with the window.
     pub thumbs: Entity<crate::thumbs::ThumbCache>,
+
+    /// A thumbnail/icon completion set this when it wants a repaint. Coalesced:
+    /// many completions within a short window produce at most one repaint.
+    thumbs_dirty: bool,
+    /// A flush timer is already scheduled; don't spawn another.
+    thumbs_flush_pending: bool,
 }
 
 impl Ply {
@@ -262,6 +268,8 @@ impl Ply {
             watch: None,
             focus: cx.focus_handle(),
             thumbs: cx.new(|_| crate::thumbs::ThumbCache::new()),
+            thumbs_dirty: false,
+            thumbs_flush_pending: false,
         };
         ply.refresh_volumes(cx);
         ply.start_watch_poll(cx);
@@ -359,6 +367,33 @@ impl Ply {
         })
         .detach();
     }
+
+    /// Set the dirty flag. Call from inside an `update` closure where `self`
+    /// is already mutably borrowed.
+    pub(crate) fn mark_thumbs_dirty(&mut self) {
+        self.thumbs_dirty = true;
+    }
+
+    /// Schedule a flush if one is not already pending. Call from inside an
+    /// `update` closure where `cx` is available.
+    pub(crate) fn schedule_thumbs_flush(&mut self, cx: &mut Context<Self>) {
+        if !self.thumbs_flush_pending {
+            self.thumbs_flush_pending = true;
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    this.thumbs_flush_pending = false;
+                    if this.thumbs_dirty {
+                        this.thumbs_dirty = false;
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
+    }
 }
 
 /// Escape closes whatever is on top, innermost first.
@@ -373,5 +408,101 @@ pub fn dismiss_topmost(ply: &mut Ply, cx: &mut Context<Ply>) {
         ply.cancel_rename(cx);
     } else {
         ply.clear_selection(cx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Simulates the coalescing logic outside a live GPUI context: dirty + flush
+    /// flags with manual flush, matching what `thumbs_updated` / `mark_thumbs_dirty`
+    /// / `schedule_thumbs_flush` do on the real model.
+    struct Coalescer {
+        dirty: bool,
+        flush_pending: bool,
+        notify_count: u32,
+    }
+
+    impl Coalescer {
+        fn new() -> Self {
+            Self {
+                dirty: false,
+                flush_pending: false,
+                notify_count: 0,
+            }
+        }
+
+        fn mark_dirty(&mut self) {
+            self.dirty = true;
+        }
+
+        fn schedule_flush(&mut self) {
+            if !self.flush_pending {
+                self.flush_pending = true;
+            }
+        }
+
+        fn flush(&mut self) -> bool {
+            self.flush_pending = false;
+            if self.dirty {
+                self.dirty = false;
+                self.notify_count += 1;
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    #[test]
+    fn single_completion_flushes() {
+        let mut c = Coalescer::new();
+        c.mark_dirty();
+        c.schedule_flush();
+        assert!(c.flush(), "dirty flag must produce a notify");
+        assert_eq!(c.notify_count, 1);
+        assert!(!c.dirty);
+        assert!(!c.flush_pending);
+    }
+
+    #[test]
+    fn many_completions_between_flushes_produce_one_notify() {
+        let mut c = Coalescer::new();
+        for _ in 0..100 {
+            c.mark_dirty();
+            c.schedule_flush();
+        }
+        assert!(c.flush());
+        assert_eq!(c.notify_count, 1);
+    }
+
+    #[test]
+    fn flush_when_clean_is_a_noop() {
+        let mut c = Coalescer::new();
+        assert!(!c.flush(), "no notify when nothing is dirty");
+        assert_eq!(c.notify_count, 0);
+    }
+
+    #[test]
+    fn flag_resets_after_flush_allows_next_cycle() {
+        let mut c = Coalescer::new();
+        c.mark_dirty();
+        c.schedule_flush();
+        c.flush();
+        // Second batch
+        c.mark_dirty();
+        c.schedule_flush();
+        assert!(c.flush());
+        assert_eq!(c.notify_count, 2);
+    }
+
+    #[test]
+    fn schedule_is_idempotent_while_pending() {
+        let mut c = Coalescer::new();
+        c.mark_dirty();
+        c.schedule_flush();
+        c.schedule_flush();
+        c.schedule_flush();
+        c.flush();
+        assert_eq!(c.notify_count, 1, "only one flush even with multiple schedule calls");
     }
 }

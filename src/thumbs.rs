@@ -486,7 +486,10 @@ pub fn request_thumbnail(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) {
                 });
             }
         }
-        let _ = this.update(cx, |_, cx| cx.notify());
+        let _ = this.update(cx, |this, cx| {
+            this.mark_thumbs_dirty();
+            this.schedule_thumbs_flush(cx);
+        });
     })
     .detach();
 }
@@ -536,7 +539,10 @@ pub fn class_icon(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) -> Option<Arc
                 }
             });
         });
-        let _ = this.update(cx, |_, cx| cx.notify());
+        let _ = this.update(cx, |this, cx| {
+            this.mark_thumbs_dirty();
+            this.schedule_thumbs_flush(cx);
+        });
     })
     .detach();
     None
@@ -736,7 +742,10 @@ pub fn refresh_lnk(paths: &[PathBuf], cx: &mut Context<Ply>) {
                                 }
                             });
                         });
-                        let _ = this.update(cx, |_, cx| cx.notify());
+                        let _ = this.update(cx, |this, cx| {
+                            this.mark_thumbs_dirty();
+                            this.schedule_thumbs_flush(cx);
+                        });
                     })
                     .detach();
                 })
@@ -1630,7 +1639,10 @@ pub fn path_icon(
                 }
             });
         });
-        let _ = this.update(cx, |_, cx| cx.notify());
+        let _ = this.update(cx, |this, cx| {
+            this.mark_thumbs_dirty();
+            this.schedule_thumbs_flush(cx);
+        });
     })
     .detach();
     None
@@ -1681,7 +1693,10 @@ pub fn recycle_bin_icon(ply: &Ply, cx: &mut Context<Ply>) -> Option<Arc<RenderIm
                 }
             });
         });
-        let _ = this.update(cx, |_, cx| cx.notify());
+        let _ = this.update(cx, |this, cx| {
+            this.mark_thumbs_dirty();
+            this.schedule_thumbs_flush(cx);
+        });
     })
     .detach();
     None
