@@ -24,11 +24,29 @@ use chrono::{DateTime, Local};
 pub fn render(ply: &Ply, window: &Window, cx: &mut Context<Ply>) -> impl IntoElement {
     let list_view = ply.view == ViewMode::List;
     let count = ply.visible_len();
+    let request_gen = ply.list_generation;
 
-    // Prefetch: kick off icon extraction for the near window up front so icons
-    // resolve quickly; the rest request on demand as they render.
-    for e in ply.visible().iter().take(PREFETCH_SCAN) {
-        thumbs::ensure_entry_icons(ply, e, cx);
+    // Visible-first prefetch: request icons for visible entries first, then a
+    // bounded lookahead past the visible window. This mirrors KIO/Nautilus
+    // visible-first scheduling so the pool serves on-screen rows before
+    // off-screen ones.
+    {
+        let entries = ply.visible();
+        let visible_count = if list_view {
+            let row_h = 29.;
+            (f32::from(window.viewport_size().height) / row_h).ceil() as usize
+        } else {
+            let cols = grid_cols_from_width(avail_width(window));
+            let row_h = GRID_CELL_W + 6. + 14. + 6.;
+            let rows = (f32::from(window.viewport_size().height) / row_h).ceil() as usize;
+            rows * cols
+        };
+        let visible_end = visible_count.min(entries.len());
+        let lookahead_end = (visible_end + PREFETCH_LOOKAHEAD).min(entries.len());
+        // Visible entries first, then the lookahead window.
+        for entry in entries.iter().take(lookahead_end) {
+            thumbs::ensure_entry_icons(ply, entry, cx, request_gen);
+        }
     }
 
     // Working-set lock: tell the thumbnail cache which entries are visible so
@@ -69,11 +87,16 @@ pub fn render(ply: &Ply, window: &Window, cx: &mut Context<Ply>) -> impl IntoEle
         None if list_view => uniform_list(
             "entries",
             count,
-            cx.processor(|this, range: Range<usize>, _window, cx| {
+            cx.processor(move |this, range: Range<usize>, _window, cx| {
                 let now = Local::now();
                 let entries = this.visible();
+                let req_gen = this.list_generation;
                 range
-                    .filter_map(|ix| entries.get(ix).map(|e| list_row(this, e, ix, now, cx)))
+                    .filter_map(|ix| {
+                        entries
+                            .get(ix)
+                            .map(|e| list_row(this, e, ix, now, cx, req_gen))
+                    })
                     .collect::<Vec<_>>()
             }),
         )
@@ -86,13 +109,16 @@ pub fn render(ply: &Ply, window: &Window, cx: &mut Context<Ply>) -> impl IntoEle
             row_count,
             cx.processor(move |this, range: Range<usize>, _window, cx| {
                 let entries = this.visible();
+                let req_gen = this.list_generation;
                 range
                     .map(|row_ix| {
                         let rng = grid_row_range(row_ix, cols, entries.len());
                         div()
                             .flex()
                             .gap(px(4.))
-                            .children(rng.map(|ix| grid_cell(this, entries[ix], ix, cx)))
+                            .children(
+                                rng.map(|ix| grid_cell(this, entries[ix], ix, cx, req_gen)),
+                            )
                             .into_any_element()
                     })
                     .collect::<Vec<_>>()
@@ -124,10 +150,9 @@ const KIND_COL: f32 = 130.;
 const SIZE_COL: f32 = 80.;
 const MODIFIED_COL: f32 = 130.;
 
-/// How many listing entries get their icon extraction kicked off up front so
-/// icons resolve quickly; the rest request on demand as they render. Covers
-/// roughly two viewport-fulls of list rows without stalling media-heavy folders.
-const PREFETCH_SCAN: usize = 48;
+/// How far past the visible window the visible-first prefetch extends. Kept
+/// small so the pool serves on-screen rows before spending slots on look-ahead.
+const PREFETCH_LOOKAHEAD: usize = 24;
 
 /// Grid cell geometry. `GRID_CELL_STRIDE` is the horizontal span one cell
 /// claims including the gap after it, so a row of `cols` cells is `cols*96 +
@@ -268,9 +293,10 @@ fn icon_or_thumb(
     box_px: f32,
     icon_px: f32,
     cx: &mut Context<Ply>,
+    request_gen: u64,
 ) -> AnyElement {
     let p = ply.palette();
-    match thumbs::entry_icon_probe(ply, entry, cx) {
+    match thumbs::entry_icon_probe(ply, entry, cx, request_gen) {
         thumbs::IconProbe::Ready(img) => super::thumb_img(&img, box_px).into_any_element(),
         thumbs::IconProbe::Loading => super::icon_slot(box_px).into_any_element(),
         thumbs::IconProbe::Glyph => {
@@ -285,6 +311,7 @@ fn list_row(
     ix: usize,
     now: DateTime<Local>,
     cx: &mut Context<Ply>,
+    request_gen: u64,
 ) -> AnyElement {
     let p = ply.palette();
     let selected = ply.is_selected(&entry.path);
@@ -314,7 +341,7 @@ fn list_row(
                 .items_center()
                 .gap(px(8.))
                 .min_w_0()
-                .child(icon_or_thumb(ply, entry, 16., 14., cx))
+                .child(icon_or_thumb(ply, entry, 16., 14., cx, request_gen))
                 .map(|el| {
                     if renaming {
                         el.child(rename_field(ply, cx))
@@ -367,7 +394,7 @@ fn list_row(
         .into_any_element()
 }
 
-fn grid_cell(ply: &Ply, entry: &Entry, ix: usize, cx: &mut Context<Ply>) -> AnyElement {
+fn grid_cell(ply: &Ply, entry: &Entry, ix: usize, cx: &mut Context<Ply>, request_gen: u64) -> AnyElement {
     let p = ply.palette();
     let selected = ply.is_selected(&entry.path);
     let renaming = ply.rename.as_ref().is_some_and(|r| r.path == entry.path);
@@ -386,7 +413,7 @@ fn grid_cell(ply: &Ply, entry: &Entry, ix: usize, cx: &mut Context<Ply>) -> AnyE
         .cursor_default()
         .when(selected, |el| el.bg(p.select_strong))
         .when(!selected, |el| el.hover(|s| s.bg(p.muted)))
-        .child(icon_or_thumb(ply, entry, 56., 56., cx))
+        .child(icon_or_thumb(ply, entry, 56., 56., cx, request_gen))
         .map(|el| {
             if renaming {
                 el.child(rename_field(ply, cx))
@@ -534,5 +561,21 @@ mod tests {
                 assert_eq!(row_ix * cols + j, ix);
             }
         }
+    }
+
+    #[test]
+    fn visible_first_prefetch_bounds() {
+        // The visible-first prefetch clamps lookahead_end to entries.len().
+        let total = 10;
+        let visible_end = 6;
+        let lookahead = PREFETCH_LOOKAHEAD;
+        let end = (visible_end + lookahead).min(total);
+        assert_eq!(end, 10, "should not exceed total");
+
+        // Small listing: lookahead extends only to the end.
+        let total = 3;
+        let visible_end = 2;
+        let end = (visible_end + lookahead).min(total);
+        assert_eq!(end, 3);
     }
 }

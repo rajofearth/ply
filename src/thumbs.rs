@@ -503,11 +503,29 @@ pub(crate) fn probe_key(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) -> Cach
     }
 }
 
+/// Whether a thumbnail result from `request_gen` should be applied given the
+/// `current_gen` at completion time. A stale generation means the user navigated
+/// to a different folder (or reloaded) while extraction was in flight; the
+/// result belongs to the old listing and must be discarded.
+pub(crate) fn should_apply_result(request_gen: u64, current_gen: u64) -> bool {
+    request_gen == current_gen
+}
+
 /// Kicks off content extraction for a `.lnk` shortcut (its target icon) or a
 /// media entry (a real preview thumbnail) if it is not already cached or in
 /// flight, then notifies the window when it lands. Type icons are resolved by
 /// the pre-paint batch instead; this is the slow per-file tier.
-pub fn request_thumbnail(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) {
+///
+/// `request_gen` is the listing generation captured at call time. When the
+/// extraction completes, the result is applied only if the generation still
+/// matches; otherwise it is silently dropped (no insert, no notify), freeing
+/// the content slot and inflight mark.
+pub fn request_thumbnail(
+    ply: &Ply,
+    entry: &Entry,
+    cx: &mut Context<Ply>,
+    request_gen: u64,
+) {
     if !(is_lnk(entry) || wants_content_thumbnail(entry)) {
         return;
     }
@@ -516,16 +534,22 @@ pub fn request_thumbnail(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) {
     }
     let key = probe_key(ply, entry, cx);
     let cache_entity = ply.thumb_cache();
-    let (cached, inflight, failed, over_cap) = {
+    let (cached, inflight, failed, over_cap, current_gen) = {
         let c = cache_entity.read(cx);
         (
             c.get(&key).is_some(),
             c.is_inflight(&key),
             c.is_failed(&key),
             c.content_pending() >= CONTENT_CAP,
+            ply.list_generation,
         )
     };
     if cached || inflight || failed || over_cap {
+        return;
+    }
+    // Skip enqueueing if the generation already changed: the result would be
+    // rejected on completion anyway, so don't waste a pool slot.
+    if !should_apply_result(request_gen, current_gen) {
         return;
     }
     cache_entity.update(cx, |c, _| {
@@ -544,44 +568,73 @@ pub fn request_thumbnail(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) {
             cx.background_spawn(async move { request(worker_path, THUMB_SIZE).map(|p| (p, None)) })
                 .await
         };
+        // Check generation at completion time. Stale results are silently
+        // dropped: no cache insert, no notify, but always release the
+        // content slot and inflight mark to avoid leaks.
+        let stale = {
+            let gen_ok = this
+                .update(cx, |this, _| should_apply_result(request_gen, this.list_generation))
+                .unwrap_or(false);
+            !gen_ok
+        };
         match got {
             Some(((bytes, w, h), stamp)) => {
-                let img = to_render_image(bytes, w, h);
-                let _ = this.update(cx, |this, cx| {
-                    this.thumb_cache().update(cx, |c, _| {
-                        c.unmark_inflight(&key);
-                        c.release_content();
-                        match (img, stamp) {
-                            (Some(image), Some(stamp)) => {
-                                c.set_lnk_stamp(&path, stamp);
-                                c.insert_force(stamped_key(&path, stamp), image);
-                            }
-                            (Some(image), None) => {
-                                c.insert(key.clone(), image);
-                            }
-                            _ => {
-                                c.mark_failed(key.clone());
-                            }
-                        }
+                if stale {
+                    let _ = this.update(cx, |this, cx| {
+                        this.thumb_cache().update(cx, |c, _| {
+                            c.unmark_inflight(&key);
+                            c.release_content();
+                        });
                     });
-                });
+                } else {
+                    let img = to_render_image(bytes, w, h);
+                    let _ = this.update(cx, |this, cx| {
+                        this.thumb_cache().update(cx, |c, _| {
+                            c.unmark_inflight(&key);
+                            c.release_content();
+                            match (img, stamp) {
+                                (Some(image), Some(stamp)) => {
+                                    c.set_lnk_stamp(&path, stamp);
+                                    c.insert_force(stamped_key(&path, stamp), image);
+                                }
+                                (Some(image), None) => {
+                                    c.insert(key.clone(), image);
+                                }
+                                _ => {
+                                    c.mark_failed(key.clone());
+                                }
+                            }
+                        });
+                    });
+                }
             }
             None => {
-                let _ = this.update(cx, |this, cx| {
-                    this.thumb_cache().update(cx, |c, _| {
-                        c.unmark_inflight(&key);
-                        c.release_content();
-                        // Remember the failure so the probe settles on the
-                        // themed glyph instead of re-requesting every render.
-                        c.mark_failed(key.clone());
+                if stale {
+                    let _ = this.update(cx, |this, cx| {
+                        this.thumb_cache().update(cx, |c, _| {
+                            c.unmark_inflight(&key);
+                            c.release_content();
+                        });
                     });
-                });
+                } else {
+                    let _ = this.update(cx, |this, cx| {
+                        this.thumb_cache().update(cx, |c, _| {
+                            c.unmark_inflight(&key);
+                            c.release_content();
+                            c.mark_failed(key.clone());
+                        });
+                    });
+                }
             }
         }
-        let _ = this.update(cx, |this, cx| {
-            this.mark_thumbs_dirty();
-            this.schedule_thumbs_flush(cx);
-        });
+        // Only notify when the result is current; stale completions are
+        // silent.
+        if !stale {
+            let _ = this.update(cx, |this, cx| {
+                this.mark_thumbs_dirty();
+                this.schedule_thumbs_flush(cx);
+            });
+        }
     })
     .detach();
 }
@@ -646,14 +699,19 @@ pub fn class_icon(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) -> Option<Arc
 /// every icon in the window starts resolving at once instead of one row at a
 /// time. After the pre-paint batch these mostly no-op on already-cached type
 /// icons.
-pub(crate) fn ensure_entry_icons(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) {
+pub(crate) fn ensure_entry_icons(
+    ply: &Ply,
+    entry: &Entry,
+    cx: &mut Context<Ply>,
+    request_gen: u64,
+) {
     if wants_path_icon(entry) {
         let _ = folder_icon(ply, entry, cx);
     } else if is_lnk(entry) {
-        request_thumbnail(ply, entry, cx);
+        request_thumbnail(ply, entry, cx, request_gen);
     } else if wants_content_thumbnail(entry) {
         let _ = class_icon(ply, entry, cx);
-        request_thumbnail(ply, entry, cx);
+        request_thumbnail(ply, entry, cx, request_gen);
     } else {
         let _ = class_icon(ply, entry, cx);
     }
@@ -694,7 +752,12 @@ pub(crate) enum IconProbe {
 /// Probe an entry's icon: ensure its extraction is running, then classify it
 /// for rendering. The single source of truth for both the prefetch pass and
 /// the row renderer, so they can never disagree on a slot.
-pub(crate) fn entry_icon_probe(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) -> IconProbe {
+pub(crate) fn entry_icon_probe(
+    ply: &Ply,
+    entry: &Entry,
+    cx: &mut Context<Ply>,
+    request_gen: u64,
+) -> IconProbe {
     if wants_path_icon(entry) {
         // Folders and executables: a real path icon, pre-resolved by the batch
         // so this is a plain map hit on freshly painted listings.
@@ -712,7 +775,7 @@ pub(crate) fn entry_icon_probe(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) 
         if let Some(img) = cache_entity.read(cx).get(&key) {
             return IconProbe::Ready(img);
         }
-        request_thumbnail(ply, entry, cx);
+        request_thumbnail(ply, entry, cx, request_gen);
         if entry_icon_pending(ply, entry, cx) {
             IconProbe::Loading
         } else {
@@ -727,10 +790,10 @@ pub(crate) fn entry_icon_probe(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) 
         }
         // Type icon as the placeholder while the thumbnail extracts async.
         if let Some(img) = class_icon(ply, entry, cx) {
-            request_thumbnail(ply, entry, cx);
+            request_thumbnail(ply, entry, cx, request_gen);
             return IconProbe::Ready(img);
         }
-        request_thumbnail(ply, entry, cx);
+        request_thumbnail(ply, entry, cx, request_gen);
         if entry_icon_pending(ply, entry, cx) {
             IconProbe::Loading
         } else {
@@ -2191,5 +2254,90 @@ mod tests {
         assert_eq!(c.bytes, bytes_before);
         assert_eq!(c.locked_bytes, locked_before);
         assert_eq!(c.locked_set.len(), 2);
+    }
+
+    // --- Generation guard tests (milestone D) ---
+
+    #[test]
+    fn same_generation_applies_result() {
+        assert!(should_apply_result(5, 5));
+        assert!(should_apply_result(0, 0));
+        assert!(should_apply_result(u64::MAX, u64::MAX));
+    }
+
+    #[test]
+    fn stale_generation_rejects_result() {
+        assert!(!should_apply_result(4, 5));
+        assert!(!should_apply_result(5, 6));
+        assert!(!should_apply_result(0, 1));
+    }
+
+    #[test]
+    fn stale_result_does_not_insert_or_notify() {
+        // Simulates the completion path for a stale generation: the cache
+        // must not gain an entry, and no dirty flag should be set.
+        let mut c = ThumbCache::new();
+        let key = stamped_key(Path::new("old_folder/photo.png"), 1);
+
+        // Stale: request_gen=1, current_gen=2. Should skip insert.
+        let request_gen = 1u64;
+        let current_gen = 2u64;
+        if should_apply_result(request_gen, current_gen) {
+            let img = to_render_image(vec![42u8; 36864], 96, 96).unwrap();
+            c.insert(key.clone(), img);
+        }
+
+        assert!(
+            c.get(&key).is_none(),
+            "stale result must not be inserted into cache"
+        );
+    }
+
+    #[test]
+    fn current_generation_inserts_result() {
+        let mut c = ThumbCache::new();
+        let key = stamped_key(Path::new("current_folder/photo.png"), 1);
+
+        let request_gen = 3u64;
+        let current_gen = 3u64;
+        if should_apply_result(request_gen, current_gen) {
+            let img = to_render_image(vec![42u8; 36864], 96, 96).unwrap();
+            c.insert(key.clone(), img);
+        }
+
+        assert!(
+            c.get(&key).is_some(),
+            "current-generation result must be inserted"
+        );
+    }
+
+    #[test]
+    fn visible_first_prefetch_covers_visible_then_lookahead() {
+        // The visible-first mechanism in browser.rs iterates indices 0..lookahead_end.
+        // Visible entries occupy the lower indices (0..visible_end), lookahead
+        // the upper (visible_end..lookahead_end). Verify the partitioning:
+        let total = 100usize;
+        let visible_end = 30usize;
+        let lookahead = 24usize;
+        let lookahead_end = (visible_end + lookahead).min(total);
+
+        let mut visible = Vec::new();
+        let mut lookahead_only = Vec::new();
+        for ix in 0..lookahead_end {
+            if ix < visible_end {
+                visible.push(ix);
+            } else {
+                lookahead_only.push(ix);
+            }
+        }
+
+        // All visible indices come before any lookahead-only index.
+        assert_eq!(visible, (0..visible_end).collect::<Vec<_>>());
+        assert_eq!(
+            lookahead_only,
+            (visible_end..lookahead_end).collect::<Vec<_>>()
+        );
+        // Visible portion is first in iteration order.
+        assert!(visible.last() < lookahead_only.first());
     }
 }

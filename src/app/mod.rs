@@ -209,7 +209,7 @@ pub struct Ply {
     pub rename: Option<Rename>,
     pub status: Option<SharedString>,
 
-    list_generation: u64,
+    pub(crate) list_generation: u64,
     list_task: Option<Task<()>>,
     watch: Option<FolderWatch>,
     pub focus: FocusHandle,
