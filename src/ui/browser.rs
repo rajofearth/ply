@@ -24,12 +24,35 @@ use chrono::{DateTime, Local};
 pub fn render(ply: &Ply, window: &Window, cx: &mut Context<Ply>) -> impl IntoElement {
     let list_view = ply.view == ViewMode::List;
     let count = ply.visible_len();
-    let entries = ply.visible();
 
     // Prefetch: kick off icon extraction for the near window up front so icons
     // resolve quickly; the rest request on demand as they render.
-    for e in entries.iter().take(PREFETCH_SCAN) {
+    for e in ply.visible().iter().take(PREFETCH_SCAN) {
         thumbs::ensure_entry_icons(ply, e, cx);
+    }
+
+    // Working-set lock: tell the thumbnail cache which entries are visible so
+    // it never evicts on-screen thumbnails. Only the keys for actually visible
+    // entries are locked; everything else is evictable and re-decodes on
+    // demand when scrolled back into view.
+    {
+        let entries = ply.visible();
+        let thumb = ply.thumb_cache();
+        thumb.update(cx, |cache, _| {
+            let mut keys = Vec::with_capacity(entries.len());
+            for e in &entries {
+                let key = if thumbs::is_lnk(e) {
+                    match cache.lnk_stamp(&e.path) {
+                        Some(stamp) => thumbs::stamped_key(&e.path, stamp),
+                        None => thumbs::cache_key(&e.path, e.modified),
+                    }
+                } else {
+                    thumbs::cache_key(&e.path, e.modified)
+                };
+                keys.push(key);
+            }
+            cache.set_working_set(&keys);
+        });
     }
 
     // Both views are virtualized through `uniform_list`, which scrolls itself

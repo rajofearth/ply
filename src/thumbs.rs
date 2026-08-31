@@ -35,6 +35,12 @@ pub const THUMB_SIZE: u32 = 96;
 /// Hard ceiling on cached pixel bytes (~32 MiB of RGBA).
 const BUDGET: usize = 32 * 1024 * 1024;
 
+/// Cap on simultaneously locked (on-screen) thumbnails. Mirrors Chromium's
+/// `kMaxItemsInWorkingSet` scaled to Ply: a viewport of ~60-80 cells at 96x96x4
+/// bytes each uses ~2.8 MiB; 128 is two viewports + generous overscan and keeps
+/// locked memory under 5 MiB, well within the 32 MiB byte budget.
+const LOCK_CAP: usize = 128;
+
 /// Identity of a cached raster: a path plus the "stamp" it was derived from.
 /// For media and executables the stamp is the own-file mtime, so editing the
 /// file re-extracts it. For `.lnk` shortcuts the stamp is the resolved icon
@@ -110,12 +116,21 @@ pub(crate) enum StockIcon {
 }
 
 /// Per-window cache of decoded rasters, kept inside [`Ply`] so it is dropped
-/// with the window. LRU-evicts oldest entries past [`BUDGET`].
+/// with the window. Two-tier design: an LRU evictable tier bounded by
+/// [`BUDGET`] bytes, and a locked tier for on-screen entries that is bounded by
+/// [`LOCK_CAP`] count. The render path calls [`ThumbCache::set_working_set`]
+/// once per frame with the visible keys; everything outside the working set is
+/// evictable and re-decodes on demand.
 pub struct ThumbCache {
     map: HashMap<CacheKey, Arc<RenderImage>>,
     order: VecDeque<CacheKey>,
     inflight: HashSet<CacheKey>,
     bytes: usize,
+    /// Keys currently visible on screen. Eviction never frees a locked entry;
+    /// bounded by [`LOCK_CAP`]. Locked entries do not count toward [`BUDGET`].
+    locked_map: HashMap<CacheKey, Arc<RenderImage>>,
+    locked_set: HashSet<CacheKey>,
+    locked_bytes: usize,
     /// Resolved icon-source stamp per `.lnk` path, so the render probe can key
     /// on the source identity without re-reading the link on every paint.
     lnk_stamp: HashMap<PathBuf, u64>,
@@ -148,6 +163,9 @@ impl ThumbCache {
             order: VecDeque::new(),
             inflight: HashSet::new(),
             bytes: 0,
+            locked_map: HashMap::new(),
+            locked_set: HashSet::new(),
+            locked_bytes: 0,
             lnk_stamp: HashMap::new(),
             class_icons: HashMap::new(),
             class_inflight: HashSet::new(),
@@ -161,7 +179,10 @@ impl ThumbCache {
     }
 
     pub fn get(&self, key: &CacheKey) -> Option<Arc<RenderImage>> {
-        self.map.get(key).cloned()
+        self.locked_map
+            .get(key)
+            .or_else(|| self.map.get(key))
+            .cloned()
     }
 
     pub fn is_inflight(&self, key: &CacheKey) -> bool {
@@ -256,8 +277,17 @@ impl ThumbCache {
     }
 
     /// Insert, replacing any existing raster at the same key (used when a
-    /// `.lnk` re-extracts to a new icon).
+    /// `.lnk` re-extracts to a new icon). If the key is currently locked,
+    /// the replacement goes into the locked tier directly.
     fn insert_force(&mut self, key: CacheKey, img: Arc<RenderImage>) {
+        if self.locked_set.contains(&key) {
+            if let Some(old) = self.locked_map.remove(&key) {
+                self.locked_bytes = self.locked_bytes.saturating_sub(byte_size(&old));
+            }
+            self.locked_bytes = self.locked_bytes.saturating_add(byte_size(&img));
+            self.locked_map.insert(key, img);
+            return;
+        }
         if let Some(old) = self.map.remove(&key) {
             self.bytes = self.bytes.saturating_sub(byte_size(&old));
         }
@@ -272,11 +302,73 @@ impl ThumbCache {
         while self.bytes > BUDGET {
             match self.order.pop_front() {
                 Some(old) => {
+                    if self.locked_set.contains(&old) {
+                        continue;
+                    }
                     if let Some(evicted) = self.map.remove(&old) {
                         self.bytes = self.bytes.saturating_sub(byte_size(&evicted));
                     }
                 }
                 None => break,
+            }
+        }
+    }
+
+    /// Replace the locked (on-screen) working set. Keys in `new_keys` that are
+    /// not yet locked are promoted from the evictable tier; keys that were
+    /// locked but are absent from `new_keys` are demoted back to the evictable
+    /// LRU. If the locked count exceeds [`LOCK_CAP`], excess entries are evicted
+    /// from the back of the locked set (oldest lock).
+    pub fn set_working_set(&mut self, new_keys: &[CacheKey]) {
+        let new: HashSet<CacheKey> = new_keys.iter().cloned().collect();
+
+        // Promote: evictable -> locked.
+        for key in new.iter() {
+            if self.locked_set.contains(key) {
+                continue;
+            }
+            if let Some(img) = self.map.remove(key) {
+                self.bytes = self.bytes.saturating_sub(byte_size(&img));
+                self.locked_bytes = self.locked_bytes.saturating_add(byte_size(&img));
+                self.locked_map.insert(key.clone(), img);
+                self.locked_set.insert(key.clone());
+            }
+        }
+
+        // Demote: locked -> evictable.
+        let to_unlock: Vec<CacheKey> = self
+            .locked_set
+            .iter()
+            .filter(|k| !new.contains(k))
+            .cloned()
+            .collect();
+        for key in &to_unlock {
+            if let Some(img) = self.locked_map.remove(key) {
+                self.locked_bytes = self.locked_bytes.saturating_sub(byte_size(&img));
+                self.bytes = self.bytes.saturating_add(byte_size(&img));
+                self.map.insert(key.clone(), img.clone());
+                self.order.push_back(key.clone());
+            }
+            self.locked_set.remove(key);
+        }
+
+        // Enforce lock cap: evict oldest locked entries beyond the cap.
+        while self.locked_set.len() > LOCK_CAP {
+            let oldest = self
+                .locked_set
+                .iter()
+                .min_by_key(|k| self.locked_map.get(*k).map(byte_size))
+                .cloned();
+            if let Some(key) = oldest {
+                if let Some(img) = self.locked_map.remove(&key) {
+                    self.locked_bytes = self.locked_bytes.saturating_sub(byte_size(&img));
+                    self.bytes = self.bytes.saturating_add(byte_size(&img));
+                    self.map.insert(key.clone(), img);
+                    self.order.push_back(key.clone());
+                }
+                self.locked_set.remove(&key);
+            } else {
+                break;
             }
         }
     }
@@ -348,7 +440,7 @@ fn byte_size(img: &Arc<RenderImage>) -> usize {
     w.saturating_mul(h).max(1) * 4
 }
 
-fn is_lnk(entry: &Entry) -> bool {
+pub(crate) fn is_lnk(entry: &Entry) -> bool {
     Path::new(&entry.name)
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("lnk"))
@@ -1913,5 +2005,191 @@ mod tests {
             stamped_key(p, 0) != stamped_key(p, nanos),
             "different stamps must key different cache entries"
         );
+    }
+
+    // --- Working-set lock tests ---
+
+    /// Create a 96x96 RGBA thumbnail (36,864 bytes) keyed at `path` with a
+    /// given stamp.  The pixel content is distinct per `path` so byte_size
+    /// stays predictable.
+    fn make_thumb(cache: &mut ThumbCache, path: &str, stamp: u64) -> CacheKey {
+        let key = stamped_key(Path::new(path), stamp);
+        let pixels: Vec<u8> = (0..36864)
+            .map(|i| (i ^ path.len() as usize) as u8)
+            .collect();
+        let img = to_render_image(pixels, 96, 96).unwrap();
+        cache.insert(key.clone(), img);
+        key
+    }
+
+    #[test]
+    fn locked_entries_are_never_evicted() {
+        let mut c = ThumbCache::new();
+        let k0 = make_thumb(&mut c, "a.png", 1);
+        let k1 = make_thumb(&mut c, "b.png", 2);
+
+        // Lock k0: it must survive any eviction pressure.
+        c.set_working_set(&[k0.clone()]);
+        assert!(c.locked_set.contains(&k0));
+
+        // Flood with enough entries to blow past the budget.
+        // 32 MiB / 36,864 bytes per thumb = ~868 entries needed.
+        for i in 0..1200 {
+            make_thumb(&mut c, &format!("x{i}.png"), i + 10);
+        }
+
+        assert!(
+            c.get(&k0).is_some(),
+            "locked entry must survive eviction"
+        );
+        assert!(
+            c.get(&k1).is_none(),
+            "unlocked entry should be evicted under pressure"
+        );
+    }
+
+    #[test]
+    fn set_working_set_locks_and_unlocks() {
+        let mut c = ThumbCache::new();
+        let k0 = make_thumb(&mut c, "a.png", 1);
+        let k1 = make_thumb(&mut c, "b.png", 2);
+
+        c.set_working_set(&[k0.clone(), k1.clone()]);
+        assert!(c.locked_set.contains(&k0));
+        assert!(c.locked_set.contains(&k1));
+
+        // Scroll: k0 leaves the viewport, k1 stays, k2 enters.
+        let k2 = make_thumb(&mut c, "c.png", 3);
+        c.set_working_set(&[k1.clone(), k2.clone()]);
+        assert!(!c.locked_set.contains(&k0), "k0 should be unlocked");
+        assert!(c.locked_set.contains(&k1));
+        assert!(c.locked_set.contains(&k2));
+    }
+
+    #[test]
+    fn unlocked_entry_returns_to_evictable_lru() {
+        let mut c = ThumbCache::new();
+        let k0 = make_thumb(&mut c, "a.png", 1);
+
+        // Lock, then unlock.
+        c.set_working_set(&[k0.clone()]);
+        assert!(c.locked_set.contains(&k0));
+        c.set_working_set(&[]);
+        assert!(!c.locked_set.contains(&k0));
+
+        // k0 should be in the evictable tier and retrievable.
+        assert!(c.get(&k0).is_some());
+        assert!(c.map.contains_key(&k0));
+        assert!(c.order.contains(&k0));
+    }
+
+    #[test]
+    fn byte_budget_enforced_on_evictable_only() {
+        let mut c = ThumbCache::new();
+        let k0 = make_thumb(&mut c, "a.png", 1);
+
+        // Lock k0. Its bytes leave the evictable budget.
+        c.set_working_set(&[k0.clone()]);
+        assert_eq!(c.bytes, 0);
+
+        // Insert many evictable entries: eviction must keep bytes under BUDGET.
+        // Need >868 entries (32 MiB / 36,864 bytes per thumb) to trigger eviction.
+        for i in 0..1200 {
+            make_thumb(&mut c, &format!("x{i}.png"), i + 10);
+        }
+        assert!(
+            c.bytes <= BUDGET,
+            "evictable bytes {} must not exceed BUDGET {BUDGET}",
+            c.bytes
+        );
+        // k0 is still accessible despite being outside the budget.
+        assert!(c.get(&k0).is_some());
+    }
+
+    #[test]
+    fn insert_force_updates_locked_entry_in_place() {
+        let mut c = ThumbCache::new();
+        let k0 = make_thumb(&mut c, "a.png", 1);
+        c.set_working_set(&[k0.clone()]);
+
+        // Re-extract while locked: the new image replaces the old in-place.
+        let new_pixels: Vec<u8> = vec![42u8; 36864];
+        let new_img = to_render_image(new_pixels, 96, 96).unwrap();
+        c.insert_force(k0.clone(), new_img);
+
+        assert!(c.locked_set.contains(&k0), "still locked");
+        assert!(c.get(&k0).is_some(), "still accessible");
+        // The old evictable map must not have a stale copy.
+        assert!(!c.map.contains_key(&k0));
+    }
+
+    #[test]
+    fn lock_cap_evicts_excess_locked_entries() {
+        let mut c = ThumbCache::new();
+        let mut keys = Vec::new();
+        // Insert LOCK_CAP + 10 entries.
+        for i in 0..(LOCK_CAP + 10) {
+            keys.push(make_thumb(&mut c, &format!("t{i}.png"), i as u64));
+        }
+
+        // Lock all of them. The excess should spill into the evictable tier.
+        c.set_working_set(&keys);
+        assert!(
+            c.locked_set.len() <= LOCK_CAP,
+            "locked set {} must not exceed LOCK_CAP {LOCK_CAP}",
+            c.locked_set.len()
+        );
+
+        // The spilled keys must still be accessible (just evictable).
+        for k in &keys {
+            assert!(c.get(k).is_some(), "spilled key must still be in cache");
+        }
+    }
+
+    #[test]
+    fn re_insert_after_unlock_restores_to_lru() {
+        let mut c = ThumbCache::new();
+        let k0 = make_thumb(&mut c, "a.png", 1);
+
+        // Lock, unlock, then re-insert (simulates re-decode on demand).
+        c.set_working_set(&[k0.clone()]);
+        c.set_working_set(&[]);
+        let new_img = to_render_image(vec![99u8; 36864], 96, 96).unwrap();
+        c.insert(k0.clone(), new_img);
+
+        assert!(c.get(&k0).is_some());
+        assert!(!c.locked_set.contains(&k0));
+        assert!(c.map.contains_key(&k0));
+    }
+
+    #[test]
+    fn empty_working_set_unlocks_everything() {
+        let mut c = ThumbCache::new();
+        let k0 = make_thumb(&mut c, "a.png", 1);
+        let k1 = make_thumb(&mut c, "b.png", 2);
+
+        c.set_working_set(&[k0.clone(), k1.clone()]);
+        assert_eq!(c.locked_set.len(), 2);
+
+        c.set_working_set(&[]);
+        assert_eq!(c.locked_set.len(), 0);
+        assert!(c.get(&k0).is_some());
+        assert!(c.get(&k1).is_some());
+    }
+
+    #[test]
+    fn idempotent_set_working_set_is_a_noop() {
+        let mut c = ThumbCache::new();
+        let k0 = make_thumb(&mut c, "a.png", 1);
+        let k1 = make_thumb(&mut c, "b.png", 2);
+
+        c.set_working_set(&[k0.clone(), k1.clone()]);
+        let bytes_before = c.bytes;
+        let locked_before = c.locked_bytes;
+
+        c.set_working_set(&[k0.clone(), k1.clone()]);
+        assert_eq!(c.bytes, bytes_before);
+        assert_eq!(c.locked_bytes, locked_before);
+        assert_eq!(c.locked_set.len(), 2);
     }
 }
