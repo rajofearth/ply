@@ -56,15 +56,43 @@ and where sensible per-path/class icons), NOT the OS shell-data we get for free.
   call for a cached key).
 - Fail memo: a failed file writes a fail marker and is not retried.
 - Eviction: over-cap removes oldest first; missing-source files removed.
-- Budget gate still passes; full test suite green; bench 2nd-open of Screenshots is fast.
+- Budget gate still passes; full test suite green (105 tests); clippy clean.
+
+## Result (bench, Screenshots, 1973 entries, grid view, this machine)
+
+First open is a cold cache (everything generated through the shell and written to disk);
+second open (same launch, warm cache) reads the rasters back from disk instead.
+
+| metric             | cold (generate) | hot (cache) |
+|--------------------|-----------------|-------------|
+| launch→settle      | ~6.4s           | ~2-5s       |
+| peak CPU           | ~219%           | ~167-177%   |
+| steady working set | ~450 MB         | ~465 MB flat|
+| steady idle CPU    | 2.08%           | 2.08%       |
+
+That's the point of the cache: the second open settles up to ~3x faster and never
+re-extracts. Memory stays flat between the two.
+
+Two correctness/robustness notes, both fixed and tested here:
+- **Decode concurrency must stay bounded.** A first cut let disk decodes run with no
+  cap: a warm visible window + prefetch decoded dozens of full-size PNGs at once and
+  the hot open ballooned to ~1.6 GB before settling. Disk probes now hold a content
+  slot just like shell extractions, so total concurrent decode work stays under
+  `CONTENT_CAP`; memory holds flat (~465 MB). Fast hits free their slot quickly, so a
+  warm open still drains the visible window in a few frames.
+- **The disk probe is inflight-marked**, so repeated render frames can't re-trigger a
+  probe (or extraction) while one is resolving. Without it a warm open re-decodered
+  the same files every frame (decode storm, never-idle CPU).
 
 ## Files
 - `src/cache.rs` (new): disk-cache read/write/evict, key computation, PNG encode/decode
   via `image`, fail-memo, size accounting.
 - `src/thumbs.rs`: hook lookup-before-generate into the request path; persist on
-  completion (guarded by generation).
-- `src/app/ops.rs`: wire reload to warm the working set from disk cache if applicable.
-- `src/budget.rs`: report disk-cache size (RAM budget unchanged).
+  completion (guarded by generation); disk probes are inflight-marked and hold a
+  content slot so concurrent decode work stays bounded.
+- `src/app/mod.rs`: one background evict pass at launch to enforce the disk-size cap.
+- `src/budget.rs`: disk cache is not counted toward the RAM budget gate (it's on disk),
+  so no change was needed there.
 
 ## Non-goals (per research + ADRs)
 - No drive-wide background indexing (ADR 0002) — cache is per-requested-folder.

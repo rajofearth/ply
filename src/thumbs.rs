@@ -562,45 +562,120 @@ pub fn request_thumbnail(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>, reques
     // type icons. `request_thumbnail` also serves `.lnk` shortcut icons; those
     // stay in-memory-only because their key is the resolved icon-source stamp,
     // not a plain path+mtime.
+    //
+    // The whole resolve (disk probe through final insert) runs off the UI
+    // thread so a cold disk cache never blocks a frame. For content media we
+    // probe the disk first: a hit decodes straight into the working set,
+    // skipping the shell extraction and its content slot, and a persisted
+    // `fail/` marker short-circuits re-extraction. A miss (or an `.lnk`) falls
+    // through to the real extraction below. Everything is generation-guarded so
+    // a disk hit for a now-stale folder never pollutes the working set.
     let is_content = !is_lnk(entry);
-    if is_content {
-        let disk_key = key.disk_key();
-        // A known-bad file (per the freedesktop `fail/` marker) is never
-        // re-extracted; fold it into the in-memory failed set so later probes
-        // are fast. Best-effort disk read; any local/read failure just falls
-        // through to a fresh extraction.
-        if crate::cache::disk_failed(&disk_key) {
-            cache_entity.update(cx, |c, _| c.mark_failed(key.clone()));
-            return;
-        }
-        // Lookup-before-generate: a cached PNG decodes straight into the
-        // working set, skipping the shell extraction (and its content slot).
-        // Respect the generation guard: a disk hit for a now-stale folder must
-        // still not pollute the working set.
-        if should_apply_result(request_gen, current_gen)
-            && let Some((bytes, w, h)) = crate::cache::lookup(&disk_key)
-            && let Some(img) = to_render_image(bytes, w, h)
-        {
-            cache_entity.update(cx, |c, _| {
-                c.insert(key.clone(), img);
-            });
-            // Repaint so the freshly-inserted working-set entry shows. The
-            // probe path runs repeatedly, so this is cheap to coalesce via the
-            // normal repaint cycle.
-            cx.notify();
-            return;
-        }
-    }
+    let disk_key = key.disk_key();
+    let path = entry.path.clone();
+    let worker_path = path.clone();
+    let lnk = is_lnk(entry);
+
+    // Hold the inflight mark AND a content slot for the whole resolve, so
+    // repeated render frames can't re-trigger a probe or extraction while this
+    // one is in flight, and the total concurrent decode work (disk hits plus
+    // shell extractions) stays bounded by CONTENT_CAP. Bounding is what keeps
+    // memory flat: a warm folder decodes many full-size PNGs, and without a cap
+    // they pile up faster than they drain. Fast disk hits free their slot
+    // quickly, so a warm open still drains the visible window in a few frames.
     cache_entity.update(cx, |c, _| {
         c.mark_inflight(key.clone());
         c.reserve_content();
     });
 
-    let path = entry.path.clone();
-    let worker_path = path.clone();
-    let lnk = is_lnk(entry);
-    let disk_key = key.disk_key();
+    // Content media probe the disk cache first on a background thread; `.lnk`
+    // shortcuts skip the disk (their key is a resolved icon-source stamp, not a
+    // plain path+mtime) and go straight to extraction. A disk hit reads and
+    // PNG-decodes the cached file into raw RGBA bytes and builds the
+    // RenderImage back on the UI thread, matching the extraction path. Any
+    // local/read failure reads as a miss and falls through to fresh
+    // extraction. Everything here is generation-guarded so a disk hit for a
+    // now-stale folder never pollutes the working set.
     cx.spawn(async move |this, cx| {
+        let (disk_failed, disk_hit) = if is_content {
+            let dk = disk_key.clone();
+            cx.background_spawn(async move {
+                if crate::cache::disk_failed(&dk) {
+                    (true, None)
+                } else {
+                    (false, crate::cache::lookup(&dk))
+                }
+            })
+            .await
+        } else {
+            (false, None)
+        };
+
+        if is_content && disk_failed {
+            // Known-bad file (persisted `fail/` marker): fold it into the
+            // in-memory failed set so later probes are fast. The inflight mark
+            // and content slot are released here; a local failure on the
+            // marker read is not an error.
+            let _ = this.update(cx, |this, cx| {
+                this.thumb_cache().update(cx, |c, _| {
+                    c.unmark_inflight(&key);
+                    c.release_content();
+                    c.mark_failed(key.clone());
+                });
+            });
+            return;
+        }
+
+        if let Some((bytes, w, h)) = disk_hit {
+            // Only trust a disk hit while the listing is unchanged.
+            let current = this
+                .update(cx, |this, _| should_apply_result(request_gen, this.list_generation))
+                .unwrap_or(false);
+            if !current {
+                let _ = this.update(cx, |this, cx| {
+                    this.thumb_cache().update(cx, |c, _| {
+                        c.unmark_inflight(&key);
+                        c.release_content();
+                    });
+                });
+                return;
+            }
+            match to_render_image(bytes, w, h) {
+                Some(img) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.thumb_cache().update(cx, |c, _| {
+                            c.unmark_inflight(&key);
+                            c.release_content();
+                            c.insert(key.clone(), img);
+                        });
+                    });
+                    // Mark dirty so the freshly-inserted entry shows on the
+                    // next flush, coalesced with any other pending icon
+                    // updates. Insert makes it sticky, so later probes find it
+                    // cached and never re-decode from disk.
+                    let _ = this.update(cx, |this, cx| {
+                        this.mark_thumbs_dirty();
+                        this.schedule_thumbs_flush(cx);
+                    });
+                }
+                None => {
+                    // Cached PNG failed to decode: not a permanent failure, so
+                    // fall through to a fresh shell extraction.
+                    let _ = this.update(cx, |this, cx| {
+                        this.thumb_cache().update(cx, |c, _| {
+                            c.unmark_inflight(&key);
+                            c.release_content();
+                        });
+                    });
+                }
+            }
+            return;
+        }
+
+        // Disk miss (content without a cached raster, or an `.lnk`): run the
+        // real shell extraction. The inflight mark and content slot are already
+        // held from above; the completion below clears them and writes the
+        // raster back to the disk cache.
         let got = if lnk {
             cx.background_spawn(async move { request_lnk(worker_path, THUMB_SIZE) })
                 .await
