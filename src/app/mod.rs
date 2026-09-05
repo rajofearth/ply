@@ -228,6 +228,15 @@ pub struct Ply {
     thumbs_dirty: bool,
     /// A flush timer is already scheduled; don't spawn another.
     thumbs_flush_pending: bool,
+    /// Paint storm detector: while repaints arrive at fling rate (fast
+    /// scrolling), listing cells paint placeholder slots instead of content
+    /// thumbnails, so a fling past hundreds of files doesn't upload hundreds
+    /// of GPU tiles that are visible for a frame each. Shared class icons
+    /// still paint (their tiles upload once and dedupe). Updated in
+    /// `Render::render`, read by the browser cell painters.
+    pub(crate) thumb_storm: bool,
+    storm_window_start: std::time::Instant,
+    storm_paints: u32,
 }
 
 impl Ply {
@@ -277,6 +286,9 @@ impl Ply {
             thumbs: cx.new(|_| crate::thumbs::ThumbCache::new()),
             thumbs_dirty: false,
             thumbs_flush_pending: false,
+            thumb_storm: false,
+            storm_window_start: std::time::Instant::now(),
+            storm_paints: 0,
         };
         ply.refresh_volumes(cx);
         ply.start_watch_poll(cx);
@@ -308,6 +320,21 @@ impl Ply {
     /// The window's thumbnail cache.
     pub fn thumb_cache(&self) -> Entity<crate::thumbs::ThumbCache> {
         self.thumbs.clone()
+    }
+
+    /// Update the paint-storm detector; called at the top of every render.
+    /// Sustained repaint rates (>= 12 paints in a rolling 250 ms window,
+    /// i.e. ~48 fps) mean a scroll fling is in flight. Ordinary interaction
+    /// (typing, key-repeat selection at ~30 Hz, completion trickle) stays
+    /// well under the threshold.
+    pub(crate) fn note_paint(&mut self) {
+        let now = std::time::Instant::now();
+        if now.duration_since(self.storm_window_start).as_millis() > 250 {
+            self.storm_window_start = now;
+            self.storm_paints = 0;
+        }
+        self.storm_paints += 1;
+        self.thumb_storm = self.storm_paints >= 12;
     }
 
     /// Whether a text field has focus, so bare-key shortcuts should stand down.

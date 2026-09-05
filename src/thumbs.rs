@@ -32,13 +32,18 @@ use crate::listing::{Entry, KindClass, kind_class};
 /// One thumbnail size, in device-independent pixels on the larger side.
 pub const THUMB_SIZE: u32 = 96;
 
-/// Hard ceiling on cached pixel bytes (~32 MiB of RGBA).
-const BUDGET: usize = 32 * 1024 * 1024;
+/// Hard ceiling on cached pixel bytes: ~8 MiB of RGBA plus the capped
+/// on-screen working set. Bounds the live tile count; evictions queue GPU
+/// drops via `pending_drops` (see `drain_drops`).
+const BUDGET: usize = 8 * 1024 * 1024;
+
+/// Evicted bytes that trigger a full live-tile flush (see `drain_drops`).
+const FLUSH_THRESHOLD: usize = 2 * 1024 * 1024;
 
 /// Cap on simultaneously locked (on-screen) thumbnails. Mirrors Chromium's
 /// `kMaxItemsInWorkingSet` scaled to Ply: a viewport of ~60-80 cells at 96x96x4
 /// bytes each uses ~2.8 MiB; 128 is two viewports + generous overscan and keeps
-/// locked memory under 5 MiB, well within the 32 MiB byte budget.
+/// locked memory under 5 MiB, well within the byte budget.
 const LOCK_CAP: usize = 128;
 
 /// Identity of a cached raster: a path plus the "stamp" it was derived from.
@@ -164,6 +169,15 @@ pub struct ThumbCache {
     /// guards opening a folder full of media from lining up hundreds of
     /// GetImage jobs; the drain releases a slot on each completion.
     content_pending: usize,
+    /// Images fully evicted from both tiers since the last drain. The app
+    /// drains this each render and calls `Window::drop_image` so GPUI frees the
+    /// texture from the window's atlas (which otherwise never evicts). Without
+    /// this, every thumbnail ever painted keeps its GPU texture forever and the
+    /// working set grows monotonically while browsing.
+    pending_drops: Vec<Arc<RenderImage>>,
+    /// Evicted bytes since the last full live-tile flush. Bounds atlas page
+    /// retention during heavy turnover; see [`ThumbCache::drain_drops`].
+    dropped_since_flush: usize,
 }
 
 impl ThumbCache {
@@ -185,6 +199,8 @@ impl ThumbCache {
             failed: HashSet::new(),
             class_failed: HashSet::new(),
             content_pending: 0,
+            pending_drops: Vec::new(),
+            dropped_since_flush: 0,
         }
     }
 
@@ -293,6 +309,7 @@ impl ThumbCache {
         if self.locked_set.contains(&key) {
             if let Some(old) = self.locked_map.remove(&key) {
                 self.locked_bytes = self.locked_bytes.saturating_sub(byte_size(&old));
+                self.pending_drops.push(old);
             }
             self.locked_bytes = self.locked_bytes.saturating_add(byte_size(&img));
             self.locked_map.insert(key, img);
@@ -300,6 +317,7 @@ impl ThumbCache {
         }
         if let Some(old) = self.map.remove(&key) {
             self.bytes = self.bytes.saturating_sub(byte_size(&old));
+            self.pending_drops.push(old);
         }
         self.push(key, img);
     }
@@ -317,11 +335,46 @@ impl ThumbCache {
                     }
                     if let Some(evicted) = self.map.remove(&old) {
                         self.bytes = self.bytes.saturating_sub(byte_size(&evicted));
+                        // Fully evicted: queue the raster so the app can free
+                        // its GPU texture from the atlas this frame.
+                        self.pending_drops.push(evicted);
                     }
                 }
                 None => break,
             }
         }
+    }
+
+    /// Drain rasters that have left the cache since the last call. Call on the
+    /// render path (where a `Window` is at hand) and drop each via
+    /// [`Window::drop_image`] so GPUI frees the atlas tile.
+    ///
+    /// When turnover is heavy (fast scrolling), also drops every LIVE tile
+    /// once evicted bytes pass [`FLUSH_THRESHOLD`]. Atlas buckets only reuse
+    /// freed space once a whole bucket empties, and the locked working set
+    /// pins at least one tile on nearly every page — without a full flush,
+    /// freed holes are never reusable and dead pages accumulate without
+    /// bound. Visible tiles re-upload on this same paint, so the net atlas
+    /// stays near the live set instead of the cumulative paintings.
+    ///
+    /// The flush covers the shared class/index/stock icon maps too: those
+    /// tiles interleave with thumbnail tiles temporally (every media file
+    /// paints its class icon before its preview arrives), so leaving them
+    /// pinned keeps every mixed bucket alive forever.
+    pub fn drain_drops(&mut self) -> Vec<Arc<RenderImage>> {
+        let mut out = std::mem::take(&mut self.pending_drops);
+        self.dropped_since_flush += out.iter().map(byte_size).sum::<usize>();
+        if self.dropped_since_flush >= FLUSH_THRESHOLD
+            && (!self.map.is_empty() || !self.locked_map.is_empty())
+        {
+            out.extend(self.map.values().cloned());
+            out.extend(self.locked_map.values().cloned());
+            out.extend(self.class_icons.values().cloned());
+            out.extend(self.index_icons.values().cloned());
+            out.extend(self.stock_icons.values().cloned());
+            self.dropped_since_flush = 0;
+        }
+        out
     }
 
     /// Replace the locked (on-screen) working set. Keys in `new_keys` that are
@@ -629,7 +682,9 @@ pub fn request_thumbnail(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>, reques
         if let Some((bytes, w, h)) = disk_hit {
             // Only trust a disk hit while the listing is unchanged.
             let current = this
-                .update(cx, |this, _| should_apply_result(request_gen, this.list_generation))
+                .update(cx, |this, _| {
+                    should_apply_result(request_gen, this.list_generation)
+                })
                 .unwrap_or(false);
             if !current {
                 let _ = this.update(cx, |this, cx| {
@@ -728,11 +783,12 @@ pub fn request_thumbnail(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>, reques
                     // thread, then insert into the working set. Best-effort
                     // write; a disk error never fails the app.
                     let write_key = disk_key.clone();
-                    let write_bytes = bytes.clone();
-                    cx.background_spawn(async move {
-                        crate::cache::store(&write_key, &write_bytes, w, h);
-                    })
-                    .detach();
+                    if let Some((write_bytes, w, h)) = fit_thumb(bytes.clone(), w, h) {
+                        cx.background_spawn(async move {
+                            crate::cache::store(&write_key, &write_bytes, w, h);
+                        })
+                        .detach();
+                    }
                     let img = to_render_image(bytes, w, h);
                     let _ = this.update(cx, |this, cx| {
                         this.thumb_cache().update(cx, |c, _| {
@@ -1062,7 +1118,29 @@ pub fn refresh_lnk(paths: &[PathBuf], cx: &mut Context<Ply>) {
     }
 }
 
+/// Normalise a decoded RGBA raster to at most [`THUMB_SIZE`] on its longer
+/// side BEFORE it becomes a `RenderImage`. The shell's `GetImage` can hand
+/// back bitmaps far larger than the requested size; without a cap every
+/// painted thumbnail becomes a full-size atlas tile (multi-MB tiles for
+/// camera photos), which dominates the GPU working set while browsing a
+/// media folder. The display always draws at the same cell size, so a small
+/// texture is visually identical but a fraction of the bytes.
+fn fit_thumb(bytes: Vec<u8>, w: u32, h: u32) -> Option<(Vec<u8>, u32, u32)> {
+    let buf = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(w, h, bytes)?;
+    let (iw, ih) = buf.dimensions();
+    let longest = iw.max(ih);
+    if longest <= THUMB_SIZE {
+        return Some((buf.into_raw(), iw, ih));
+    }
+    let scale = THUMB_SIZE as f32 / longest as f32;
+    let nw = ((iw as f32 * scale).round() as u32).max(1);
+    let nh = ((ih as f32 * scale).round() as u32).max(1);
+    let small = image::imageops::resize(&buf, nw, nh, image::imageops::FilterType::Triangle);
+    Some((small.into_raw(), nw, nh))
+}
+
 fn to_render_image(bytes: Vec<u8>, w: u32, h: u32) -> Option<Arc<RenderImage>> {
+    let (bytes, w, h) = fit_thumb(bytes, w, h)?;
     let buf = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(w, h, bytes)?;
     let frame = image::Frame::new(buf);
     Some(Arc::new(RenderImage::new(vec![frame])))
@@ -2247,7 +2325,7 @@ mod tests {
         assert!(c.locked_set.contains(&k0));
 
         // Flood with enough entries to blow past the budget.
-        // 32 MiB / 36,864 bytes per thumb = ~868 entries needed.
+        // 8 MiB / 36,864 bytes per thumb = ~217 entries needed.
         for i in 0..1200 {
             make_thumb(&mut c, &format!("x{i}.png"), i + 10);
         }
@@ -2304,7 +2382,7 @@ mod tests {
         assert_eq!(c.bytes, 0);
 
         // Insert many evictable entries: eviction must keep bytes under BUDGET.
-        // Need >868 entries (32 MiB / 36,864 bytes per thumb) to trigger eviction.
+        // Need >217 entries (8 MiB / 36,864 bytes per thumb) to trigger eviction.
         for i in 0..1200 {
             make_thumb(&mut c, &format!("x{i}.png"), i + 10);
         }

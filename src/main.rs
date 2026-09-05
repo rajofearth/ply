@@ -29,6 +29,10 @@ fn main() {
         .with_assets(icons::Assets)
         .run(|cx| {
             gpui_component::init(cx);
+            // Grayscale text: the subpixel text pipeline costs ~100 MB of
+            // GPU-shared memory on first paint (measured); grayscale is
+            // visually near-identical and skips it.
+            cx.set_text_rendering_mode(gpui::TextRenderingMode::Grayscale);
 
             cx.bind_keys([
                 KeyBinding::new("d", ToggleTheme, Some("Ply")),

@@ -296,6 +296,15 @@ fn icon_or_thumb(
     request_gen: u64,
 ) -> AnyElement {
     let p = ply.palette();
+    // During a paint storm (scroll fling), content thumbnails paint as
+    // placeholder slots: uploading a tile per file for frames that are gone
+    // in 16 ms each is what grows GPU-shared without bound while scrolling.
+    // Shared class icons and glyphs still paint (their tiles upload once and
+    // dedupe), and extraction keeps warming the cache, so the thumbs fill in
+    // on settle. Sidebar/Home probes are unaffected (separate call sites).
+    if ply.thumb_storm && thumbs::wants_content_thumbnail(entry) {
+        return super::icon_slot(box_px).into_any_element();
+    }
     match thumbs::entry_icon_probe(ply, entry, cx, request_gen) {
         thumbs::IconProbe::Ready(img) => super::thumb_img(&img, box_px).into_any_element(),
         thumbs::IconProbe::Loading => super::icon_slot(box_px).into_any_element(),

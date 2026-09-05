@@ -105,6 +105,20 @@ impl Render for Ply {
         let editing = self.rename.is_some();
         self.sync_filter_placeholder(window, cx);
 
+        // Paint-storm detector (see `Ply::thumb_storm`): sustained repaint
+        // rates mean a scroll fling is in flight.
+        self.note_paint();
+
+        // Free GPU textures for thumbnails that have left the bounded cache.
+        // GPUI's own window atlas never evicts, so without this every image
+        // ever painted keeps a tile in GPU memory forever.
+        let dropped = self
+            .thumb_cache()
+            .update(cx, |cache, _| cache.drain_drops());
+        for image in dropped {
+            window.drop_image(image).ok();
+        }
+
         div()
             .key_context("Ply")
             .track_focus(&self.focus)
