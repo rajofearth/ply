@@ -228,15 +228,35 @@ pub struct Ply {
     thumbs_dirty: bool,
     /// A flush timer is already scheduled; don't spawn another.
     thumbs_flush_pending: bool,
-    /// Paint storm detector: while repaints arrive at fling rate (fast
-    /// scrolling), listing cells paint placeholder slots instead of content
+    /// Paint storm detector: while the viewport travels at fling speed,
+    /// listing cells paint placeholder slots instead of content
     /// thumbnails, so a fling past hundreds of files doesn't upload hundreds
     /// of GPU tiles that are visible for a frame each. Shared class icons
     /// still paint (their tiles upload once and dedupe). Updated in
     /// `Render::render`, read by the browser cell painters.
     pub(crate) thumb_storm: bool,
     storm_window_start: std::time::Instant,
-    storm_paints: u32,
+    /// Viewport start the current storm window is measured against, and
+    /// whether it has moved enough to be a real fling. Rate alone is not
+    /// enough: a fast extraction trickle also repaints rapidly while the
+    /// viewport sits still, and blanking that (progressive fill) would feel
+    /// slower, not faster. Conversely heavy upload-bound frames render too
+    /// slowly to trip any fps threshold, so movement is the whole signal.
+    /// The reference sticks across windows while moving (no on/off flicker
+    /// mid-fling) and re-anchors after one quiet window.
+    storm_ref_start: usize,
+    storm_window_moved: bool,
+    /// Entry-index range actually painted last frame (union of the
+    /// virtualized rows the list/grid processors ran for), plus the listing
+    /// generation it belongs to. Prefetch and the thumbnail working-set lock
+    /// use this viewport window instead of the whole listing: locking 15k
+    /// keys spills the LOCK_CAP and churns on-screen tiles, and rebuilding
+    /// that key vector every frame is the largest main-thread cost in the
+    /// app. One frame stale by construction; overscan covers the lag. The
+    /// row processors overwrite it (last wins); a generation mismatch or an
+    /// empty range falls back to the top of the listing.
+    pub(crate) last_viewport: std::ops::Range<usize>,
+    pub(crate) last_viewport_gen: u64,
 }
 
 impl Ply {
@@ -288,7 +308,10 @@ impl Ply {
             thumbs_flush_pending: false,
             thumb_storm: false,
             storm_window_start: std::time::Instant::now(),
-            storm_paints: 0,
+            storm_ref_start: 0,
+            storm_window_moved: false,
+            last_viewport: 0..0,
+            last_viewport_gen: 0,
         };
         ply.refresh_volumes(cx);
         ply.start_watch_poll(cx);
@@ -323,18 +346,31 @@ impl Ply {
     }
 
     /// Update the paint-storm detector; called at the top of every render.
-    /// Sustained repaint rates (>= 12 paints in a rolling 250 ms window,
-    /// i.e. ~48 fps) mean a scroll fling is in flight. Ordinary interaction
-    /// (typing, key-repeat selection at ~30 Hz, completion trickle) stays
-    /// well under the threshold.
+    /// A storm is real viewport travel (more than `STORM_MOVE_MIN` entries
+    /// within a rolling 250 ms window): a scroll fling. Repaint rate alone
+    /// is not the signal — a fast extraction trickle repaints rapidly while
+    /// the viewport sits still (progressive fill-in, must never blank), and
+    /// upload-bound fling frames render too slowly to trip any fps
+    /// threshold. Slow scrolls, arrow-key stepping and typing move less
+    /// than the minimum and stay progressive.
     pub(crate) fn note_paint(&mut self) {
+        /// Viewport travel (entries) within one window that counts as a
+        /// fling rather than jitter or key-repeat stepping.
+        const STORM_MOVE_MIN: usize = 40;
         let now = std::time::Instant::now();
         if now.duration_since(self.storm_window_start).as_millis() > 250 {
             self.storm_window_start = now;
-            self.storm_paints = 0;
+            if !self.storm_window_moved {
+                // Quiet window: re-anchor. A moving window keeps the old
+                // reference so the storm doesn't flicker off mid-fling.
+                self.storm_ref_start = self.last_viewport.start;
+            }
+            self.storm_window_moved = false;
         }
-        self.storm_paints += 1;
-        self.thumb_storm = self.storm_paints >= 12;
+        if self.last_viewport.start.abs_diff(self.storm_ref_start) > STORM_MOVE_MIN {
+            self.storm_window_moved = true;
+        }
+        self.thumb_storm = self.storm_window_moved;
     }
 
     /// Whether a text field has focus, so bare-key shortcuts should stand down.

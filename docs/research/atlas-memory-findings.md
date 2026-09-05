@@ -52,11 +52,40 @@ extraction keeps warming the cache, so previews fill in on settle.
 Tuning: `BUDGET` 8 MiB (~220 tiles: viewport + lookahead + scroll-back),
 `LOCK_CAP` 128, `FLUSH_THRESHOLD` 2 MiB.
 
-## Results
+## Round two: the lock was locking everything
 
-Home 362 to ~195-256 MB Task Manager. A 60-wheel fling through ~2k images:
-storm peak ~550-700 MB, settles ~511 MB (was ~770-960 MB and climbing).
-Non-GPU stays ~36-76 MB throughout.
+`visible()` returns the whole listing, and the render path passed all of it
+to `set_working_set` every frame while prefetching rows `0..N` regardless of
+scroll position. Consequences, all measured or code-proven:
+
+- O(listing) PathBuf clones plus hashing on every frame (the largest
+  main-thread cost in the app at 15k files).
+- The 128-entry lock cap spilled for any folder over ~128 thumbnails, so
+  on-screen tiles were evicted by off-screen completions. An evicted video
+  tile re-extracts in seconds (image: milliseconds), which is the video
+  "blink" (blank slot, slow reappear). Images cycled the same way but too
+  fast to see.
+- Prefetch warmed the top of the folder even when scrolled to row 9,000.
+
+Fix: the virtualized row processors record the painted entry range into
+`Ply::last_viewport`; prefetch and the lock use that window (plus symmetric
+overscan), clamped to `LOCK_CAP` around the painted center so the spill can
+never take an on-screen tile. First paint and generation changes fall back
+to the top.
+
+The storm gate is movement-only: viewport travel over 40 entries per
+250 ms window, with a sticky reference across windows (no on/off flicker
+mid-fling). Repaint rate alone is the wrong signal both ways: fill trickle
+repaints fast while stationary (must stay progressive), and upload-bound
+fling frames render too slowly to trip any fps threshold. Verified by
+transition logging: one engagement per fling, no flicker.
+
+## Results after round two
+
+15,744-PNG folder, 60-wheel fling: storm peak flat ~465 MB (was a
+520-920 MB sawtooth), settles to 274 MB Task Manager (219 MB GPU-shared).
+811-video folder: down-and-back scroll flat ~450 MB throughout, idle 0% CPU
+— the blink mechanism (on-screen eviction) is gone. Home unchanged ~256 MB.
 
 ## Known limit
 

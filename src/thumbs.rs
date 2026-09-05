@@ -43,8 +43,10 @@ const FLUSH_THRESHOLD: usize = 2 * 1024 * 1024;
 /// Cap on simultaneously locked (on-screen) thumbnails. Mirrors Chromium's
 /// `kMaxItemsInWorkingSet` scaled to Ply: a viewport of ~60-80 cells at 96x96x4
 /// bytes each uses ~2.8 MiB; 128 is two viewports + generous overscan and keeps
-/// locked memory under 5 MiB, well within the byte budget.
-const LOCK_CAP: usize = 128;
+/// locked memory under 5 MiB, well within the byte budget. The browser clamps
+/// its lock window to this cap (see `clamp_lock_window`), so the spill path
+/// below only ever sees off-screen keys.
+pub(crate) const LOCK_CAP: usize = 128;
 
 /// Identity of a cached raster: a path plus the "stamp" it was derived from.
 /// For media and executables the stamp is the own-file mtime, so editing the

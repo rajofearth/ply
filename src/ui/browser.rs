@@ -25,40 +25,67 @@ pub fn render(ply: &Ply, window: &Window, cx: &mut Context<Ply>) -> impl IntoEle
     let list_view = ply.view == ViewMode::List;
     let count = ply.visible_len();
     let request_gen = ply.list_generation;
+    let entries = ply.visible();
+    let total = entries.len();
+    let visible_count = if list_view {
+        let row_h = 29.;
+        (f32::from(window.viewport_size().height) / row_h).ceil() as usize
+    } else {
+        let cols = grid_cols_from_width(avail_width(window));
+        let row_h = GRID_CELL_W + 6. + 14. + 6.;
+        let rows = (f32::from(window.viewport_size().height) / row_h).ceil() as usize;
+        rows * cols
+    };
 
-    // Visible-first prefetch: request icons for visible entries first, then a
-    // bounded lookahead past the visible window. This mirrors KIO/Nautilus
+    // Viewport window from last frame's painted rows (see
+    // `Ply::last_viewport`): the virtualized list only paints this slice, so
+    // prefetch and the working-set lock key off it instead of the whole
+    // listing. Falls back to the top on first paint or after the listing
+    // changes; one frame stale by construction, overscan covers the lag.
+    let vp: Range<usize> = if !ply.last_viewport.is_empty()
+        && ply.last_viewport_gen == request_gen
+        && ply.last_viewport.start < total
+    {
+        let end = ply.last_viewport.end.min(total);
+        ply.last_viewport.start..end
+    } else {
+        0..visible_count.min(total)
+    };
+    // Visible-first prefetch: request icons for the viewport window first,
+    // then a bounded symmetric overscan past it. This mirrors KIO/Nautilus
     // visible-first scheduling so the pool serves on-screen rows before
     // off-screen ones.
     {
         let entries = ply.visible();
-        let visible_count = if list_view {
-            let row_h = 29.;
-            (f32::from(window.viewport_size().height) / row_h).ceil() as usize
-        } else {
-            let cols = grid_cols_from_width(avail_width(window));
-            let row_h = GRID_CELL_W + 6. + 14. + 6.;
-            let rows = (f32::from(window.viewport_size().height) / row_h).ceil() as usize;
-            rows * cols
-        };
-        let visible_end = visible_count.min(entries.len());
-        let lookahead_end = (visible_end + PREFETCH_LOOKAHEAD).min(entries.len());
-        // Visible entries first, then the lookahead window.
-        for entry in entries.iter().take(lookahead_end) {
+        let pf_start = vp.start.saturating_sub(PREFETCH_OVERSCAN);
+        let pf_end = (vp.end + PREFETCH_OVERSCAN).min(entries.len());
+        // Visible entries first, then the overscan window.
+        for entry in &entries[vp.clone()] {
+            thumbs::ensure_entry_icons(ply, entry, cx, request_gen);
+        }
+        for entry in &entries[pf_start..vp.start] {
+            thumbs::ensure_entry_icons(ply, entry, cx, request_gen);
+        }
+        for entry in &entries[vp.end..pf_end] {
             thumbs::ensure_entry_icons(ply, entry, cx, request_gen);
         }
     }
 
     // Working-set lock: tell the thumbnail cache which entries are visible so
-    // it never evicts on-screen thumbnails. Only the keys for actually visible
-    // entries are locked; everything else is evictable and re-decodes on
-    // demand when scrolled back into view.
+    // it never evicts on-screen thumbnails. Only the viewport plus a small
+    // overscan is locked, clamped to LOCK_CAP around the painted center so
+    // the cap spill can never take an on-screen tile; everything else is
+    // evictable and re-decodes on demand when scrolled back into view.
     {
         let entries = ply.visible();
+        let lo = vp.start.saturating_sub(LOCK_OVERSCAN);
+        let hi = (vp.end + LOCK_OVERSCAN).min(entries.len());
+        let center = (vp.start + vp.end) / 2;
+        let (lo, hi) = clamp_lock_window(lo, hi, center);
         let thumb = ply.thumb_cache();
         thumb.update(cx, |cache, _| {
-            let mut keys = Vec::with_capacity(entries.len());
-            for e in entries {
+            let mut keys = Vec::with_capacity(hi - lo);
+            for e in &entries[lo..hi] {
                 let key = if thumbs::is_lnk(e) {
                     match cache.lnk_stamp(&e.path) {
                         Some(stamp) => thumbs::stamped_key(&e.path, stamp),
@@ -89,8 +116,13 @@ pub fn render(ply: &Ply, window: &Window, cx: &mut Context<Ply>) -> impl IntoEle
             count,
             cx.processor(move |this, range: Range<usize>, _window, cx| {
                 let now = Local::now();
-                let entries = this.visible();
                 let req_gen = this.list_generation;
+                // Record the painted viewport for next frame's prefetch and
+                // working-set lock (see `Ply::last_viewport`). Last write
+                // wins; the list asks for its visible slice once per frame.
+                this.last_viewport = range.clone();
+                this.last_viewport_gen = req_gen;
+                let entries = this.visible();
                 range
                     .filter_map(|ix| {
                         entries
@@ -108,8 +140,13 @@ pub fn render(ply: &Ply, window: &Window, cx: &mut Context<Ply>) -> impl IntoEle
             "grid_rows",
             row_count,
             cx.processor(move |this, range: Range<usize>, _window, cx| {
-                let entries = this.visible();
                 let req_gen = this.list_generation;
+                // Record the painted viewport as entry indices (see
+                // `Ply::last_viewport`); clamped to the listing at use time.
+                // Recorded before borrowing the entries below.
+                this.last_viewport = range.start * cols..range.end * cols;
+                this.last_viewport_gen = req_gen;
+                let entries = this.visible();
                 range
                     .map(|row_ix| {
                         let rng = grid_row_range(row_ix, cols, entries.len());
@@ -150,9 +187,28 @@ const KIND_COL: f32 = 130.;
 const SIZE_COL: f32 = 80.;
 const MODIFIED_COL: f32 = 130.;
 
-/// How far past the visible window the visible-first prefetch extends. Kept
-/// small so the pool serves on-screen rows before spending slots on look-ahead.
-const PREFETCH_LOOKAHEAD: usize = 24;
+/// How far past the visible window the visible-first prefetch extends, in
+/// both directions. Kept small so the pool serves on-screen rows before
+/// spending slots on overscan.
+const PREFETCH_OVERSCAN: usize = 64;
+
+/// Lock overscan around the painted viewport, in entries each side. The
+/// window is clamped to `LOCK_CAP` (see `clamp_lock_window`), so this only
+/// needs to cover a frame or two of fast scrolling.
+const LOCK_OVERSCAN: usize = 48;
+
+/// Shrink `[lo, hi)` symmetrically around `center` to at most `LOCK_CAP`
+/// entries. The spill path evicts by smallest-byte-first in hash order, so
+/// an oversized lock set could sacrifice an on-screen tile; clamping first
+/// keeps every painted entry locked.
+fn clamp_lock_window(lo: usize, hi: usize, center: usize) -> (usize, usize) {
+    use crate::thumbs::LOCK_CAP;
+    if hi.saturating_sub(lo) <= LOCK_CAP {
+        return (lo, hi);
+    }
+    let start = center.saturating_sub(LOCK_CAP / 2).clamp(lo, hi - LOCK_CAP);
+    (start, start + LOCK_CAP)
+}
 
 /// Grid cell geometry. `GRID_CELL_STRIDE` is the horizontal span one cell
 /// claims including the gap after it, so a row of `cols` cells is `cols*96 +
@@ -573,18 +629,27 @@ mod tests {
     }
 
     #[test]
-    fn visible_first_prefetch_bounds() {
-        // The visible-first prefetch clamps lookahead_end to entries.len().
-        let total = 10;
-        let visible_end = 6;
-        let lookahead = PREFETCH_LOOKAHEAD;
-        let end = (visible_end + lookahead).min(total);
-        assert_eq!(end, 10, "should not exceed total");
+    fn lock_window_clamps_to_cap_around_painted_center() {
+        use crate::thumbs::LOCK_CAP;
+        // Small window passes through untouched.
+        assert_eq!(clamp_lock_window(100, 172, 136), (100, 172));
+        // Oversized window shrinks symmetrically around the painted center.
+        let (lo, hi) = clamp_lock_window(0, 1000, 500);
+        assert_eq!(hi - lo, LOCK_CAP);
+        assert!(lo <= 500 - LOCK_CAP / 2 + 1 && 500 <= hi);
+        // Near the top it clamps to the start instead of underflowing.
+        assert_eq!(clamp_lock_window(0, 1000, 10), (0, LOCK_CAP));
+        // Near the end it clamps to the end.
+        assert_eq!(clamp_lock_window(800, 1000, 990), (1000 - LOCK_CAP, 1000));
+    }
 
-        // Small listing: lookahead extends only to the end.
-        let total = 3;
-        let visible_end = 2;
-        let end = (visible_end + lookahead).min(total);
-        assert_eq!(end, 3);
+    #[test]
+    fn viewport_prefetch_window_stays_in_bounds() {
+        // Overscan past either end clamps to the listing, never panics.
+        let total = 10;
+        let end = (6 + PREFETCH_OVERSCAN).min(total);
+        assert_eq!(end, 10, "should not exceed total");
+        let start = 2usize.saturating_sub(PREFETCH_OVERSCAN);
+        assert_eq!(start, 0, "should not underflow zero");
     }
 }
