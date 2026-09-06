@@ -349,28 +349,32 @@ impl Ply {
     }
 
     /// Update the paint-storm detector; called at the top of every render.
-    /// A storm is real viewport travel (more than `STORM_MOVE_MIN` entries
-    /// within a rolling 250 ms window): a scroll fling. Repaint rate alone
-    /// is not the signal — a fast extraction trickle repaints rapidly while
-    /// the viewport sits still (progressive fill-in, must never blank), and
-    /// upload-bound fling frames render too slowly to trip any fps
-    /// threshold. Slow scrolls, arrow-key stepping and typing move less
-    /// than the minimum and stay progressive.
+    /// A storm is viewport travel past its own length (plus a small
+    /// margin) measured against a reference that sticks across windows
+    /// mid-fling and re-anchors after one quiet window: a scroll fling.
+    /// Content whipping by faster than a full screen per 250 ms is
+    /// unreadable, so its tiles can wait for settle; anything slower
+    /// (wheel rolls, arrow-key stepping, typing) stays progressive, as
+    /// does a fast extraction trickle repainting a stationary viewport.
+    /// Repaint rate alone is not the signal: upload-bound fling frames
+    /// render too slowly to trip any fps threshold, and a fixed entry
+    /// count can't tell a 10-column grid row from a list row.
     pub(crate) fn note_paint(&mut self) {
-        /// Viewport travel (entries) within one window that counts as a
-        /// fling rather than jitter or key-repeat stepping.
-        const STORM_MOVE_MIN: usize = 40;
         let now = std::time::Instant::now();
         if now.duration_since(self.storm_window_start).as_millis() > 250 {
             self.storm_window_start = now;
             if !self.storm_window_moved {
                 // Quiet window: re-anchor. A moving window keeps the old
-                // reference so the storm doesn't flicker off mid-fling.
+                // reference so travel accumulates and slow renders can't
+                // hide a fling.
                 self.storm_ref_start = self.last_viewport.start;
             }
             self.storm_window_moved = false;
         }
-        if self.last_viewport.start.abs_diff(self.storm_ref_start) > STORM_MOVE_MIN {
+        // The margin absorbs jitter at the boundary; the viewport term
+        // scales grid rows and list rows to the same meaning.
+        let trip = self.last_viewport.len().max(24) + 24;
+        if self.last_viewport.start.abs_diff(self.storm_ref_start) > trip {
             self.storm_window_moved = true;
         }
         self.thumb_storm = self.storm_window_moved;

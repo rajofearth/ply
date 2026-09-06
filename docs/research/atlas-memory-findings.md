@@ -73,12 +73,16 @@ overscan), clamped to `LOCK_CAP` around the painted center so the spill can
 never take an on-screen tile. First paint and generation changes fall back
 to the top.
 
-The storm gate is movement-only: viewport travel over 40 entries per
-250 ms window, with a sticky reference across windows (no on/off flicker
-mid-fling). Repaint rate alone is the wrong signal both ways: fill trickle
-repaints fast while stationary (must stay progressive), and upload-bound
-fling frames render too slowly to trip any fps threshold. Verified by
-transition logging: one engagement per fling, no flicker.
+The storm gate is movement-only: viewport travel past its own length
+(plus margin) per 250 ms window, with a sticky reference across windows
+(no on/off flicker mid-fling). Repaint rate alone is the wrong signal
+both ways: fill trickle repaints fast while stationary (must stay
+progressive), and upload-bound fling frames render too slowly to trip
+any fps threshold. A fixed entry count was tried first and dropped: it
+can't tell a 10-column grid row from a list row, so it blanked ordinary
+trackpad scrolling. The viewport-relative trip scales both views to the
+same meaning. Verified by transition logging: slow rolls never engage,
+one engagement per fling, flat memory throughout.
 
 ## Results after round two
 
