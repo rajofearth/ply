@@ -4656,6 +4656,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "dirs",
+ "embed-resource",
  "gpui",
  "gpui-component",
  "gpui_platform",

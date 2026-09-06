@@ -1,0 +1,15 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Ply
+GenericName=File Explorer
+Comment=A fast file explorer
+TryExec=ply
+Exec=ply %U
+Icon=app.ply.explorer
+Terminal=false
+Categories=System;FileTools;Utility;
+Keywords=files;explorer;folders;
+StartupWMClass=app.ply.explorer
+StartupNotify=true
+MimeType=inode/directory;
