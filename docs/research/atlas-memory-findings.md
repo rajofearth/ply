@@ -87,6 +87,30 @@ transition logging: one engagement per fling, no flicker.
 811-video folder: down-and-back scroll flat ~450 MB throughout, idle 0% CPU
 — the blink mechanism (on-screen eviction) is gone. Home unchanged ~256 MB.
 
+## Round three: instant icons and folder-change release
+
+User report: grid cells sit blank (not even the type icon) on open and
+after flings. Three compounding causes, all fixed:
+
+- The type-icon batch did one shell lookup per entry (512 identical
+  `SHGetFileInfoW` calls for an all-PNG folder), stalling every icon behind
+  it on the single shared shell worker. The worker now resolves each
+  distinct extension once; per-path targets (folders, executables) stay
+  per-entry.
+- A fling's last frames could all be storm slots with nothing left pending,
+  so no further render ever repainted the settled viewport: the screen
+  froze on placeholders. A debounced 300 ms settle timer per storm
+  guarantees the follow-up paint.
+- Storm cells painted blank slots even when the shared class icon was
+  cached. They now paint the class icon (one shared tile, dedupes free)
+  and fall back to the slot only when it is genuinely unknown.
+
+Navigating folders now releases per-file rasters eagerly
+(`ThumbCache::clear_content` on every location change; shared type icons
+survive): Back out of a flung 15k folder drops ~200 MB, Forward
+re-resolves from the disk cache. Verified live: 449 MB after fling,
+247 MB after Back, 473 MB after Forward.
+
 ## Known limit
 
 The settle number is floored by per-painting driver retention times live

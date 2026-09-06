@@ -56,7 +56,6 @@ pub fn render(ply: &Ply, window: &Window, cx: &mut Context<Ply>) -> impl IntoEle
     // visible-first scheduling so the pool serves on-screen rows before
     // off-screen ones.
     {
-        let entries = ply.visible();
         let pf_start = vp.start.saturating_sub(PREFETCH_OVERSCAN);
         let pf_end = (vp.end + PREFETCH_OVERSCAN).min(entries.len());
         // Visible entries first, then the overscan window.
@@ -77,7 +76,6 @@ pub fn render(ply: &Ply, window: &Window, cx: &mut Context<Ply>) -> impl IntoEle
     // the cap spill can never take an on-screen tile; everything else is
     // evictable and re-decodes on demand when scrolled back into view.
     {
-        let entries = ply.visible();
         let lo = vp.start.saturating_sub(LOCK_OVERSCAN);
         let hi = (vp.end + LOCK_OVERSCAN).min(entries.len());
         let center = (vp.start + vp.end) / 2;
@@ -352,13 +350,15 @@ fn icon_or_thumb(
     request_gen: u64,
 ) -> AnyElement {
     let p = ply.palette();
-    // During a paint storm (scroll fling), content thumbnails paint as
-    // placeholder slots: uploading a tile per file for frames that are gone
-    // in 16 ms each is what grows GPU-shared without bound while scrolling.
-    // Shared class icons and glyphs still paint (their tiles upload once and
-    // dedupe), and extraction keeps warming the cache, so the thumbs fill in
-    // on settle. Sidebar/Home probes are unaffected (separate call sites).
+    // During a paint storm (scroll fling), content thumbnails paint their
+    // shared type icon instead of a blank slot: the class tile uploads once
+    // and dedupes across every cell, so flings stay informative with zero
+    // per-file uploads, and extraction keeps warming the cache so previews
+    // fill in on settle. Sidebar/Home probes are unaffected (separate calls).
     if ply.thumb_storm && thumbs::wants_content_thumbnail(entry) {
+        if let Some(img) = thumbs::class_icon(ply, entry, cx) {
+            return super::thumb_img(&img, box_px).into_any_element();
+        }
         return super::icon_slot(box_px).into_any_element();
     }
     match thumbs::entry_icon_probe(ply, entry, cx, request_gen) {

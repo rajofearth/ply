@@ -228,6 +228,8 @@ pub struct Ply {
     thumbs_dirty: bool,
     /// A flush timer is already scheduled; don't spawn another.
     thumbs_flush_pending: bool,
+    /// A storm-settle repaint is already scheduled; don't spawn another.
+    pub(crate) storm_settle_pending: bool,
     /// Paint storm detector: while the viewport travels at fling speed,
     /// listing cells paint placeholder slots instead of content
     /// thumbnails, so a fling past hundreds of files doesn't upload hundreds
@@ -306,6 +308,7 @@ impl Ply {
             thumbs: cx.new(|_| crate::thumbs::ThumbCache::new()),
             thumbs_dirty: false,
             thumbs_flush_pending: false,
+            storm_settle_pending: false,
             thumb_storm: false,
             storm_window_start: std::time::Instant::now(),
             storm_ref_start: 0,

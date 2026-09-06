@@ -347,6 +347,29 @@ impl ThumbCache {
         }
     }
 
+    /// Release every per-file raster (both tiers) when the location changes.
+    /// Content and path keys embed their source path, so nothing here is
+    /// usable in the new folder; holding it only burns heap and pins atlas
+    /// tiles until budget pressure evicts them. Everything dropped queues a
+    /// GPU drop for the next render drain. Shared class/index/stock icons
+    /// survive (folder-independent, cheap to keep). In-flight extractions
+    /// are left alone: the generation guard stale-drops their completions.
+    pub fn clear_content(&mut self) {
+        self.pending_drops
+            .reserve(self.map.len() + self.locked_map.len());
+        for (_, img) in self.map.drain() {
+            self.bytes = self.bytes.saturating_sub(byte_size(&img));
+            self.pending_drops.push(img);
+        }
+        for (_, img) in self.locked_map.drain() {
+            self.locked_bytes = self.locked_bytes.saturating_sub(byte_size(&img));
+            self.pending_drops.push(img);
+        }
+        self.locked_set.clear();
+        self.order.clear();
+        self.dropped_since_flush = 0;
+    }
+
     /// Drain rasters that have left the cache since the last call. Call on the
     /// render path (where a `Window` is at hand) and drop each via
     /// [`Window::drop_image`] so GPUI frees the atlas tile.
@@ -1505,10 +1528,26 @@ mod backend {
     ) -> Option<ListingIcons> {
         let mut per_entry: Vec<(usize, i32)> = Vec::with_capacity(targets.len());
         let mut indices: Vec<i32> = Vec::with_capacity(targets.len());
+        // Class lookups are pure functions of the extension: resolve each
+        // distinct ext once. A 15k-file folder of one type used to pay 512
+        // identical shell calls here, stalling every icon behind it on the
+        // single shared worker. Path targets stay per-entry (desktop.ini
+        // custom icons differ per folder).
+        let mut class_index_cache: HashMap<String, i32> = HashMap::new();
         for (ordinal, target) in targets {
             let index = match target {
                 IconTarget::Path(path) => path_icon_index(path),
-                IconTarget::Class(ext) => class_icon_index(ext),
+                IconTarget::Class(ext) => {
+                    if let Some(index) = class_index_cache.get(ext) {
+                        Some(*index)
+                    } else {
+                        let index = class_icon_index(ext);
+                        if let Some(index) = index {
+                            class_index_cache.insert(ext.clone(), index);
+                        }
+                        index
+                    }
+                }
             };
             if let Some(index) = index {
                 per_entry.push((*ordinal as usize, index));
@@ -2314,6 +2353,26 @@ mod tests {
         let img = to_render_image(pixels, 96, 96).unwrap();
         cache.insert(key.clone(), img);
         key
+    }
+
+    #[test]
+    fn location_change_releases_per_file_rasters() {
+        let mut c = ThumbCache::new();
+        let k0 = make_thumb(&mut c, "a.png", 1);
+        let k1 = make_thumb(&mut c, "b.png", 2);
+        c.set_working_set(&[k0.clone()]);
+
+        c.clear_content();
+
+        assert!(c.map.is_empty(), "evictable tier must drain");
+        assert!(c.locked_map.is_empty(), "locked tier must drain");
+        assert!(c.locked_set.is_empty(), "lock membership must reset");
+        assert_eq!(c.bytes, 0);
+        assert_eq!(c.locked_bytes, 0);
+        assert!(c.get(&k0).is_none() && c.get(&k1).is_none());
+        // Both rasters queue GPU drops for the next render drain.
+        let dropped = c.drain_drops();
+        assert_eq!(dropped.len(), 2, "every released raster must drop");
     }
 
     #[test]

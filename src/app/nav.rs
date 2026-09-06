@@ -70,6 +70,11 @@ impl Ply {
     /// Apply a location without touching history.
     fn enter(&mut self, location: Location, window: &mut Window, cx: &mut Context<Self>) {
         self.location = location;
+        // The new location's files have different cache keys, so the old
+        // rasters are dead weight: release heap now and queue their GPU
+        // tiles for the next render drain instead of waiting for budget
+        // pressure. Shared type icons survive (see `clear_content`).
+        self.thumb_cache().update(cx, |c, _| c.clear_content());
         self.clear_selection_paths();
         self.anchor = None;
         self.rename = None;

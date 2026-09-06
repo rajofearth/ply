@@ -105,9 +105,28 @@ impl Render for Ply {
         let editing = self.rename.is_some();
         self.sync_filter_placeholder(window, cx);
 
-        // Paint-storm detector (see `Ply::thumb_storm`): sustained repaint
-        // rates mean a scroll fling is in flight.
+        // Paint-storm detector (see `Ply::thumb_storm`): fast viewport
+        // travel means a scroll fling is in flight.
         self.note_paint();
+
+        // Storm-settle repaint: a fling's last frames may all be slots, and
+        // with nothing left pending no further render would ever repaint the
+        // settled viewport — the screen would freeze on placeholders. One
+        // debounced timer per storm guarantees the follow-up paint that
+        // shows the thumbs. It re-arms while still flinging.
+        if self.thumb_storm && !self.storm_settle_pending {
+            self.storm_settle_pending = true;
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(300))
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    this.storm_settle_pending = false;
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
 
         // Free GPU textures for thumbnails that have left the bounded cache.
         // GPUI's own window atlas never evicts, so without this every image
