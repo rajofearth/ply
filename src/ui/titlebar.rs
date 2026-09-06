@@ -1,6 +1,6 @@
 use gpui::{
-    Context, FontWeight, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement,
-    Styled, WindowControlArea, div, prelude::FluentBuilder, px,
+    Context, FontWeight, InteractiveElement, IntoElement, ParentElement,
+    StatefulInteractiveElement, Styled, WindowControlArea, div, prelude::FluentBuilder, px,
 };
 
 use super::icon;
@@ -101,8 +101,7 @@ pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
                                 .occlude()
                                 .cursor_default()
                                 .when(current, |el| {
-                                    el.text_color(p.foreground)
-                                        .font_weight(FontWeight::MEDIUM)
+                                    el.text_color(p.foreground).font_weight(FontWeight::MEDIUM)
                                 })
                                 .hover(|s| s.text_color(p.foreground))
                                 .child(name)

@@ -502,7 +502,11 @@ mod tests {
         // If the machine has no fixed drive the batch is empty; nothing to plan.
         if !paths.is_empty() {
             let (trash, permanent) = plan_delete(&paths).unwrap();
-            assert_eq!(trash.len(), paths.len(), "every trashable path lands in trash");
+            assert_eq!(
+                trash.len(),
+                paths.len(),
+                "every trashable path lands in trash"
+            );
             assert!(permanent.is_empty(), "no trashable path may escalate");
         }
         std::fs::remove_dir_all(&dir).ok();
@@ -516,8 +520,14 @@ mod tests {
         std::fs::write(&file, b"x").unwrap();
 
         let res = plan_delete(&[file.clone(), PathBuf::from(r"\\MTP\DEVICE\o1")]);
-        assert!(res.is_err(), "a batch touching a portable root must be refused whole");
-        assert!(file.exists(), "nothing may be planned/deleted when a batch is refused");
+        assert!(
+            res.is_err(),
+            "a batch touching a portable root must be refused whole"
+        );
+        assert!(
+            file.exists(),
+            "nothing may be planned/deleted when a batch is refused"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -557,7 +567,10 @@ mod tests {
 
         let res = delete_permanently(&[PathBuf::from(r"D:\")]);
         assert!(res.is_err());
-        assert!(sentinel.exists(), "a refused root must not touch anything else");
+        assert!(
+            sentinel.exists(),
+            "a refused root must not touch anything else"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -573,7 +586,10 @@ mod tests {
 
         let res = delete_permanently(&[PathBuf::from(r"D:\"), file.clone()]);
         assert!(res.is_err());
-        assert!(file.exists(), "the root guard must abort before any deletion");
+        assert!(
+            file.exists(),
+            "the root guard must abort before any deletion"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -589,8 +605,14 @@ mod tests {
         std::fs::write(&file, b"x").unwrap();
 
         let res = delete_permanently(&[file.clone(), PathBuf::from(r"D:\")]);
-        assert!(res.is_err(), "a root trailing the batch must refuse the whole batch");
-        assert!(file.exists(), "nothing may be deleted when any batch member is a root");
+        assert!(
+            res.is_err(),
+            "a root trailing the batch must refuse the whole batch"
+        );
+        assert!(
+            file.exists(),
+            "nothing may be deleted when any batch member is a root"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

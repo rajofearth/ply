@@ -510,7 +510,10 @@ mod tests {
         // all 'a's, exactly one '…' in the middle.
         let result = truncate_middle(&"a".repeat(60), 30);
         assert_eq!(result.chars().count(), 29);
-        assert_eq!(result, format!("{}{}{}", "a".repeat(14), "…", "a".repeat(14)));
+        assert_eq!(
+            result,
+            format!("{}{}{}", "a".repeat(14), "…", "a".repeat(14))
+        );
         assert_eq!(result.matches('…').count(), 1);
     }
 
@@ -520,7 +523,10 @@ mod tests {
         // fewer than 5 chars; the char-gated version must keep exactly 5.
         let result = truncate_middle(&"界".repeat(7), 5);
         assert_eq!(result.chars().count(), 5);
-        assert!(!result.ends_with("界界界界界"), "must actually truncate the long tail");
+        assert!(
+            !result.ends_with("界界界界界"),
+            "must actually truncate the long tail"
+        );
     }
 
     #[test]

@@ -281,7 +281,11 @@ fn properties(ply: &Ply, cx: &mut Context<Ply>) -> Option<AnyElement> {
     )
 }
 
-fn field(p: crate::theme::Palette, label: gpui::SharedString, value: gpui::SharedString) -> gpui::Div {
+fn field(
+    p: crate::theme::Palette,
+    label: gpui::SharedString,
+    value: gpui::SharedString,
+) -> gpui::Div {
     div()
         .flex()
         .justify_between()

@@ -57,38 +57,38 @@ fn c(hex: u32) -> Hsla {
 impl Palette {
     fn light() -> Self {
         Self {
-            background: c(0xffffff),      // oklch(1 0 0)
-            foreground: c(0x0a0a0a),      // oklch(0.145 0 0)
-            card: c(0xffffff),            // oklch(1 0 0)
-            muted: c(0xf5f5f5),           // oklch(0.97 0 0)
+            background: c(0xffffff),       // oklch(1 0 0)
+            foreground: c(0x0a0a0a),       // oklch(0.145 0 0)
+            card: c(0xffffff),             // oklch(1 0 0)
+            muted: c(0xf5f5f5),            // oklch(0.97 0 0)
             muted_foreground: c(0x737373), // oklch(0.556 0 0)
-            accent: c(0xf5f5f5),          // oklch(0.97 0 0)
-            border: c(0xe5e5e5),          // oklch(0.922 0 0)
-            destructive: c(0xe7000b),     // oklch(0.577 0.245 27.325)
-            sidebar: c(0xfafafa),         // oklch(0.985 0 0)
-            sidebar_border: c(0xe5e5e5),  // oklch(0.922 0 0)
-            chart_bar: c(0x737373),       // oklch(0.556 0 0)
-            chart_bar_track: c(0xe8e8e8), // oklch(0.93 0 0)
-            select_strong: c(0xe4e4e4),   // oklch(0.92 0 0)
+            accent: c(0xf5f5f5),           // oklch(0.97 0 0)
+            border: c(0xe5e5e5),           // oklch(0.922 0 0)
+            destructive: c(0xe7000b),      // oklch(0.577 0.245 27.325)
+            sidebar: c(0xfafafa),          // oklch(0.985 0 0)
+            sidebar_border: c(0xe5e5e5),   // oklch(0.922 0 0)
+            chart_bar: c(0x737373),        // oklch(0.556 0 0)
+            chart_bar_track: c(0xe8e8e8),  // oklch(0.93 0 0)
+            select_strong: c(0xe4e4e4),    // oklch(0.92 0 0)
             overlay: hsla(0., 0., 0., 0.4),
         }
     }
 
     fn dark() -> Self {
         Self {
-            background: c(0x0a0a0a),       // oklch(0.145 0 0)
-            foreground: c(0xfafafa),       // oklch(0.985 0 0)
-            card: c(0x171717),             // oklch(0.205 0 0)
-            muted: c(0x262626),            // oklch(0.269 0 0)
-            muted_foreground: c(0xa1a1a1), // oklch(0.708 0 0)
-            accent: c(0x262626),           // oklch(0.269 0 0)
-            border: hsla(0., 0., 1., 0.1), // oklch(1 0 0 / 10%)
-            destructive: c(0xff6467),      // oklch(0.704 0.191 22.216)
-            sidebar: c(0x171717),          // oklch(0.205 0 0)
+            background: c(0x0a0a0a),               // oklch(0.145 0 0)
+            foreground: c(0xfafafa),               // oklch(0.985 0 0)
+            card: c(0x171717),                     // oklch(0.205 0 0)
+            muted: c(0x262626),                    // oklch(0.269 0 0)
+            muted_foreground: c(0xa1a1a1),         // oklch(0.708 0 0)
+            accent: c(0x262626),                   // oklch(0.269 0 0)
+            border: hsla(0., 0., 1., 0.1),         // oklch(1 0 0 / 10%)
+            destructive: c(0xff6467),              // oklch(0.704 0.191 22.216)
+            sidebar: c(0x171717),                  // oklch(0.205 0 0)
             sidebar_border: hsla(0., 0., 1., 0.1), // oklch(1 0 0 / 10%)
-            chart_bar: c(0xa1a1a1),        // oklch(0.708 0 0)
-            chart_bar_track: c(0x333333),  // oklch(0.32 0 0)
-            select_strong: c(0x333333),    // oklch(0.32 0 0)
+            chart_bar: c(0xa1a1a1),                // oklch(0.708 0 0)
+            chart_bar_track: c(0x333333),          // oklch(0.32 0 0)
+            select_strong: c(0x333333),            // oklch(0.32 0 0)
             overlay: hsla(0., 0., 0., 0.4),
         }
     }

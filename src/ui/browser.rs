@@ -151,9 +151,7 @@ pub fn render(ply: &Ply, window: &Window, cx: &mut Context<Ply>) -> impl IntoEle
                         div()
                             .flex()
                             .gap(px(4.))
-                            .children(
-                                rng.map(|ix| grid_cell(this, &entries[ix], ix, cx, req_gen)),
-                            )
+                            .children(rng.map(|ix| grid_cell(this, &entries[ix], ix, cx, req_gen)))
                             .into_any_element()
                     })
                     .collect::<Vec<_>>()
@@ -459,7 +457,13 @@ fn list_row(
         .into_any_element()
 }
 
-fn grid_cell(ply: &Ply, entry: &Entry, ix: usize, cx: &mut Context<Ply>, request_gen: u64) -> AnyElement {
+fn grid_cell(
+    ply: &Ply,
+    entry: &Entry,
+    ix: usize,
+    cx: &mut Context<Ply>,
+    request_gen: u64,
+) -> AnyElement {
     let p = ply.palette();
     let selected = ply.is_selected(&entry.path);
     let renaming = ply.rename.as_ref().is_some_and(|r| r.path == entry.path);

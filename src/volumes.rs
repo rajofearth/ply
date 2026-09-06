@@ -124,7 +124,12 @@ pub fn refresh_local_sizes(volumes: &[Volume]) -> Vec<Volume> {
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
-        fn GetDiskFreeSpaceExW(root: *const u16, free: *mut u64, total: *mut u64, free_tot: *mut u64) -> i32;
+        fn GetDiskFreeSpaceExW(
+            root: *const u16,
+            free: *mut u64,
+            total: *mut u64,
+            free_tot: *mut u64,
+        ) -> i32;
     }
 
     volumes
@@ -137,7 +142,8 @@ pub fn refresh_local_sizes(volumes: &[Volume]) -> Vec<Volume> {
                 .collect();
             let (mut free, mut total, mut free_tot) = (0u64, 0u64, 0u64);
             // SAFETY: valid locals.
-            let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, &mut total, &mut free_tot) };
+            let ok =
+                unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, &mut total, &mut free_tot) };
             (ok != 0 && total != 0).then_some((v, free, total))
         })
         .filter_map(|(v, free, total)| {
@@ -183,10 +189,21 @@ fn discover_windows_lettered() -> Vec<Volume> {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetDriveTypeW(root: *const u16) -> u32;
-        fn GetDiskFreeSpaceExW(root: *const u16, free: *mut u64, total: *mut u64, free_tot: *mut u64) -> i32;
+        fn GetDiskFreeSpaceExW(
+            root: *const u16,
+            free: *mut u64,
+            total: *mut u64,
+            free_tot: *mut u64,
+        ) -> i32;
         fn GetVolumeInformationW(
-            root: *const u16, name: *mut u16, name_len: u32, serial: *mut u32, max_comp: *mut u32,
-            flags: *mut u32, fs_name: *mut u16, fs_name_len: u32,
+            root: *const u16,
+            name: *mut u16,
+            name_len: u32,
+            serial: *mut u32,
+            max_comp: *mut u32,
+            flags: *mut u32,
+            fs_name: *mut u16,
+            fs_name_len: u32,
         ) -> i32;
     }
 
@@ -204,7 +221,10 @@ fn discover_windows_lettered() -> Vec<Volume> {
         }
         let letter = (b'A' + i as u8) as char;
         let root = format!("{letter}:\\");
-        let wide: Vec<u16> = std::ffi::OsStr::new(&root).encode_wide().chain(Some(0)).collect();
+        let wide: Vec<u16> = std::ffi::OsStr::new(&root)
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
 
         // SAFETY: NUL-terminated root path.
         let dtype = unsafe { GetDriveTypeW(wide.as_ptr()) };
@@ -219,7 +239,8 @@ fn discover_windows_lettered() -> Vec<Volume> {
 
         let (mut free, mut total, mut free_tot) = (0u64, 0u64, 0u64);
         // SAFETY: valid locals; may block on network drives.
-        let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, &mut total, &mut free_tot) };
+        let ok =
+            unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, &mut total, &mut free_tot) };
         // Skip empty CD/card readers and inaccessible volumes.
         if ok == 0 || total == 0 {
             continue;
@@ -229,8 +250,14 @@ fn discover_windows_lettered() -> Vec<Volume> {
         // SAFETY: MAX_PATH+1 buffer; unused out-params null.
         let label = if unsafe {
             GetVolumeInformationW(
-                wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32, std::ptr::null_mut(),
-                std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), 0,
+                wide.as_ptr(),
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
             )
         } != 0
         {
@@ -326,7 +353,13 @@ mod tests {
     use super::*;
 
     fn vol(free: u64, total: u64) -> Volume {
-        Volume { name: "t".into(), path: PathBuf::from("/"), kind: VolumeKind::Drive, free, total }
+        Volume {
+            name: "t".into(),
+            path: PathBuf::from("/"),
+            kind: VolumeKind::Drive,
+            free,
+            total,
+        }
     }
 
     #[test]
@@ -392,9 +425,27 @@ mod tests {
     #[test]
     fn refresh_local_sizes_never_touches_network_or_mtp() {
         let volumes = vec![
-            Volume { name: "C".into(), path: PathBuf::from(r"C:\"), kind: VolumeKind::Drive, free: 10, total: 100 },
-            Volume { name: "N".into(), path: PathBuf::from(r"Z:\"), kind: VolumeKind::Network, free: 5, total: 10 },
-            Volume { name: "Phone".into(), path: PathBuf::from(r"\\MTP\abc"), kind: VolumeKind::Device, free: 0, total: 0 },
+            Volume {
+                name: "C".into(),
+                path: PathBuf::from(r"C:\"),
+                kind: VolumeKind::Drive,
+                free: 10,
+                total: 100,
+            },
+            Volume {
+                name: "N".into(),
+                path: PathBuf::from(r"Z:\"),
+                kind: VolumeKind::Network,
+                free: 5,
+                total: 10,
+            },
+            Volume {
+                name: "Phone".into(),
+                path: PathBuf::from(r"\\MTP\abc"),
+                kind: VolumeKind::Device,
+                free: 0,
+                total: 0,
+            },
         ];
         // Nothing here changes on disk, so the guaranteed outcome is that
         // unchanged local drives, plus all network/MTP, are never reported back.
