@@ -111,6 +111,25 @@ survive): Back out of a flung 15k folder drops ~200 MB, Forward
 re-resolves from the disk cache. Verified live: 449 MB after fling,
 247 MB after Back, 473 MB after Forward.
 
+## Round four: sidebar chrome stops blinking
+
+The folder-change release had a side effect: sidebar and Home drive
+icons live in the same evictable tiers, so every navigation blanked the
+chrome too. Per-path icons for chrome now live in a pinned LRU tier
+(256 entries) that survives navigation, budget pressure, and working-set
+replacement; listing folder rows stay in the normal tiers. The flush
+covers pinned tiles so they can't pin mixed buckets either.
+
+Same review pass also closed four smaller holes, all found by tracing
+every blank-slot path: disk fail-marker and corrupt-PNG completions now
+notify (they stranded cells blank with nothing pending), a corrupt cached
+PNG is deleted and the resolve genuinely falls through to shell
+extraction (the comment always promised this; the code returned early),
+LRU order entries are removed on promote (duplicates let live entries
+evict early and grew the deque without bound while scrolling), and the
+stock Recycle Bin icon memoizes failure instead of retry-repainting
+forever.
+
 ## Known limit
 
 The settle number is floored by per-painting driver retention times live

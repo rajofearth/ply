@@ -40,6 +40,10 @@ const BUDGET: usize = 8 * 1024 * 1024;
 /// Evicted bytes that trigger a full live-tile flush (see `drain_drops`).
 const FLUSH_THRESHOLD: usize = 2 * 1024 * 1024;
 
+/// Cap on pinned sidebar/Home path icons. Dozens of 48px rasters; 256 is a
+/// generous ceiling (~2 MiB) that never meaningfully contends with content.
+const PINNED_CAP: usize = 256;
+
 /// Cap on simultaneously locked (on-screen) thumbnails. Mirrors Chromium's
 /// `kMaxItemsInWorkingSet` scaled to Ply: a viewport of ~60-80 cells at 96x96x4
 /// bytes each uses ~2.8 MiB; 128 is two viewports + generous overscan and keeps
@@ -162,6 +166,17 @@ pub struct ThumbCache {
     /// Fixed stock icons (e.g. the Recycle Bin), one per [`StockIcon`].
     stock_icons: HashMap<StockIcon, Arc<RenderImage>>,
     stock_inflight: HashSet<StockIcon>,
+    /// Stock icons whose resolution permanently failed; render the glyph and
+    /// never re-request (without this a persistent failure retries forever,
+    /// repainting blank on every frame).
+    stock_failed: HashSet<StockIcon>,
+    /// Pinned per-path icons for the sidebar and Home cards (drives, pinned
+    /// folders, expanded branches). Same rasters as listing path icons, but
+    /// folder-independent: they survive location changes and budget pressure
+    /// so navigation never blanks the chrome while the new folder fills.
+    /// LRU-capped; evictions queue GPU drops like any other tier.
+    pinned_map: HashMap<CacheKey, Arc<RenderImage>>,
+    pinned_order: VecDeque<CacheKey>,
     /// Keys whose shell extraction permanently failed; a failed key renders the
     /// themed glyph and is never re-requested.
     failed: HashSet<CacheKey>,
@@ -198,6 +213,9 @@ impl ThumbCache {
             index_icons: HashMap::new(),
             stock_icons: HashMap::new(),
             stock_inflight: HashSet::new(),
+            stock_failed: HashSet::new(),
+            pinned_map: HashMap::new(),
+            pinned_order: VecDeque::new(),
             failed: HashSet::new(),
             class_failed: HashSet::new(),
             content_pending: 0,
@@ -279,6 +297,39 @@ impl ThumbCache {
         self.stock_inflight.insert(stock);
     }
 
+    /// True if a stock icon permanently failed: settle on the glyph, never
+    /// re-request (a persistent failure would otherwise retry — and repaint
+    /// blank — on every frame).
+    pub fn stock_is_failed(&self, stock: StockIcon) -> bool {
+        self.stock_failed.contains(&stock)
+    }
+
+    /// Pinned per-path icon for sidebar/Home chrome, if present. Never
+    /// evicted by the byte budget and never cleared on navigation.
+    pub fn pinned_get(&self, key: &CacheKey) -> Option<Arc<RenderImage>> {
+        self.pinned_map.get(key).cloned()
+    }
+
+    /// Insert or replace a pinned icon. LRU-capped; evicted pins queue GPU
+    /// drops like any other tier.
+    pub fn insert_pinned(&mut self, key: CacheKey, img: Arc<RenderImage>) {
+        if let Some(old) = self.pinned_map.insert(key.clone(), img) {
+            self.pending_drops.push(old);
+        }
+        self.pinned_order.retain(|k| k != &key);
+        self.pinned_order.push_back(key);
+        while self.pinned_map.len() > PINNED_CAP {
+            match self.pinned_order.pop_front() {
+                Some(old) => {
+                    if let Some(evicted) = self.pinned_map.remove(&old) {
+                        self.pending_drops.push(evicted);
+                    }
+                }
+                None => break,
+            }
+        }
+    }
+
     /// True if extraction for `key` permanently failed, so its slot settles on
     /// the themed glyph instead of re-requesting on every render.
     pub fn is_failed(&self, key: &CacheKey) -> bool {
@@ -320,6 +371,7 @@ impl ThumbCache {
         if let Some(old) = self.map.remove(&key) {
             self.bytes = self.bytes.saturating_sub(byte_size(&old));
             self.pending_drops.push(old);
+            self.order.retain(|k| k != &key);
         }
         self.push(key, img);
     }
@@ -352,8 +404,9 @@ impl ThumbCache {
     /// usable in the new folder; holding it only burns heap and pins atlas
     /// tiles until budget pressure evicts them. Everything dropped queues a
     /// GPU drop for the next render drain. Shared class/index/stock icons
-    /// survive (folder-independent, cheap to keep). In-flight extractions
-    /// are left alone: the generation guard stale-drops their completions.
+    /// and pinned sidebar/Home icons survive (folder-independent, cheap to
+    /// keep). In-flight extractions are left alone: the generation guard
+    /// stale-drops their completions.
     pub fn clear_content(&mut self) {
         self.pending_drops
             .reserve(self.map.len() + self.locked_map.len());
@@ -382,10 +435,10 @@ impl ThumbCache {
     /// bound. Visible tiles re-upload on this same paint, so the net atlas
     /// stays near the live set instead of the cumulative paintings.
     ///
-    /// The flush covers the shared class/index/stock icon maps too: those
-    /// tiles interleave with thumbnail tiles temporally (every media file
-    /// paints its class icon before its preview arrives), so leaving them
-    /// pinned keeps every mixed bucket alive forever.
+    /// The flush covers the shared class/index/stock/pinned icon maps too:
+    /// those tiles interleave with thumbnail tiles temporally (every media
+    /// file paints its class icon before its preview arrives), so leaving
+    /// them pinned keeps every mixed bucket alive forever.
     pub fn drain_drops(&mut self) -> Vec<Arc<RenderImage>> {
         let mut out = std::mem::take(&mut self.pending_drops);
         self.dropped_since_flush += out.iter().map(byte_size).sum::<usize>();
@@ -397,6 +450,7 @@ impl ThumbCache {
             out.extend(self.class_icons.values().cloned());
             out.extend(self.index_icons.values().cloned());
             out.extend(self.stock_icons.values().cloned());
+            out.extend(self.pinned_map.values().cloned());
             self.dropped_since_flush = 0;
         }
         out
@@ -417,6 +471,11 @@ impl ThumbCache {
             }
             if let Some(img) = self.map.remove(key) {
                 self.bytes = self.bytes.saturating_sub(byte_size(&img));
+                // The LRU order mirrors the evictable map exactly: a promoted
+                // key leaves it, or its stale slot would let a live entry be
+                // evicted early (and the deque would grow without bound while
+                // scrolling, since demote pushes the key back on exit).
+                self.order.retain(|k| k != key);
                 self.locked_bytes = self.locked_bytes.saturating_add(byte_size(&img));
                 self.locked_map.insert(key.clone(), img);
                 self.locked_set.insert(key.clone());
@@ -693,13 +752,20 @@ pub fn request_thumbnail(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>, reques
             // Known-bad file (persisted `fail/` marker): fold it into the
             // in-memory failed set so later probes are fast. The inflight mark
             // and content slot are released here; a local failure on the
-            // marker read is not an error.
+            // marker read is not an error. Notify: this frame painted a
+            // blank slot, and without a repaint it would sit blank until
+            // something unrelated happens to paint (the probe now resolves
+            // to the terminal glyph).
             let _ = this.update(cx, |this, cx| {
                 this.thumb_cache().update(cx, |c, _| {
                     c.unmark_inflight(&key);
                     c.release_content();
                     c.mark_failed(key.clone());
                 });
+            });
+            let _ = this.update(cx, |this, cx| {
+                this.mark_thumbs_dirty();
+                this.schedule_thumbs_flush(cx);
             });
             return;
         }
@@ -737,19 +803,17 @@ pub fn request_thumbnail(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>, reques
                         this.mark_thumbs_dirty();
                         this.schedule_thumbs_flush(cx);
                     });
+                    return;
                 }
                 None => {
-                    // Cached PNG failed to decode: not a permanent failure, so
-                    // fall through to a fresh shell extraction.
-                    let _ = this.update(cx, |this, cx| {
-                        this.thumb_cache().update(cx, |c, _| {
-                            c.unmark_inflight(&key);
-                            c.release_content();
-                        });
-                    });
+                    // Cached PNG failed to decode: the source file is fine,
+                    // only these bytes are corrupt, so delete them (next open
+                    // is a clean miss) and fall through to a fresh shell
+                    // extraction below with the mark and slot still held.
+                    let rm_key = disk_key.clone();
+                    crate::cache::remove(&rm_key);
                 }
             }
-            return;
         }
 
         // Disk miss (content without a cached raster, or an `.lnk`): run the
@@ -1048,7 +1112,8 @@ pub(crate) fn entry_icon_probe(
 }
 
 /// Probe a real path (folder / drive root) the same way [`entry_icon_probe`]
-/// probes an entry, for the sidebar and Home rows.
+/// probes an entry, for the sidebar and Home rows. Pinned tier: sidebar and
+/// Home chrome must survive navigation without blinking.
 pub(crate) fn path_icon_probe(
     ply: &Ply,
     path: &Path,
@@ -1057,10 +1122,10 @@ pub(crate) fn path_icon_probe(
 ) -> IconProbe {
     let cache_entity = ply.thumb_cache();
     let key = stamped_key(path, stamp);
-    if let Some(img) = cache_entity.read(cx).get(&key) {
+    if let Some(img) = cache_entity.read(cx).pinned_get(&key) {
         return IconProbe::Ready(img);
     }
-    let _ = path_icon(ply, path, stamp, cx);
+    let _ = path_icon(ply, path, stamp, cx, true);
     if cache_entity.read(cx).is_inflight(&key) {
         IconProbe::Loading
     } else {
@@ -2012,18 +2077,26 @@ pub fn read_properties(path: &Path) -> Vec<(String, String)> {
 /// `C:\` — honoring `desktop.ini` custom icons the way Explorer shows them.
 /// Returns `Some` when the raster is already cached; otherwise kicks off an
 /// async extraction and returns `None` so the caller falls back to an SVG
-/// glyph until it lands.
+/// glyph until it lands. When `pinned`, the raster lives in the pinned tier
+/// (sidebar/Home chrome: survives navigation and budget pressure);
+/// otherwise it joins the normal evictable tiers (listing rows).
 pub fn path_icon(
     ply: &Ply,
     path: &Path,
     stamp: u64,
     cx: &mut Context<Ply>,
+    pinned: bool,
 ) -> Option<Arc<RenderImage>> {
     let key = stamped_key(path, stamp);
     let cache_entity = ply.thumb_cache();
     let (cached, inflight, failed) = {
         let c = cache_entity.read(cx);
-        (c.get(&key), c.is_inflight(&key), c.is_failed(&key))
+        let cached = if pinned {
+            c.pinned_get(&key)
+        } else {
+            c.get(&key)
+        };
+        (cached, c.is_inflight(&key), c.is_failed(&key))
     };
     if let Some(img) = cached {
         return Some(img);
@@ -2058,7 +2131,11 @@ pub fn path_icon(
                 c.unmark_inflight(&key);
                 if let Some((index, image)) = got {
                     let shared = c.share_index(Some(index), image);
-                    c.insert(key.clone(), shared);
+                    if pinned {
+                        c.insert_pinned(key.clone(), shared);
+                    } else {
+                        c.insert(key.clone(), shared);
+                    }
                 } else {
                     c.mark_failed(key);
                 }
@@ -2075,8 +2152,9 @@ pub fn path_icon(
 
 /// The shell icon for a folder entry, keyed by the folder's own mtime so a
 /// changed `desktop.ini` re-extracts the icon. Thin wrapper over [`path_icon`].
+/// Listing rows share the evictable tiers (they rebuild per folder anyway).
 pub fn folder_icon(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) -> Option<Arc<RenderImage>> {
-    path_icon(ply, &entry.path, mtime_nanos(entry.modified), cx)
+    path_icon(ply, &entry.path, mtime_nanos(entry.modified), cx, false)
 }
 
 /// The stock Recycle Bin icon, cached in the small per-cache stock map. Whether
@@ -2084,14 +2162,18 @@ pub fn folder_icon(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) -> Option<Ar
 pub fn recycle_bin_icon(ply: &Ply, cx: &mut Context<Ply>) -> Option<Arc<RenderImage>> {
     let stock = StockIcon::RecycleBin;
     let cache_entity = ply.thumb_cache();
-    let (cached, inflight) = {
+    let (cached, inflight, failed) = {
         let c = cache_entity.read(cx);
-        (c.stock_icon(stock), c.stock_is_inflight(stock))
+        (
+            c.stock_icon(stock),
+            c.stock_is_inflight(stock),
+            c.stock_is_failed(stock),
+        )
     };
     if let Some(img) = cached {
         return Some(img);
     }
-    if inflight {
+    if inflight || failed {
         return None;
     }
     cache_entity.update(cx, |c, _| c.mark_stock_inflight(stock));
@@ -2115,6 +2197,10 @@ pub fn recycle_bin_icon(ply: &Ply, cx: &mut Context<Ply>) -> Option<Arc<RenderIm
                 c.stock_inflight.remove(&stock);
                 if let Some(img) = got {
                     c.stock_icons.insert(stock, img);
+                } else {
+                    // Terminal: settle on the glyph instead of retrying (and
+                    // blank-repainting) on every frame forever.
+                    c.stock_failed.insert(stock);
                 }
             });
         });
@@ -2373,6 +2459,39 @@ mod tests {
         // Both rasters queue GPU drops for the next render drain.
         let dropped = c.drain_drops();
         assert_eq!(dropped.len(), 2, "every released raster must drop");
+    }
+
+    #[test]
+    fn location_change_keeps_pinned_sidebar_icons() {
+        let mut c = ThumbCache::new();
+        let drive = make_thumb(&mut c, "C:\\", 0);
+        // Simulate the sidebar probe path: pinned, not evictable.
+        c.insert_pinned(drive.clone(), c.get(&drive).unwrap());
+        let _ = make_thumb(&mut c, "a.png", 1);
+
+        c.clear_content();
+
+        assert!(
+            c.pinned_get(&drive).is_some(),
+            "pinned sidebar icon must survive navigation"
+        );
+        assert!(c.map.is_empty() && c.locked_map.is_empty());
+    }
+
+    #[test]
+    fn pinned_tier_is_lru_capped() {
+        let mut c = ThumbCache::new();
+        for i in 0..(PINNED_CAP + 10) {
+            let key = stamped_key(Path::new(&format!("d{i}:\\")), 0);
+            let pixels: Vec<u8> = vec![7u8; 9216];
+            let img = to_render_image(pixels, 48, 48).unwrap();
+            c.insert_pinned(key, img);
+        }
+        assert!(
+            c.pinned_map.len() <= PINNED_CAP,
+            "pinned map {} must not exceed PINNED_CAP {PINNED_CAP}",
+            c.pinned_map.len()
+        );
     }
 
     #[test]

@@ -73,6 +73,15 @@ pub fn lookup(key: &str) -> Option<(Vec<u8>, u32, u32)> {
     Some((rgba.into_raw(), w, h))
 }
 
+/// Delete one cached thumbnail, e.g. after it fails to decode: the source
+/// file is fine, only these bytes are corrupt, so the next open re-extracts
+/// fresh instead of failing the same way forever. Best-effort.
+pub fn remove(key: &str) {
+    if let Some(dir) = cache_dir() {
+        let _ = fs::remove_file(dir.join("normal").join(format!("{key}.png")));
+    }
+}
+
 /// Whether a disk fail marker exists for this key.
 pub fn disk_failed(key: &str) -> bool {
     cache_dir()
