@@ -694,6 +694,14 @@ pub fn request_thumbnail(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>, reques
     if !should_apply_result(request_gen, current_gen) {
         return;
     }
+    // Skip enqueueing while flinging: rows visible for a frame each would
+    // each burn a slow extraction (seconds for cold video) and clog the
+    // workers behind viewports the user already left. Class icons still
+    // resolve (cheap, shared), so storm cells paint those; the settle
+    // repaint dispatches the settled viewport. See `Ply::thumb_storm`.
+    if ply.thumb_storm {
+        return;
+    }
 
     // Persist CONTENT thumbnails (media), not `.lnk` icons and not the shell
     // type icons. `request_thumbnail` also serves `.lnk` shortcut icons; those

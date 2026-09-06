@@ -134,6 +134,21 @@ evict early and grew the deque without bound while scrolling), and the
 stock Recycle Bin icon memoizes failure instead of retry-repainting
 forever.
 
+## Round five: stop dispatching while flinging
+
+Research (Explorer two-stage pattern, QuickLook cancel semantics) says the
+same thing: never spend slow extraction work on rows visible for a frame.
+`request_thumbnail` now returns early while `thumb_storm` is set, so a
+fling dispatches nothing; class icons still resolve (cheap, shared) and
+the settle repaint dispatches the settled viewport. Flings run at ~0%
+CPU with nothing grinding behind viewports the user already left.
+
+Measurement honesty: storm-peak Task Manager numbers swing ±300 MB
+run to run (driver-side present-load transients that drain after stop),
+so peaks don't compare across runs. The repeatable shape is: open
+settles low (~310 MB for 15k cold files), flings stay CPU-idle, and
+settle comes back down instead of ratcheting up.
+
 ## Known limit
 
 The settle number is floored by per-painting driver retention times live
