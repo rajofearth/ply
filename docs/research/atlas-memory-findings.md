@@ -73,16 +73,20 @@ overscan), clamped to `LOCK_CAP` around the painted center so the spill can
 never take an on-screen tile. First paint and generation changes fall back
 to the top.
 
-The storm gate is movement-only: viewport travel past its own length
-(plus margin) per 250 ms window, with a sticky reference across windows
-(no on/off flicker mid-fling). Repaint rate alone is the wrong signal
-both ways: fill trickle repaints fast while stationary (must stay
-progressive), and upload-bound fling frames render too slowly to trip
-any fps threshold. A fixed entry count was tried first and dropped: it
-can't tell a 10-column grid row from a list row, so it blanked ordinary
-trackpad scrolling. The viewport-relative trip scales both views to the
-same meaning. Verified by transition logging: slow rolls never engage,
-one engagement per fling, flat memory throughout.
+The storm gate compares consecutive renders: a viewport jump past 40
+entries between two renders means a fling. No history anchoring, no
+clocks — a stationary viewport always reads no-travel on the next
+render, so the flag cannot latch on (an earlier sticky-reference design
+did latch: stopping far from the fling start re-tripped every render,
+blocking all dispatches forever with zero CPU; caught by code review,
+proven by a stuck-run with zero disk writes, fixed by this design plus
+regression tests). Repaint rate alone is the wrong signal both ways:
+fill trickle repaints fast while stationary (must stay progressive),
+and upload-bound fling frames render too slowly to trip any fps
+threshold. A fixed per-window count was tried and dropped: per-window
+distance misses slow renders. Verified: slow rolls never engage, flings
+engage, settle resumes dispatches (100/100 cold videos extracted and
+persisted).
 
 ## Results after round two
 
@@ -148,6 +152,17 @@ run to run (driver-side present-load transients that drain after stop),
 so peaks don't compare across runs. The repeatable shape is: open
 settles low (~310 MB for 15k cold files), flings stay CPU-idle, and
 settle comes back down instead of ratcheting up.
+
+## Round six: unlatch the storm, widen the pool
+
+The sticky-reference storm latched on: stopping far from the fling start
+re-tripped every render, blocking all dispatches forever at zero CPU —
+cold folders loaded nothing, navigation cleared the cache into the same
+block. Replaced with a stateless consecutive-render gate plus regression
+tests; verified live (100/100 cold videos extracted and persisted after
+a fling). Extraction pool went 4 to 8 STA workers after measuring fully
+parallel GetImage scaling (8 cold videos: 1.04 s sequential, 43 ms
+parallel), roughly halving cold-folder fill time.
 
 ## Known limit
 

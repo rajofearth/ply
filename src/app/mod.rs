@@ -237,17 +237,7 @@ pub struct Ply {
     /// still paint (their tiles upload once and dedupe). Updated in
     /// `Render::render`, read by the browser cell painters.
     pub(crate) thumb_storm: bool,
-    storm_window_start: std::time::Instant,
-    /// Viewport start the current storm window is measured against, and
-    /// whether it has moved enough to be a real fling. Rate alone is not
-    /// enough: a fast extraction trickle also repaints rapidly while the
-    /// viewport sits still, and blanking that (progressive fill) would feel
-    /// slower, not faster. Conversely heavy upload-bound frames render too
-    /// slowly to trip any fps threshold, so movement is the whole signal.
-    /// The reference sticks across windows while moving (no on/off flicker
-    /// mid-fling) and re-anchors after one quiet window.
-    storm_ref_start: usize,
-    storm_window_moved: bool,
+    storm_gate: StormGate,
     /// Entry-index range actually painted last frame (union of the
     /// virtualized rows the list/grid processors ran for), plus the listing
     /// generation it belongs to. Prefetch and the thumbnail working-set lock
@@ -310,9 +300,7 @@ impl Ply {
             thumbs_flush_pending: false,
             storm_settle_pending: false,
             thumb_storm: false,
-            storm_window_start: std::time::Instant::now(),
-            storm_ref_start: 0,
-            storm_window_moved: false,
+            storm_gate: StormGate::new(),
             last_viewport: 0..0,
             last_viewport_gen: 0,
         };
@@ -349,35 +337,18 @@ impl Ply {
     }
 
     /// Update the paint-storm detector; called at the top of every render.
-    /// A storm is viewport travel past its own length (plus a small
-    /// margin) measured against a reference that sticks across windows
-    /// mid-fling and re-anchors after one quiet window: a scroll fling.
-    /// Content whipping by faster than a full screen per 250 ms is
-    /// unreadable, so its tiles can wait for settle; anything slower
-    /// (wheel rolls, arrow-key stepping, typing) stays progressive, as
-    /// does a fast extraction trickle repainting a stationary viewport.
-    /// Repaint rate alone is not the signal: upload-bound fling frames
-    /// render too slowly to trip any fps threshold, and a fixed entry
-    /// count can't tell a 10-column grid row from a list row.
+    /// A storm is a viewport jump past `TRIP` entries between two renders:
+    /// a scroll fling. Comparing consecutive renders (instead of anchoring
+    /// to history) means the flag can never latch on: a stationary viewport
+    /// always reads no-travel on the next render, so stopping clears it on
+    /// the very next paint, with or without timers. A fast extraction
+    /// trickle repainting a stationary viewport never trips it, so
+    /// progressive fill-in is never blanked; slow scrolls, arrow-key
+    /// stepping and typing move less and stay progressive.
     pub(crate) fn note_paint(&mut self) {
-        let now = std::time::Instant::now();
-        if now.duration_since(self.storm_window_start).as_millis() > 250 {
-            self.storm_window_start = now;
-            if !self.storm_window_moved {
-                // Quiet window: re-anchor. A moving window keeps the old
-                // reference so travel accumulates and slow renders can't
-                // hide a fling.
-                self.storm_ref_start = self.last_viewport.start;
-            }
-            self.storm_window_moved = false;
-        }
-        // The margin absorbs jitter at the boundary; the viewport term
-        // scales grid rows and list rows to the same meaning.
-        let trip = self.last_viewport.len().max(24) + 24;
-        if self.last_viewport.start.abs_diff(self.storm_ref_start) > trip {
-            self.storm_window_moved = true;
-        }
-        self.thumb_storm = self.storm_window_moved;
+        self.thumb_storm = self
+            .storm_gate
+            .update(self.last_viewport.start, self.list_generation);
     }
 
     /// Whether a text field has focus, so bare-key shortcuts should stand down.
@@ -479,6 +450,45 @@ impl Ply {
             })
             .detach();
         }
+    }
+}
+
+/// Fling detector with no latching state. Fed the painted viewport start
+/// plus the listing generation on every render; reports whether the
+/// viewport is currently whipping past content. Comparing consecutive
+/// renders (instead of anchoring to history) is the whole safety story:
+/// a stationary viewport always reads no-travel on the next render, so
+/// stopping clears the storm on the very next paint with or without
+/// timers, and a generation change resets without tripping, so navigation
+/// and filtering never inherit a storm. Pure logic, no clock: unit-tested
+/// below, including the no-latch regression test.
+#[derive(Debug, Default)]
+struct StormGate {
+    prev_start: Option<usize>,
+    generation: u64,
+}
+
+impl StormGate {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one render. Returns true while flinging: the viewport jumped
+    /// more than `TRIP` entries since the previous render.
+    fn update(&mut self, vp_start: usize, generation: u64) -> bool {
+        /// Entries jumped between two renders that counts as a fling
+        /// rather than stepping, slow rolls, or repaint churn.
+        const TRIP: usize = 40;
+        let trip = match (self.prev_start, self.generation == generation) {
+            (Some(prev), true) => vp_start.abs_diff(prev) > TRIP,
+            // First sighting, or the listing changed under us (new folder,
+            // filter rebuild): never storm on a jump we didn't observe
+            // both ends of.
+            _ => false,
+        };
+        self.prev_start = Some(vp_start);
+        self.generation = generation;
+        trip
     }
 }
 
@@ -593,5 +603,56 @@ mod tests {
             c.notify_count, 1,
             "only one flush even with multiple schedule calls"
         );
+    }
+
+    #[test]
+    fn storm_gate_first_sighting_never_trips() {
+        let mut g = super::StormGate::new();
+        assert!(!g.update(800, 5), "no previous render to compare against");
+    }
+
+    #[test]
+    fn storm_gate_ignores_small_steps() {
+        let mut g = super::StormGate::new();
+        g.update(0, 1);
+        // Key-repeat stepping and slow rolls: 10 entries per render.
+        for i in 1..=20 {
+            assert!(!g.update(i * 10, 1), "slow motion must stay progressive");
+        }
+    }
+
+    #[test]
+    fn storm_gate_trips_on_jump_and_clears_on_stop() {
+        let mut g = super::StormGate::new();
+        g.update(0, 1);
+        assert!(g.update(500, 1), "fling jump must trip");
+        // Stopped dead: the very next render reads no travel and clears.
+        // This is the no-latch regression test — the old sticky reference
+        // kept tripping forever on a parked far viewport.
+        assert!(
+            !g.update(500, 1),
+            "a stationary viewport must clear on the next render"
+        );
+        assert!(!g.update(500, 1), "stays clear while parked");
+    }
+
+    #[test]
+    fn storm_gate_resets_on_generation_change() {
+        let mut g = super::StormGate::new();
+        g.update(0, 1);
+        assert!(g.update(900, 1), "fling trips");
+        // New folder (or filter rebuild): the jump is meaningless, and the
+        // flag must not carry over.
+        assert!(!g.update(0, 2), "generation change resets without tripping");
+        assert!(!g.update(0, 2), "fresh listing starts quiet");
+    }
+
+    #[test]
+    fn storm_gate_keeps_tripping_while_moving() {
+        let mut g = super::StormGate::new();
+        g.update(0, 1);
+        assert!(g.update(200, 1));
+        assert!(g.update(400, 1), "sustained fling stays gated");
+        assert!(g.update(600, 1));
     }
 }

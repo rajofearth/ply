@@ -1292,8 +1292,11 @@ mod backend {
     /// Thumbnail extraction runs on a small STA pool: each worker owns its own
     /// apartment and queue, jobs are spread round-robin. A GetImage that hangs
     /// (e.g. a synced/on-demand cloud file) stalls one thread; the others keep
-    /// draining, and names/type icons never share this pool at all.
-    const CONTENT_THREADS: usize = 4;
+    /// draining, and names/type icons never share this pool at all. Eight
+    /// workers: measured fully parallel scaling (no shell serialization), so
+    /// this halves cold-folder fill time versus four; per-worker transient
+    /// decode buffers stay modest next to the tile budget.
+    const CONTENT_THREADS: usize = 8;
 
     enum ContentJob {
         /// Extract the shell image for a path (media / executable). For a
