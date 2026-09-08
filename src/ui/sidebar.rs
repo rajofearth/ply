@@ -26,6 +26,7 @@ enum RowIcon {
 
 pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
     let p = ply.palette();
+    let home_active = ply.is_home();
     let (drives, devices) = volumes::partition_drives_devices(&ply.volumes);
 
     let mut pinned = Vec::new();
@@ -97,15 +98,23 @@ pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
                 .pr(px(10.))
                 .text_size(px(12.5))
                 .cursor_default()
-                .when(ply.is_home(), |el| {
-                    el.bg(p.accent)
+                .when(home_active, |el| {
+                    el.bg(p.select_strong)
                         .text_color(p.foreground)
                         .font_weight(FontWeight::MEDIUM)
                 })
-                .when(!ply.is_home(), |el| {
+                .when(!home_active, |el| {
                     el.text_color(p.muted_foreground).hover(|s| s.bg(p.muted))
                 })
-                .child(icon(Ico::Home, px(16.), p.muted_foreground))
+                .child(icon(
+                    Ico::Home,
+                    px(16.),
+                    if home_active {
+                        p.foreground
+                    } else {
+                        p.muted_foreground
+                    },
+                ))
                 .child("Home")
                 .on_click(cx.listener(|this, _, window, cx| this.go_home(window, cx))),
         )
@@ -192,6 +201,16 @@ fn row(
     let active = ply.current_folder() == Some(path);
     let expanded = ply.is_expanded(path);
     let id = super::stable_id(path);
+    // Active uses a stronger neutral step than hover so the two never match;
+    // hover keeps the muted icon, only the active row promotes it.
+    let lead = if active {
+        p.foreground
+    } else {
+        p.muted_foreground
+    };
+    // Chevron hover stays visible on both grounds: muted on the active fill,
+    // stronger neutral on the sidebar / hover ground. Zero-hue, sharp.
+    let chev_hover = if active { p.muted } else { p.select_strong };
 
     div()
         .id(("side", id))
@@ -204,7 +223,7 @@ fn row(
         .text_size(px(12.5))
         .cursor_default()
         .when(active, |el| {
-            el.bg(p.accent)
+            el.bg(p.select_strong)
                 .text_color(p.foreground)
                 .font_weight(FontWeight::MEDIUM)
         })
@@ -214,10 +233,13 @@ fn row(
         .child(
             div()
                 .id(("chev", id))
-                .w(px(12.))
+                .w(px(22.))
+                .h(px(22.))
                 .flex()
                 .flex_none()
+                .items_center()
                 .justify_center()
+                .hover(move |s| s.bg(chev_hover))
                 .child(icon(
                     if expanded {
                         Ico::ChevronDown
@@ -235,13 +257,11 @@ fn row(
                 }),
         )
         .child(match &row_icon {
-            RowIcon::Glyph(ico) => icon(*ico, px(16.), p.muted_foreground).into_any_element(),
+            RowIcon::Glyph(ico) => icon(*ico, px(16.), lead).into_any_element(),
             RowIcon::Path(pth) => match thumbs::path_icon_probe(ply, pth, 0, cx) {
                 thumbs::IconProbe::Ready(img) => super::thumb_img(&img, 16.).into_any_element(),
                 thumbs::IconProbe::Loading => super::icon_slot(16.).into_any_element(),
-                thumbs::IconProbe::Glyph => {
-                    icon(Ico::Folder, px(16.), p.muted_foreground).into_any_element()
-                }
+                thumbs::IconProbe::Glyph => icon(Ico::Folder, px(16.), lead).into_any_element(),
             },
         })
         .child(div().truncate().child(label))
@@ -254,7 +274,7 @@ fn row(
         .on_mouse_down(MouseButton::Right, {
             let path = path.to_path_buf();
             cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                this.open_menu(ev.position, path.clone(), cx);
+                this.open_sidebar_menu(ev.position, path.clone(), cx);
             })
         })
         .on_drag(PinDrag(path.to_path_buf()), |drag, _, _, cx| {
@@ -276,6 +296,11 @@ fn recycle_bin_row(ply: &Ply, cx: &mut Context<Ply>) -> AnyElement {
     let active = ply
         .current_folder()
         .is_some_and(crate::recycle_bin::is_recycle_bin);
+    let lead = if active {
+        p.foreground
+    } else {
+        p.muted_foreground
+    };
     div()
         .id("recycle-bin-row")
         .flex()
@@ -287,7 +312,7 @@ fn recycle_bin_row(ply: &Ply, cx: &mut Context<Ply>) -> AnyElement {
         .text_size(px(12.5))
         .cursor_default()
         .when(active, |el| {
-            el.bg(p.accent)
+            el.bg(p.select_strong)
                 .text_color(p.foreground)
                 .font_weight(FontWeight::MEDIUM)
         })
@@ -297,9 +322,7 @@ fn recycle_bin_row(ply: &Ply, cx: &mut Context<Ply>) -> AnyElement {
         .child(match thumbs::recycle_bin_probe(ply, cx) {
             thumbs::IconProbe::Ready(img) => super::thumb_img(&img, 16.).into_any_element(),
             thumbs::IconProbe::Loading => super::icon_slot(16.).into_any_element(),
-            thumbs::IconProbe::Glyph => {
-                icon(Ico::Trash, px(16.), p.muted_foreground).into_any_element()
-            }
+            thumbs::IconProbe::Glyph => icon(Ico::Trash, px(16.), lead).into_any_element(),
         })
         .child("Recycle Bin")
         .on_click(cx.listener(|this, _, window, cx| {

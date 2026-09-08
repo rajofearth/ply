@@ -189,12 +189,14 @@ impl Ply {
     pub fn pin(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if path.is_dir() && !self.quick_access.contains(&path) {
             self.quick_access.push(path);
+            crate::volumes::save_quick_access(&self.quick_access);
             cx.notify();
         }
     }
 
     pub fn unpin(&mut self, path: &Path, cx: &mut Context<Self>) {
         self.quick_access.retain(|p| p != path);
+        crate::volumes::save_quick_access(&self.quick_access);
         cx.notify();
     }
 }

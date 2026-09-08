@@ -2,7 +2,7 @@
 //! on network drives (`GetDiskFreeSpaceExW` / `GetVolumeInformationW`) — call
 //! off the UI thread. MTP is separate so drive polls stay cheap.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum VolumeKind {
@@ -180,6 +180,86 @@ pub fn default_quick_access() -> Vec<PathBuf> {
     .flatten()
     .filter(|p| p.is_dir())
     .collect()
+}
+
+/// Cap for pinned Quick Access folders, in memory and on disk.
+pub const MAX_QUICK_ACCESS: usize = 64;
+
+/// Persisted pins: `<config_dir>/ply/quick_access.txt`, falling back to
+/// `<data_dir>/ply/quick_access.txt` when no config dir exists.
+pub fn quick_access_path() -> PathBuf {
+    dirs::config_dir()
+        .or_else(dirs::data_dir)
+        .map(|d| d.join("ply").join("quick_access.txt"))
+        .unwrap_or_else(|| std::env::temp_dir().join("ply").join("quick_access.txt"))
+}
+
+/// Parse persisted pins, one path per line. Trims whitespace, skips empties,
+/// dedupes (first wins), caps at [`MAX_QUICK_ACCESS`]. Pure, no filesystem
+/// checks; `is_dir` / MTP / Recycle Bin filtering happens in `load_or_seed`.
+pub fn parse_quick_access_text(text: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let path = PathBuf::from(line);
+        if !out.contains(&path) {
+            out.push(path);
+        }
+        if out.len() >= MAX_QUICK_ACCESS {
+            break;
+        }
+    }
+    out
+}
+
+/// Serialize pins as one display string per line. Capped at
+/// [`MAX_QUICK_ACCESS`]; inverse of [`parse_quick_access_text`].
+pub fn serialize_quick_access(pins: &[PathBuf]) -> String {
+    let mut text = String::new();
+    for pin in pins.iter().take(MAX_QUICK_ACCESS) {
+        text.push_str(&pin.display().to_string());
+        text.push('\n');
+    }
+    text
+}
+
+/// Persist pins. Best-effort: creates parent dirs, ignores all IO errors so a
+/// disk failure never changes app behavior.
+pub fn save_quick_access(pins: &[PathBuf]) {
+    save_quick_access_at(&quick_access_path(), pins);
+}
+
+fn save_quick_access_at(path: &Path, pins: &[PathBuf]) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, serialize_quick_access(pins));
+}
+
+/// Load persisted pins, or seed from shell folders on first run / corrupt
+/// file. A present file wins exactly as written (trimmed, deduped, capped at
+/// [`MAX_QUICK_ACCESS`], MTP / Recycle Bin / missing paths dropped), so an
+/// unpinned seed stays unpinned. Absent or unreadable files fall back to
+/// [`default_quick_access`] plus a best-effort save.
+pub fn load_or_seed() -> Vec<PathBuf> {
+    load_or_seed_at(&quick_access_path())
+}
+
+fn load_or_seed_at(path: &Path) -> Vec<PathBuf> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        let seed = default_quick_access();
+        save_quick_access_at(path, &seed);
+        return seed;
+    };
+    let mut pins: Vec<PathBuf> = parse_quick_access_text(&text)
+        .into_iter()
+        .filter(|p| !crate::mtp::is_mtp(p) && !crate::recycle_bin::is_recycle_bin(p) && p.is_dir())
+        .collect();
+    pins.truncate(MAX_QUICK_ACCESS);
+    pins
 }
 
 #[cfg(windows)]
@@ -453,5 +533,117 @@ mod tests {
         for v in &updated {
             assert_eq!(v.kind, VolumeKind::Drive, "only local drives refresh");
         }
+    }
+
+    fn quick_access_temp(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "ply_quick_access_{label}_{}_{}",
+            std::process::id(),
+            n
+        ))
+    }
+
+    #[test]
+    fn quick_access_round_trip() {
+        let pins = vec![PathBuf::from("/tmp/ply-a"), PathBuf::from("/tmp/ply-b")];
+        let text = serialize_quick_access(&pins);
+        assert_eq!(parse_quick_access_text(&text), pins);
+    }
+
+    #[test]
+    fn quick_access_parse_dedupes_and_skips_empties() {
+        let text = "/tmp/a\n\n  /tmp/b  \n/tmp/a\n/tmp/b\n";
+        assert_eq!(
+            parse_quick_access_text(text),
+            vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]
+        );
+    }
+
+    #[test]
+    fn quick_access_parse_caps_at_64() {
+        let text = (0..100)
+            .map(|i| format!("/tmp/dir{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parsed = parse_quick_access_text(&text);
+        assert_eq!(parsed.len(), MAX_QUICK_ACCESS);
+        assert_eq!(parsed[0], PathBuf::from("/tmp/dir0"));
+        assert_eq!(parsed[63], PathBuf::from("/tmp/dir63"));
+        let serialized = serialize_quick_access(
+            &(0..100)
+                .map(|i| PathBuf::from(format!("/tmp/dir{i}")))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(parse_quick_access_text(&serialized).len(), MAX_QUICK_ACCESS);
+    }
+
+    #[test]
+    fn quick_access_missing_file_falls_back_to_seed() {
+        let dir = quick_access_temp("missing");
+        let path = dir.join("nested").join("quick_access.txt");
+        let loaded = load_or_seed_at(&path);
+        assert_eq!(loaded, default_quick_access());
+        // Best-effort seed save leaves a file behind when the dir is writable.
+        assert_eq!(
+            std::fs::read_to_string(&path).ok().as_deref(),
+            Some(serialize_quick_access(&loaded).as_str())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quick_access_corrupt_file_falls_back_to_seed() {
+        let dir = quick_access_temp("corrupt");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("quick_access.txt");
+        std::fs::write(&path, [0xff, 0xfe, 0xfd]).unwrap();
+        assert_eq!(load_or_seed_at(&path), default_quick_access());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quick_access_drops_mtp_recycle_and_missing() {
+        let dir = quick_access_temp("filter");
+        let keep = dir.join("keep");
+        let _ = std::fs::create_dir_all(&keep);
+        let missing = dir.join("missing");
+        let path = dir.join("quick_access.txt");
+        let text = serialize_quick_access(&[
+            keep.clone(),
+            crate::mtp::root_of("deadbeefdeadbeef"),
+            crate::recycle_bin::root(),
+            missing,
+        ]);
+        std::fs::write(&path, text).unwrap();
+        let loaded = load_or_seed_at(&path);
+        assert!(loaded.contains(&keep));
+        assert!(!loaded.iter().any(|p| crate::mtp::is_mtp(p)));
+        assert!(!loaded.iter().any(|p| crate::recycle_bin::is_recycle_bin(p)));
+        for seed in default_quick_access() {
+            assert!(
+                !loaded.contains(&seed),
+                "unpinned seed stays gone: {seed:?}"
+            );
+        }
+        assert!(loaded.len() <= MAX_QUICK_ACCESS);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quick_access_save_load_round_trip() {
+        let dir = quick_access_temp("roundtrip");
+        let a = dir.join("a");
+        let b = dir.join("b");
+        let _ = std::fs::create_dir_all(&a);
+        let _ = std::fs::create_dir_all(&b);
+        let path = dir.join("quick_access.txt");
+        save_quick_access_at(&path, &[a.clone(), b.clone()]);
+        let loaded = load_or_seed_at(&path);
+        assert!(loaded.contains(&a));
+        assert!(loaded.contains(&b));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

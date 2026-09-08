@@ -9,6 +9,16 @@ use super::icon;
 use crate::app::{Ply, ViewMode};
 use crate::icons::Ico;
 
+/// Sentence-case filter placeholder: "Filter N items…".
+/// Pure so it is unit-testable; the live count is wired in
+/// `Ply::sync_filter_placeholder` (owns the window + input state).
+/// Intended caller is `sync_filter_placeholder`; allowed dead until that
+/// one-line wiring lands (outside these owned files).
+#[allow(dead_code)]
+pub fn filter_placeholder(count: usize) -> String {
+    format!("Filter {count} items…")
+}
+
 /// Only shown inside a folder: counts, the filter, and the view toggle.
 pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
     let p = ply.palette();
@@ -55,7 +65,30 @@ pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
                                 .flex_1()
                                 .min_w_0()
                                 .child(Input::new(&ply.filter).xsmall().appearance(false)),
-                        ),
+                        )
+                        .when(!ply.filter_text.is_empty(), |el| {
+                            el.child(
+                                div()
+                                    .id("filter-clear")
+                                    .flex()
+                                    .flex_none()
+                                    .items_center()
+                                    .justify_center()
+                                    .w(px(18.))
+                                    .h(px(18.))
+                                    .text_size(px(12.))
+                                    .text_color(p.muted_foreground)
+                                    .cursor_default()
+                                    .hover(|s| s.bg(p.muted))
+                                    .child("×")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.filter.update(cx, |input, cx| {
+                                            input.set_value("", window, cx);
+                                        });
+                                        window.blur();
+                                    })),
+                            )
+                        }),
                 )
                 .child(
                     div()
@@ -80,7 +113,7 @@ fn toggle(ply: &Ply, view: ViewMode, ico: Ico, cx: &mut Context<Ply>) -> impl In
         .px(px(6.))
         .py(px(3.))
         .cursor_default()
-        .when(on, |el| el.bg(p.accent))
+        .when(on, |el| el.bg(p.select_strong))
         .when(!on, |el| el.hover(|s| s.bg(p.muted)))
         .child(icon(
             ico,
@@ -88,4 +121,26 @@ fn toggle(ply: &Ply, view: ViewMode, ico: Ico, cx: &mut Context<Ply>) -> impl In
             if on { p.foreground } else { p.muted_foreground },
         ))
         .on_click(cx.listener(move |this, _, _, cx| this.set_view(view, cx)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::filter_placeholder;
+
+    #[test]
+    fn placeholder_is_sentence_case_with_ellipsis() {
+        assert_eq!(filter_placeholder(0), "Filter 0 items…");
+        assert_eq!(filter_placeholder(1), "Filter 1 items…");
+        assert_eq!(filter_placeholder(123), "Filter 123 items…");
+    }
+
+    #[test]
+    fn placeholder_never_lowercase_lead() {
+        for n in [0, 2, 42] {
+            let s = filter_placeholder(n);
+            assert!(s.starts_with("Filter "), "got {s:?}");
+            assert!(s.ends_with('…'), "got {s:?}");
+            assert!(!s.starts_with("filter "), "must be sentence-case: {s:?}");
+        }
+    }
 }

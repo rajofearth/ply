@@ -551,15 +551,32 @@ fn drag_chip(
 /// claims the key first, so the cancel has to sit on the way out.
 fn rename_field(ply: &Ply, cx: &mut Context<Ply>) -> AnyElement {
     let rename = ply.rename.as_ref().expect("called only while renaming");
+    let p = ply.palette();
     div()
-        .w_full()
+        .flex()
+        .flex_1()
+        .min_w_0()
+        .items_center()
+        .h(px(22.))
+        .px(px(6.))
+        .bg(p.card)
+        .border_1()
+        .border_color(p.border)
+        .rounded(px(0.))
+        .text_size(px(12.5))
         .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
             if ev.keystroke.key == "escape" {
                 cx.stop_propagation();
                 this.cancel_rename(cx);
             }
         }))
-        .child(Input::new(&rename.input).xsmall())
+        .child(
+            Input::new(&rename.input)
+                .xsmall()
+                .appearance(false)
+                .bordered(false)
+                .focus_bordered(false),
+        )
         .into_any_element()
 }
 

@@ -367,6 +367,18 @@ pub fn format_mtime(t: Option<SystemTime>, now: DateTime<Local>) -> String {
     }
 }
 
+/// Full Explorer-style stamp for the Properties modal, e.g.
+/// `Monday, December 1, 2025, 2:08:28 PM`. Unlike [`format_mtime`] this never
+/// shortens by recency. Pure; `now` is taken for signature symmetry only.
+pub fn format_full_datetime(when: Option<SystemTime>, now: DateTime<Local>) -> String {
+    let _ = now;
+    let Some(t) = when else {
+        return "—".into();
+    };
+    let when: DateTime<Local> = t.into();
+    when.format("%A, %B %-d, %Y, %-I:%M:%S %p").to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,5 +604,27 @@ mod tests {
         );
         let names: Vec<_> = snap.entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["A.txt", "b.txt", "c.txt"]);
+    }
+
+    #[test]
+    fn format_full_datetime_matches_explorer_style() {
+        use chrono::TimeZone;
+        let evening = Local.with_ymd_and_hms(2025, 12, 1, 14, 8, 28).unwrap();
+        let evening_sys: SystemTime = chrono::DateTime::<chrono::Utc>::from(evening).into();
+        assert_eq!(
+            format_full_datetime(Some(evening_sys), evening),
+            "Monday, December 1, 2025, 2:08:28 PM"
+        );
+        let morning = Local.with_ymd_and_hms(2025, 1, 5, 9, 5, 3).unwrap();
+        let morning_sys: SystemTime = chrono::DateTime::<chrono::Utc>::from(morning).into();
+        assert_eq!(
+            format_full_datetime(Some(morning_sys), morning),
+            "Sunday, January 5, 2025, 9:05:03 AM"
+        );
+    }
+
+    #[test]
+    fn format_full_datetime_none_is_em_dash() {
+        assert_eq!(format_full_datetime(None, Local::now()), "—");
     }
 }

@@ -5,6 +5,7 @@ mod ops;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, atomic::AtomicBool};
 use std::time::Duration;
 
 use gpui::{
@@ -37,20 +38,43 @@ pub enum ViewMode {
     Grid,
 }
 
-/// A right-click menu: optional icon toolbar, then a vertical list.
+/// A right-click menu: a vertical list of rows plus flyout state.
 pub struct Menu {
     pub at: Point<Pixels>,
-    pub toolbar: Vec<ToolBtn>,
     pub rows: Vec<MenuRow>,
     pub flyout: Option<usize>,
+    /// Keyboard-selected row, driven by the UI via [`Menu::move_selection`].
+    /// `None` means nothing is highlighted yet.
+    pub selected: Option<usize>,
 }
 
-#[derive(Clone)]
-pub struct ToolBtn {
-    pub icon: crate::icons::Ico,
-    pub action: MenuAction,
-    pub enabled: bool,
-    pub danger: bool,
+impl Menu {
+    /// Step the keyboard selection by `delta`, wrapping around. Only enabled
+    /// [`MenuRow::Item`] rows are stops; separators and disabled rows are
+    /// skipped. A stale or missing selection restarts from the nearest end.
+    /// With no selectable row the selection is cleared. Pure.
+    /// UI contract: the overlay wires arrow keys to this.
+    pub fn move_selection(&mut self, delta: isize) {
+        let n = self.rows.len();
+        let selectable = |row: &MenuRow| matches!(row, MenuRow::Item(item) if item.enabled);
+        if n == 0 || !self.rows.iter().any(&selectable) {
+            self.selected = None;
+            return;
+        }
+        let step = if delta == 0 { 1 } else { delta };
+        let mut ix = self
+            .selected
+            .filter(|&i| i < n)
+            .map(|i| i as isize)
+            .unwrap_or(if step > 0 { -1 } else { n as isize });
+        loop {
+            ix = (ix + step).rem_euclid(n as isize);
+            if selectable(&self.rows[ix as usize]) {
+                self.selected = Some(ix as usize);
+                return;
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -59,15 +83,64 @@ pub enum MenuRow {
     Item(MenuItem),
 }
 
+/// Where a menu row icon comes from. The backend (`thumbs.rs`) resolves these
+/// to shell rasters; `icon` on [`MenuItem`] stays as the lucide fallback glyph.
+/// This is the single contract the UI reads. `thumbs.rs` keeps its own
+/// worker-side `StockIcon` plus a generic stock probe; the two stay in sync by
+/// name (Shield, Folder, FolderOpen, Info, RecycleBin, Delete, MixedFiles).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MenuIconSource {
+    /// Shell icon for a real path (folder, executable, file).
+    Path(std::path::PathBuf),
+    /// Per-extension class icon, lowercased without the dot (for example `"txt"`).
+    Class(String),
+    /// Fixed stock icon.
+    Stock(MenuStock),
+}
+
+/// Fixed shell icons used by menu rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MenuStock {
+    Shield,
+    Folder,
+    FolderOpen,
+    // No menu builder constructs these today (Properties and Delete are
+    // glyph-only); they stay because `ui/overlay.rs` maps every variant to
+    // a worker `StockIcon` and tests that mapping.
+    #[allow(dead_code)]
+    Info,
+    #[allow(dead_code)]
+    RecycleBin,
+    #[allow(dead_code)]
+    Delete,
+    MixedFiles,
+}
+
 #[derive(Clone)]
 pub struct MenuItem {
     pub label: SharedString,
     pub icon: Option<crate::icons::Ico>,
+    /// Shell icon source. `None` means lucide only (Ply chrome rows).
+    pub shell: Option<MenuIconSource>,
     pub action: Option<MenuAction>,
     pub children: Vec<MenuRow>,
     pub enabled: bool,
     pub danger: bool,
     pub strong: bool,
+    /// Right-aligned accelerator hint the overlay paints (`"Enter"`, `"Del"`).
+    pub shortcut: Option<SharedString>,
+    /// Segoe MDL2 Symbols codepoint the overlay paints for this row
+    /// (`'\u{E890}'` View, `'\u{E8CB}'` Sort by, `'\u{E8F4}'` New folder,
+    /// `'\u{E7AC}'` Open with / Choose another app, `'\u{E8AC}'` Rename,
+    /// `'\u{E8C8}'` Copy as path, `'\u{E838}'` Reveal, `'\u{E946}'` Properties,
+    /// `'\u{E74D}'` Delete, `'\u{E72C}'` Refresh, `'\u{E756}'` Open in
+    /// Terminal, `'\u{E8E5}'` Open). `None` means lucide `icon` only.
+    /// UI contract: `ui/overlay.rs` reads this. Rows without a mapped
+    /// codepoint (Run as admin, Pin rows, handler and sort children,
+    /// List/Grid checks) leave it `None`.
+    /// Properties and Delete are glyph-only: they carry no `shell` stock
+    /// source, only the codepoint above plus the lucide `icon` fallback.
+    pub glyph: Option<char>,
 }
 
 impl MenuItem {
@@ -79,28 +152,41 @@ impl MenuItem {
         Self {
             label: label.into(),
             icon,
+            shell: None,
             action,
             children: Vec::new(),
             enabled: true,
             danger: false,
             strong: false,
+            shortcut: None,
+            glyph: None,
         }
     }
 
-    pub(super) fn off(self) -> Self {
+    pub(super) fn with_shell(self, source: MenuIconSource) -> Self {
         Self {
-            enabled: false,
+            shell: Some(source),
             ..self
         }
-    }
-
-    pub(super) fn on(self, enabled: bool) -> Self {
-        Self { enabled, ..self }
     }
 
     pub(super) fn danger(self) -> Self {
         Self {
             danger: true,
+            ..self
+        }
+    }
+
+    pub(super) fn with_shortcut(self, shortcut: impl Into<SharedString>) -> Self {
+        Self {
+            shortcut: Some(shortcut.into()),
+            ..self
+        }
+    }
+
+    pub(super) fn with_glyph(self, glyph: char) -> Self {
+        Self {
+            glyph: Some(glyph),
             ..self
         }
     }
@@ -116,13 +202,24 @@ impl From<MenuItem> for MenuRow {
 pub enum MenuAction {
     Open(PathBuf),
     ChooseApp(PathBuf),
+    /// Open with a specific handler from `fs_ops::list_open_with_apps`. The display
+    /// name is carried for the status line; shell `Invoke` is deferred, so the
+    /// run path currently falls back to the Choose-app picker.
+    OpenWithHandler(PathBuf, String),
     RunAsAdmin(PathBuf),
     OpenInTerminal(PathBuf),
+    // Kept for the clipboard/pin engine that does not exist yet: no menu
+    // builds these rows today, `run` still honours them when it returns.
+    #[allow(dead_code)]
     Pin(PathBuf),
+    #[allow(dead_code)]
     Unpin(PathBuf),
     CopyPath(PathBuf),
+    #[allow(dead_code)]
     Cut,
+    #[allow(dead_code)]
     Copy,
+    #[allow(dead_code)]
     Paste,
     Rename(PathBuf),
     Delete(Vec<PathBuf>),
@@ -134,8 +231,8 @@ pub enum MenuAction {
     NewFolder,
 }
 
-/// A row being renamed inline. The subscription commits on Enter or blur and
-/// lives here so it dies with the edit.
+/// A row being renamed inline. The subscription commits on Enter and
+/// cancels on blur or Esc, and lives here so it dies with the edit.
 pub struct Rename {
     pub path: PathBuf,
     pub input: Entity<InputState>,
@@ -147,11 +244,93 @@ pub struct Properties {
     pub name: SharedString,
     pub kind: SharedString,
     pub size: SharedString,
+    /// Byte-exact suffix for files, e.g. `"(580,833,358 bytes)"`.
+    pub size_detail: SharedString,
+    /// Cluster-rounded size via `fs_ops::size_on_disk`.
+    pub size_on_disk: SharedString,
+    /// Byte-exact `size_on_disk` suffix, e.g. `"(118,784 bytes)"`. `""` when
+    /// the on-disk size is unknown (volumes, portable paths, failed reads).
+    /// The overlay paints it next to [`Self::size_on_disk`].
+    pub size_on_disk_detail: SharedString,
+    /// `"N Files, M Folders"` for directories; `""` for files and volumes.
+    pub contains: SharedString,
     pub modified: SharedString,
+    /// Full-date stamps (`listing::format_full_datetime`).
+    pub created: SharedString,
+    pub accessed: SharedString,
     pub path: SharedString,
+    /// Parent folder display (Location). Split from the name where trivial;
+    /// the full path stays in [`Self::path`] for copy.
+    pub location: SharedString,
+    /// Friendly app name for the Opens-with row (`AssocQueryString`, falling
+    /// back to the kind label when the shell has nothing). Empty for
+    /// directories and volumes, where the overlay hides the row.
+    pub opens_with: SharedString,
+    /// Attribute checkboxes. `None` means mixed or unavailable (and, for
+    /// `readonly` on directories, Explorer's tri-state note instead).
+    pub readonly: Option<bool>,
+    pub hidden: Option<bool>,
+    /// Directories show Explorer's "applies to folder only" note; the
+    /// read-only box itself stays untouched (`readonly` is `None`).
+    pub attrs_note: bool,
+    /// Masked attribute bits (`fs_ops::ATTR_*`) the dialog opened with, for
+    /// [`Ply::properties_dirty`]. `None` when the bits could not be read.
+    pub attr_orig: Option<u32>,
     /// Extra shell-sourced facts (author, title, created, ...) filled in
     /// asynchronously after the dialog opens.
     pub details: Vec<(SharedString, SharedString)>,
+}
+
+/// Arguments for [`props_from_fields`]: the facts the Properties dialog
+/// shows, gathered from a real Entry or Volume — never a stub.
+pub struct PropsFields {
+    pub name: SharedString,
+    pub kind: SharedString,
+    pub size: SharedString,
+    pub size_detail: SharedString,
+    pub size_on_disk: SharedString,
+    /// Byte-exact `size_on_disk` suffix; `""` when unknown. Converted to
+    /// [`SharedString`] at the boundary like the other size strings.
+    pub size_on_disk_detail: SharedString,
+    pub contains: SharedString,
+    pub modified: SharedString,
+    pub created: SharedString,
+    pub accessed: SharedString,
+    pub path: SharedString,
+    pub location: SharedString,
+    /// Friendly app name; converted to [`SharedString`] at the boundary.
+    /// Empty for directories and volumes.
+    pub opens_with: String,
+    pub readonly: Option<bool>,
+    pub hidden: Option<bool>,
+    pub attrs_note: bool,
+    pub attr_orig: Option<u32>,
+}
+
+/// Build a [`Properties`] snapshot from [`PropsFields`]. Pure, so tests cover
+/// the mapping without a GPUI context; `details` start empty and
+/// [`Ply::fill_properties`] enriches them asynchronously.
+pub fn props_from_fields(fields: PropsFields) -> Properties {
+    Properties {
+        name: fields.name,
+        kind: fields.kind,
+        size: fields.size,
+        size_detail: fields.size_detail,
+        size_on_disk: fields.size_on_disk,
+        size_on_disk_detail: fields.size_on_disk_detail,
+        contains: fields.contains,
+        modified: fields.modified,
+        created: fields.created,
+        accessed: fields.accessed,
+        path: fields.path,
+        location: fields.location,
+        opens_with: fields.opens_with.into(),
+        readonly: fields.readonly,
+        hidden: fields.hidden,
+        attrs_note: fields.attrs_note,
+        attr_orig: fields.attr_orig,
+        details: Vec::new(),
+    }
 }
 
 /// What confirming a [`ConfirmDialog`] runs.
@@ -217,6 +396,11 @@ pub struct Ply {
 
     pub(crate) list_generation: u64,
     list_task: Option<Task<()>>,
+    /// Properties folder-walk generation: each directory dialog bumps it, and
+    /// stale walk completions are dropped. The matching cancel flag aborts
+    /// the previous walk's I/O early.
+    props_generation: u64,
+    props_walk_cancel: Arc<AtomicBool>,
     watch: Option<FolderWatch>,
     pub focus: FocusHandle,
 
@@ -272,7 +456,7 @@ impl Ply {
             history_ix: 0,
             listing: LoadState::Ready(Snapshot::default()),
             volumes: Vec::new(),
-            quick_access: volumes::default_quick_access(),
+            quick_access: volumes::load_or_seed(),
             expanded: HashSet::new(),
             children: HashMap::new(),
             mtp_names: HashMap::new(),
@@ -293,6 +477,8 @@ impl Ply {
             status: None,
             list_generation: 0,
             list_task: None,
+            props_generation: 0,
+            props_walk_cancel: Arc::new(AtomicBool::new(false)),
             watch: None,
             focus: cx.focus_handle(),
             thumbs: cx.new(|_| crate::thumbs::ThumbCache::new()),
@@ -308,6 +494,10 @@ impl Ply {
         ply.start_watch_poll(cx);
         ply.start_volume_poll(cx);
         ply.start_lnk_refresh(cx);
+        // `gpui_component::init` (main.rs) pins the library theme to Light;
+        // push Ply's opening mode into it so filter/rename inputs paint a
+        // matching caret and selection from the first frame.
+        sync_library_theme(ply.mode, cx);
         cx.spawn(async move |_, cx| {
             cx.background_spawn(async move { crate::thumbs::warm_shell() })
                 .await;
@@ -375,6 +565,7 @@ impl Ply {
 
     pub fn toggle_mode(&mut self, cx: &mut Context<Self>) {
         self.mode = self.mode.toggled();
+        sync_library_theme(self.mode, cx);
         cx.notify();
     }
 
@@ -492,14 +683,54 @@ impl StormGate {
     }
 }
 
-/// Escape closes whatever is on top, innermost first.
+/// Library theme mode matching Ply's [`Mode`]. Pure, so tests cover the
+/// mapping without a GPUI context.
+pub fn library_theme_mode(mode: Mode) -> gpui_component::ThemeMode {
+    match mode {
+        Mode::Light => gpui_component::ThemeMode::Light,
+        Mode::Dark => gpui_component::ThemeMode::Dark,
+    }
+}
+
+/// Caret and selection colours the library theme should use for [`Mode`]:
+/// caret tracks the Ply foreground, selection tracks `select_strong`. Pure,
+/// so tests cover both modes without a GPUI context.
+pub fn library_caret_selection(mode: Mode) -> (gpui::Hsla, gpui::Hsla) {
+    let palette = mode.palette();
+    (palette.foreground, palette.select_strong)
+}
+
+/// Push Ply's [`Mode`] into the `gpui_component` library theme. The library
+/// `Input` paints its caret and selection from `cx.theme().caret` /
+/// `cx.theme().selection` (see `crates/ui/src/input/input.rs` in the pinned
+/// source, keys `caret` and `selection.background` in `default-theme.json`),
+/// and `gpui_component::init` pins those to Light. So every Ply mode change
+/// re-applies the library mode via [`gpui_component::Theme::change`] and then
+/// overrides caret/selection from the Ply palette. Callers: [`Ply::new`]
+/// (init) and [`Ply::toggle_mode`].
+pub fn sync_library_theme(mode: Mode, cx: &mut gpui::App) {
+    gpui_component::Theme::change(library_theme_mode(mode), None, cx);
+    let (caret, selection) = library_caret_selection(mode);
+    let theme = gpui_component::Theme::global_mut(cx);
+    theme.caret = caret;
+    theme.selection = selection;
+    theme.tokens.caret = caret.into();
+    theme.tokens.selection = selection.into();
+}
+
+/// Escape closes whatever is on top, innermost first. A menu flyout closes
+/// before the menu itself.
 pub fn dismiss_topmost(ply: &mut Ply, cx: &mut Context<Ply>) {
     if ply.confirm.is_some() {
         ply.cancel_confirm(cx);
     } else if ply.properties.is_some() {
         ply.close_properties(cx);
     } else if ply.menu.is_some() {
-        ply.close_menu(cx);
+        if ply.menu.as_ref().is_some_and(|menu| menu.flyout.is_some()) {
+            ply.set_flyout(None, cx);
+        } else {
+            ply.close_menu(cx);
+        }
     } else if ply.rename.is_some() {
         ply.cancel_rename(cx);
     } else {
@@ -654,5 +885,103 @@ mod tests {
         assert!(g.update(200, 1));
         assert!(g.update(400, 1), "sustained fling stays gated");
         assert!(g.update(600, 1));
+    }
+
+    fn menu_item(label: &str, enabled: bool) -> super::MenuRow {
+        super::MenuItem {
+            enabled,
+            ..super::MenuItem::new(label, None, None)
+        }
+        .into()
+    }
+
+    fn menu_with(rows: Vec<super::MenuRow>) -> super::Menu {
+        super::Menu {
+            at: gpui::Point::new(gpui::px(0.), gpui::px(0.)),
+            rows,
+            flyout: None,
+            selected: None,
+        }
+    }
+
+    #[test]
+    fn menu_item_shortcut_defaults_none_and_builder_sets() {
+        let plain = super::MenuItem::new("Open", None, None);
+        assert!(plain.shortcut.is_none());
+        let with = super::MenuItem::new("Delete", None, None).with_shortcut("Del");
+        assert_eq!(with.shortcut, Some(gpui::SharedString::from("Del")));
+    }
+
+    #[test]
+    fn menu_item_glyph_defaults_none_and_builder_sets() {
+        let plain = super::MenuItem::new("Open", None, None);
+        assert!(plain.glyph.is_none());
+        let with = super::MenuItem::new("View", None, None).with_glyph('\u{E890}');
+        assert_eq!(with.glyph, Some('\u{E890}'));
+    }
+
+    #[test]
+    fn menu_move_selection_skips_separators_and_disabled_and_wraps() {
+        let mut menu = menu_with(vec![
+            menu_item("Open", true),
+            super::MenuRow::Separator,
+            menu_item("Gone", false),
+            menu_item("Properties", true),
+        ]);
+        assert!(menu.selected.is_none());
+        menu.move_selection(1);
+        assert_eq!(menu.selected, Some(0));
+        menu.move_selection(1);
+        assert_eq!(menu.selected, Some(3), "must skip separator + disabled");
+        menu.move_selection(1);
+        assert_eq!(menu.selected, Some(0), "must wrap past the end");
+        menu.move_selection(-1);
+        assert_eq!(menu.selected, Some(3), "must wrap past the start");
+        menu.move_selection(-1);
+        assert_eq!(menu.selected, Some(0), "backwards must skip too");
+    }
+
+    #[test]
+    fn menu_move_selection_clears_when_nothing_is_selectable() {
+        let mut empty = menu_with(Vec::new());
+        empty.move_selection(1);
+        assert!(empty.selected.is_none());
+        let mut all_off = menu_with(vec![super::MenuRow::Separator, menu_item("Gone", false)]);
+        all_off.move_selection(1);
+        assert!(all_off.selected.is_none());
+        // A stale index past a rebuilt shorter menu restarts cleanly.
+        let mut stale = menu_with(vec![menu_item("Only", true)]);
+        stale.selected = Some(7);
+        stale.move_selection(1);
+        assert_eq!(stale.selected, Some(0));
+    }
+
+    #[test]
+    fn library_theme_mode_follows_ply_mode() {
+        assert_eq!(
+            super::library_theme_mode(crate::theme::Mode::Light),
+            gpui_component::ThemeMode::Light
+        );
+        assert_eq!(
+            super::library_theme_mode(crate::theme::Mode::Dark),
+            gpui_component::ThemeMode::Dark
+        );
+    }
+
+    #[test]
+    fn library_caret_selection_tracks_palette_in_both_modes() {
+        for mode in [crate::theme::Mode::Light, crate::theme::Mode::Dark] {
+            let palette = mode.palette();
+            assert_eq!(
+                super::library_caret_selection(mode),
+                (palette.foreground, palette.select_strong),
+                "caret must equal foreground and selection must equal select_strong in {mode:?}"
+            );
+        }
+        // The sync must actually flip something, or toggling would be a no-op.
+        assert_ne!(
+            super::library_caret_selection(crate::theme::Mode::Light),
+            super::library_caret_selection(crate::theme::Mode::Dark)
+        );
     }
 }

@@ -15,7 +15,7 @@ mod ui;
 mod volumes;
 mod watch;
 
-use gpui::{AppContext, KeyBinding, WindowBounds, WindowOptions, point, px, size};
+use gpui::{AppContext, KeyBinding, WindowBounds, WindowOptions, actions, point, px, size};
 
 use app::Ply;
 use ui::{
@@ -23,6 +23,13 @@ use ui::{
     ExtendRight, ExtendUp, FocusFilter, GoBack, GoForward, GoHome, GoUp, Refresh, SelectDown,
     SelectLeft, SelectRight, SelectUp, ToggleTheme,
 };
+
+// Context-menu keyboard actions, driven by the overlay's selection model
+// (`Menu.selected` / `Menu::move_selection`). Root handlers live in `ui`:
+// each fires only while a menu is open and focus is not typing, and the
+// listing actions below stand down while a menu is open so keys never act
+// twice.
+actions!(ply, [MenuUp, MenuDown, MenuLeft, MenuRight, MenuActivate,]);
 
 fn main() {
     gpui_platform::application()
@@ -56,6 +63,11 @@ fn main() {
                 KeyBinding::new("f5", Refresh, Some("Ply")),
                 KeyBinding::new("ctrl-f", FocusFilter, Some("Ply")),
                 KeyBinding::new("ctrl-c", CopySelectedPath, Some("Ply")),
+                KeyBinding::new("up", MenuUp, Some("Ply")),
+                KeyBinding::new("down", MenuDown, Some("Ply")),
+                KeyBinding::new("left", MenuLeft, Some("Ply")),
+                KeyBinding::new("right", MenuRight, Some("Ply")),
+                KeyBinding::new("enter", MenuActivate, Some("Ply")),
             ]);
 
             cx.open_window(

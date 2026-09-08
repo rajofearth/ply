@@ -37,6 +37,9 @@ pub struct Palette {
     pub card: Hsla,
     pub muted: Hsla,
     pub muted_foreground: Hsla,
+    /// Retained shadcn slot; active rows use `select_strong` so active never
+    /// equals the `muted` hover fill in either mode.
+    #[allow(dead_code)]
     pub accent: Hsla,
     pub border: Hsla,
     pub destructive: Hsla,

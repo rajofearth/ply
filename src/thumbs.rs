@@ -128,12 +128,88 @@ fn mtime_nanos(t: Option<SystemTime>) -> u64 {
     .unwrap_or(0)
 }
 
-/// A fixed, environment-independent shell icon shared across all folders or
-/// entries that resolve to it. The UI never distinguishes the variants (e.g.
-/// an empty vs full Recycle Bin); the worker decides which artwork to use.
+/// A fixed, environment-independent shell icon. Each variant maps to one
+/// `SIID_*` stock id (see `backend::stock_siid`); only `RecycleBin` keeps an
+/// empty/full branch, decided worker-side by scanning the bins.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum StockIcon {
     RecycleBin,
+    Shield,
+    Info,
+    Delete,
+    FolderOpen,
+    MixedFiles,
+    Folder,
+}
+
+/// Raw `GetFileAttributesW` bits, repeated here (instead of the `windows`
+/// constants) so this stays unit-testable off Windows.
+const ATTR_READONLY: u32 = 0x1;
+const ATTR_HIDDEN: u32 = 0x2;
+const ATTR_SYSTEM: u32 = 0x4;
+const ATTR_DIRECTORY: u32 = 0x10;
+const ATTR_ARCHIVE: u32 = 0x20;
+const ATTR_REPARSE: u32 = 0x400;
+const ATTR_COMPRESSED: u32 = 0x800;
+const ATTR_ENCRYPTED: u32 = 0x4000;
+
+/// The Properties "Attributes" row from raw `GetFileAttributesW` bits. Pure
+/// so it is unit-testable off Windows.
+pub(crate) fn format_attributes(attrs: u32) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if attrs & ATTR_READONLY != 0 {
+        parts.push("Read-only");
+    }
+    if attrs & ATTR_HIDDEN != 0 {
+        parts.push("Hidden");
+    }
+    if attrs & ATTR_SYSTEM != 0 {
+        parts.push("System");
+    }
+    if attrs & ATTR_ARCHIVE != 0 {
+        parts.push("Archive");
+    }
+    if attrs & ATTR_COMPRESSED != 0 {
+        parts.push("Compressed");
+    }
+    if attrs & ATTR_ENCRYPTED != 0 {
+        parts.push("Encrypted");
+    }
+    if attrs & ATTR_REPARSE != 0 {
+        parts.push("Link");
+    }
+    if attrs & ATTR_DIRECTORY != 0 {
+        parts.push("Directory");
+    }
+    if parts.is_empty() {
+        "Normal".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// Round a byte count up to whole clusters for the "Size on disk" row. Pure.
+/// A zero cluster size means the geometry is unknown and returns `size`.
+pub(crate) fn round_to_cluster(size: u64, cluster: u64) -> u64 {
+    if cluster == 0 {
+        return size;
+    }
+    let clusters = size.div_ceil(cluster);
+    clusters.saturating_mul(cluster)
+}
+
+/// Format a `PKEY_Media_Duration` value (100ns units, as the property store
+/// renders it) as `m:ss` or `h:mm:ss`. Anything unparsable passes through raw.
+pub(crate) fn format_duration_100ns(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Ok(v) = trimmed.parse::<u64>() {
+        let secs = v / 10_000_000;
+        if secs >= 3600 {
+            return format!("{}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60);
+        }
+        return format!("{}:{:02}", secs / 60, secs % 60);
+    }
+    raw.to_string()
 }
 
 /// Per-window cache of decoded rasters, kept inside [`Ply`] so it is dropped
@@ -1143,14 +1219,16 @@ pub(crate) fn path_icon_probe(
 
 /// Probe the Recycle Bin stock icon for the sidebar row.
 pub(crate) fn recycle_bin_probe(ply: &Ply, cx: &mut Context<Ply>) -> IconProbe {
-    if let Some(img) = recycle_bin_icon(ply, cx) {
+    stock_probe(ply, cx, StockIcon::RecycleBin)
+}
+
+/// Probe any fixed stock icon for menu rows. Ready paints the shell raster,
+/// Loading holds a blank slot, Glyph settles on the lucide fallback.
+pub(crate) fn stock_probe(ply: &Ply, cx: &mut Context<Ply>, stock: StockIcon) -> IconProbe {
+    if let Some(img) = stock_icon(ply, cx, stock) {
         return IconProbe::Ready(img);
     }
-    if ply
-        .thumb_cache()
-        .read(cx)
-        .stock_is_inflight(StockIcon::RecycleBin)
-    {
+    if ply.thumb_cache().read(cx).stock_is_inflight(stock) {
         IconProbe::Loading
     } else {
         IconProbe::Glyph
@@ -1255,17 +1333,26 @@ mod backend {
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{IconTarget, IndexedPixels, ListingIcons};
+    use super::{
+        ATTR_DIRECTORY, IconTarget, IndexedPixels, ListingIcons, StockIcon, format_attributes,
+        format_duration_100ns, round_to_cluster,
+    };
 
-    use windows::Win32::Foundation::{FILETIME, SIZE};
+    use windows::Win32::Foundation::{FILETIME, GetLastError, PROPERTYKEY, SIZE};
     use windows::Win32::Graphics::Gdi::{
         BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC,
         DeleteObject, GetDIBits, GetObjectW, HBITMAP, HGDIOBJ, SelectObject,
     };
     use windows::Win32::Storage::EnhancedStorage::{
-        PKEY_Author, PKEY_Comment, PKEY_DateCreated, PKEY_Image_Dimensions, PKEY_Title,
+        PKEY_Author, PKEY_Comment, PKEY_DateAccessed, PKEY_DateCreated, PKEY_Document_PageCount,
+        PKEY_Image_BitDepth, PKEY_Image_Dimensions, PKEY_Image_HorizontalSize,
+        PKEY_Image_VerticalSize, PKEY_Media_Duration, PKEY_Photo_DateTaken, PKEY_Subject,
+        PKEY_Title, PKEY_Video_FrameHeight, PKEY_Video_FrameWidth,
     };
-    use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
+    use windows::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_NORMAL, GetCompressedFileSizeW, GetDiskFreeSpaceW, GetFileAttributesW,
+        INVALID_FILE_ATTRIBUTES, INVALID_SET_FILE_POINTER,
+    };
     use windows::Win32::System::Com::{
         COINIT_APARTMENTTHREADED, CoInitializeEx,
         StructuredStorage::{PROPVARIANT, PropVariantToFileTime, PropVariantToString},
@@ -1276,8 +1363,9 @@ mod backend {
     use windows::Win32::UI::Shell::{
         IShellItem2, IShellItemImageFactory, SHCreateItemFromParsingName, SHFILEINFOW, SHGFI_FLAGS,
         SHGFI_ICONLOCATION, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES, SHGSI_ICON,
-        SHGetFileInfoW, SHGetImageList, SHGetStockIconInfo, SHIL_EXTRALARGE, SHSTOCKICONINFO,
-        SIID_RECYCLER, SIID_RECYCLERFULL, SIIGBF,
+        SHGetFileInfoW, SHGetImageList, SHGetStockIconInfo, SHIL_EXTRALARGE, SHSTOCKICONID,
+        SHSTOCKICONINFO, SIID_DELETE, SIID_FOLDER, SIID_FOLDEROPEN, SIID_INFO, SIID_MIXEDFILES,
+        SIID_RECYCLER, SIID_RECYCLERFULL, SIID_SHIELD, SIIGBF,
     };
     use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, ICONINFO};
     use windows::core::PCWSTR;
@@ -1327,8 +1415,11 @@ mod backend {
             path: PathBuf,
             reply: Sender<Option<IndexedPixels>>,
         },
-        /// Resolve a fixed stock icon (Recycle Bin for now).
-        ResolveStockIcon { reply: Sender<Option<ThumbPixels>> },
+        /// Resolve a fixed stock icon (`SIID_*` artwork).
+        ResolveStockIcon {
+            stock: StockIcon,
+            reply: Sender<Option<ThumbPixels>>,
+        },
         /// Resolve the type icons for a whole listing up front: real-path
         /// icons (folders/executables) plus one class index per extension, all
         /// in a single round trip, decoding each distinct index once.
@@ -1369,8 +1460,8 @@ mod backend {
                     ShellJob::ResolvePathIcon { path, reply } => {
                         let _ = reply.send(path_icon_pixels(&path, &mut index_cache));
                     }
-                    ShellJob::ResolveStockIcon { reply } => {
-                        let _ = reply.send(recycle_stock_pixels());
+                    ShellJob::ResolveStockIcon { stock, reply } => {
+                        let _ = reply.send(stock_pixels(stock));
                     }
                     ShellJob::ResolveListingTypeIcons { targets, reply } => {
                         let _ = reply.send(listing_type_icons(&targets, &mut index_cache));
@@ -1493,10 +1584,11 @@ mod backend {
         rx.recv().ok().flatten()
     }
 
-    /// Resolve a fixed stock icon (Recycle Bin), as `None` on any failure.
-    pub(super) fn request_stock_icon_pixels() -> Option<ThumbPixels> {
+    /// Resolve a fixed stock icon, as `None` on any failure so callers fall
+    /// back to the themed glyph.
+    pub(super) fn request_stock_icon_pixels(stock: StockIcon) -> Option<ThumbPixels> {
         let (tx, rx) = channel();
-        if !shell_dispatch(ShellJob::ResolveStockIcon { reply: tx }) {
+        if !shell_dispatch(ShellJob::ResolveStockIcon { stock, reply: tx }) {
             return None;
         }
         rx.recv().ok().flatten()
@@ -1514,7 +1606,11 @@ mod backend {
     }
 
     /// Dispatch a shell property read to the shell worker and block for the rows.
+    /// MTP paths never queue; the shell read would hang on them.
     pub(super) fn request_properties(path: &Path) -> Vec<(String, String)> {
+        if crate::mtp::is_mtp(path) {
+            return Vec::new();
+        }
         let (tx, rx) = channel();
         if !shell_dispatch(ShellJob::ReadProperties {
             path: path.to_path_buf(),
@@ -1526,48 +1622,232 @@ mod backend {
     }
 
     /// The shell reads themselves, run on the STA worker. Returns non-empty
-    /// `(label, value)` rows; callers guard out MTP/portable paths.
+    /// `(label, value)` rows; callers guard out MTP/portable paths (and
+    /// [`request_properties`] refuses to queue them). Filesystem facts (size
+    /// on disk, dates, attributes) resolve even when the property store
+    /// cannot be opened; the media allowlist needs the store. Sync and fast,
+    /// no hosting.
     fn read_properties_impl(path: &Path) -> Vec<(String, String)> {
+        let mut rows: Vec<(String, String)> = Vec::new();
+        let now = chrono::Local::now();
+        let ext = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+
         let wide: Vec<u16> = path
             .as_os_str()
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
-        let item: IShellItem2 =
-            match unsafe { SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None) } {
-                Ok(i) => i,
-                Err(_) => return Vec::new(),
-            };
-        let store: IPropertyStore =
-            match unsafe { item.GetPropertyStore(GETPROPERTYSTOREFLAGS::default()) } {
-                Ok(s) => s,
-                Err(_) => return Vec::new(),
-            };
+        let store: Option<IPropertyStore> = (|| {
+            let item: IShellItem2 =
+                unsafe { SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None) }.ok()?;
+            unsafe { item.GetPropertyStore(GETPROPERTYSTOREFLAGS::default()) }.ok()
+        })();
 
-        let mut rows: Vec<(String, String)> = Vec::new();
         for (label, key) in [
             ("Author", &PKEY_Author),
             ("Title", &PKEY_Title),
             ("Comment", &PKEY_Comment),
             ("Dimensions", &PKEY_Image_Dimensions),
         ] {
-            if let Ok(pv) = unsafe { store.GetValue(key) } {
+            if let Some(store) = store.as_ref()
+                && let Ok(pv) = unsafe { store.GetValue(key) }
+            {
                 let s = pv_string(&pv);
                 if !s.is_empty() {
                     rows.push((label.to_string(), s));
                 }
             }
         }
-        if let Ok(pv) = unsafe { store.GetValue(&PKEY_DateCreated) }
+        let mut have_created = false;
+        if let Some(store) = store.as_ref()
+            && let Ok(pv) = unsafe { store.GetValue(&PKEY_DateCreated) }
             && let Ok(ft) = unsafe { PropVariantToFileTime(&pv, PSTIME_FLAGS(0)) }
             && let Some(st) = ft_to_systemtime(ft)
         {
             rows.push((
                 "Created".to_string(),
-                crate::listing::format_mtime(Some(st), chrono::Local::now()),
+                crate::listing::format_mtime(Some(st), now),
+            ));
+            have_created = true;
+        }
+
+        let attrs = unsafe { GetFileAttributesW(PCWSTR(wide.as_ptr())) };
+        let attrs_ok = attrs != INVALID_FILE_ATTRIBUTES;
+        let is_dir = attrs_ok && attrs & ATTR_DIRECTORY != 0;
+        if !is_dir && let Some(on_disk) = size_on_disk(path) {
+            rows.push((
+                "Size on disk".to_string(),
+                format!(
+                    "{} ({} bytes)",
+                    crate::listing::format_size(on_disk),
+                    on_disk
+                ),
             ));
         }
+
+        if !have_created
+            && let Ok(meta) = std::fs::metadata(path)
+            && let Ok(created) = meta.created()
+        {
+            rows.push((
+                "Created".to_string(),
+                crate::listing::format_mtime(Some(created), now),
+            ));
+        }
+        let mut have_accessed = false;
+        if let Some(store) = store.as_ref()
+            && let Ok(pv) = unsafe { store.GetValue(&PKEY_DateAccessed) }
+            && let Ok(ft) = unsafe { PropVariantToFileTime(&pv, PSTIME_FLAGS(0)) }
+            && let Some(st) = ft_to_systemtime(ft)
+        {
+            rows.push((
+                "Accessed".to_string(),
+                crate::listing::format_mtime(Some(st), now),
+            ));
+            have_accessed = true;
+        }
+        if !have_accessed
+            && let Ok(meta) = std::fs::metadata(path)
+            && let Ok(accessed) = meta.accessed()
+        {
+            rows.push((
+                "Accessed".to_string(),
+                crate::listing::format_mtime(Some(accessed), now),
+            ));
+        }
+
+        if attrs_ok {
+            rows.push(("Attributes".to_string(), format_attributes(attrs)));
+        }
+
+        if let Some(store) = store.as_ref() {
+            let is_image = matches!(
+                ext.as_str(),
+                "jpg"
+                    | "jpeg"
+                    | "png"
+                    | "gif"
+                    | "bmp"
+                    | "tif"
+                    | "tiff"
+                    | "webp"
+                    | "heic"
+                    | "heif"
+                    | "ico"
+                    | "dng"
+                    | "cr2"
+                    | "nef"
+                    | "arw"
+            );
+            let is_audio = matches!(
+                ext.as_str(),
+                "mp3" | "wav" | "flac" | "m4a" | "aac" | "ogg" | "opus" | "wma"
+            );
+            let is_video = matches!(
+                ext.as_str(),
+                "mp4" | "mkv" | "avi" | "mov" | "wmv" | "webm" | "m4v" | "mpg" | "mpeg"
+            );
+            let is_doc = matches!(
+                ext.as_str(),
+                "pdf"
+                    | "doc"
+                    | "docx"
+                    | "xls"
+                    | "xlsx"
+                    | "ppt"
+                    | "pptx"
+                    | "txt"
+                    | "rtf"
+                    | "odt"
+                    | "md"
+            );
+            // (label, key, enabled for this file, duration-formatted value).
+            let allowlist: Vec<(&str, &PROPERTYKEY, bool, bool)> = vec![
+                ("Width", &PKEY_Image_HorizontalSize, is_image, false),
+                ("Height", &PKEY_Image_VerticalSize, is_image, false),
+                ("Bit depth", &PKEY_Image_BitDepth, is_image, false),
+                ("Date taken", &PKEY_Photo_DateTaken, is_image, false),
+                ("Length", &PKEY_Media_Duration, is_audio || is_video, true),
+                ("Frame width", &PKEY_Video_FrameWidth, is_video, false),
+                ("Frame height", &PKEY_Video_FrameHeight, is_video, false),
+                ("Pages", &PKEY_Document_PageCount, is_doc, false),
+                ("Subject", &PKEY_Subject, is_doc || is_image, false),
+            ];
+            for (label, key, enabled, is_duration) in allowlist {
+                if !enabled {
+                    continue;
+                }
+                if let Ok(pv) = unsafe { store.GetValue(key) } {
+                    let mut s = pv_string(&pv);
+                    if s.is_empty() {
+                        continue;
+                    }
+                    if is_duration {
+                        s = format_duration_100ns(&s);
+                    }
+                    rows.push((label.to_string(), s));
+                }
+            }
+        }
         rows
+    }
+
+    /// Explorer's "Size on disk": the compressed size rounded up to whole
+    /// clusters. `None` when the size cannot be read. Falls back to the raw
+    /// size when the volume geometry is unavailable.
+    fn size_on_disk(path: &Path) -> Option<u64> {
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut high: u32 = 0;
+        let low =
+            unsafe { GetCompressedFileSizeW(PCWSTR(wide.as_ptr()), Some(&mut high as *mut u32)) };
+        let size: u64 = if low == INVALID_SET_FILE_POINTER {
+            // 0xFFFFFFFF is also a valid low half; only a real error fails.
+            if unsafe { GetLastError() }.is_err() {
+                return None;
+            }
+            ((high as u64) << 32) | low as u64
+        } else {
+            ((high as u64) << 32) | low as u64
+        };
+        Some(round_to_cluster(
+            size,
+            volume_cluster_bytes(path).unwrap_or(0),
+        ))
+    }
+
+    /// Bytes per cluster for the volume holding `path`, via the root's
+    /// `GetDiskFreeSpaceW`. `None` when the root cannot be read.
+    fn volume_cluster_bytes(path: &Path) -> Option<u64> {
+        let root = path.ancestors().last()?;
+        let wide: Vec<u16> = root
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut sectors: u32 = 0;
+        let mut bytes: u32 = 0;
+        if unsafe {
+            GetDiskFreeSpaceW(
+                PCWSTR(wide.as_ptr()),
+                Some(&mut sectors as *mut u32),
+                Some(&mut bytes as *mut u32),
+                None,
+                None,
+            )
+        }
+        .is_err()
+        {
+            return None;
+        }
+        let cluster = (sectors as u64).checked_mul(bytes as u64)?;
+        if cluster == 0 { None } else { Some(cluster) }
     }
 
     /// A `PROPVARIANT` as a plain string (strings and most scalar types), or
@@ -1756,13 +2036,35 @@ mod backend {
         Some((index, bytes.as_ref().clone(), w, h))
     }
 
-    /// The stock Recycle Bin icon. Which artwork (empty vs full) is decided by
-    /// scanning whether the bin holds anything; the caller never cares.
-    fn recycle_stock_pixels() -> Option<ThumbPixels> {
-        let id = if recycle_bin_has_items() {
-            SIID_RECYCLERFULL
-        } else {
-            SIID_RECYCLER
+    /// A [`StockIcon`] as its `SIID_*` id. Only `RecycleBin` keeps an
+    /// empty/full branch (resolved in [`stock_pixels`]); every other variant
+    /// is one fixed id.
+    fn stock_siid(stock: StockIcon) -> SHSTOCKICONID {
+        match stock {
+            StockIcon::RecycleBin => SIID_RECYCLER,
+            StockIcon::Shield => SIID_SHIELD,
+            StockIcon::Info => SIID_INFO,
+            StockIcon::Delete => SIID_DELETE,
+            StockIcon::FolderOpen => SIID_FOLDEROPEN,
+            StockIcon::MixedFiles => SIID_MIXEDFILES,
+            StockIcon::Folder => SIID_FOLDER,
+        }
+    }
+
+    /// The stock icon for a [`StockIcon`], via `SHGetStockIconInfo` with
+    /// `SHGSI_ICON` on this STA worker. Which bin artwork (empty vs full) is
+    /// decided by scanning whether the bin holds anything; the caller never
+    /// cares.
+    fn stock_pixels(stock: StockIcon) -> Option<ThumbPixels> {
+        let id = match stock {
+            StockIcon::RecycleBin => {
+                if recycle_bin_has_items() {
+                    SIID_RECYCLERFULL
+                } else {
+                    SIID_RECYCLER
+                }
+            }
+            other => stock_siid(other),
         };
         let mut info: SHSTOCKICONINFO = unsafe { std::mem::zeroed() };
         info.cbSize = std::mem::size_of::<SHSTOCKICONINFO>() as u32;
@@ -2004,7 +2306,7 @@ fn request_path_icon_pixels(_path: PathBuf) -> Option<IndexedPixels> {
 }
 
 #[cfg(not(windows))]
-fn request_stock_icon_pixels() -> Option<(Vec<u8>, u32, u32)> {
+fn request_stock_icon_pixels(_stock: StockIcon) -> Option<(Vec<u8>, u32, u32)> {
     None
 }
 
@@ -2168,10 +2470,10 @@ pub fn folder_icon(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) -> Option<Ar
     path_icon(ply, &entry.path, mtime_nanos(entry.modified), cx, false)
 }
 
-/// The stock Recycle Bin icon, cached in the small per-cache stock map. Whether
-/// it shows empty or full is decided in the worker; the UI never cares.
-pub fn recycle_bin_icon(ply: &Ply, cx: &mut Context<Ply>) -> Option<Arc<RenderImage>> {
-    let stock = StockIcon::RecycleBin;
+/// A fixed stock icon (Shield, Folder, Info, ...) cached in the small
+/// per-cache stock map. Menu rows use the evictable sharing path for free:
+/// one raster per stock id, decoded once on the STA worker.
+pub fn stock_icon(ply: &Ply, cx: &mut Context<Ply>, stock: StockIcon) -> Option<Arc<RenderImage>> {
     let cache_entity = ply.thumb_cache();
     let (cached, inflight, failed) = {
         let c = cache_entity.read(cx);
@@ -2194,7 +2496,7 @@ pub fn recycle_bin_icon(ply: &Ply, cx: &mut Context<Ply>) -> Option<Arc<RenderIm
             .background_spawn(async move {
                 #[cfg(windows)]
                 {
-                    backend::request_stock_icon_pixels()
+                    backend::request_stock_icon_pixels(stock)
                 }
                 #[cfg(not(windows))]
                 {
@@ -2400,8 +2702,109 @@ mod tests {
         }
         let cls = super::backend::request_class_icon("zip".into());
         assert!(cls.is_some(), "class icon must decode for .zip");
-        let stock = super::backend::request_stock_icon_pixels();
-        assert!(stock.is_some(), "stock recycle-bin icon must decode");
+        for stock in [
+            StockIcon::RecycleBin,
+            StockIcon::Shield,
+            StockIcon::Info,
+            StockIcon::Delete,
+            StockIcon::FolderOpen,
+            StockIcon::MixedFiles,
+            StockIcon::Folder,
+        ] {
+            let pixels = super::backend::request_stock_icon_pixels(stock);
+            assert!(pixels.is_some(), "stock icon {stock:?} must decode");
+        }
+        // The icon paths the menu rows reuse resolve directly: path, class
+        // and stock sources each decode through their own request helper.
+        let dir = std::env::temp_dir();
+        let direct_path = super::backend::request_path_icon_pixels(dir);
+        assert!(direct_path.is_some(), "menu path icon must decode");
+        let direct_class = super::backend::request_class_icon("zip".into());
+        assert!(direct_class.is_some(), "menu class icon must decode");
+        let direct_stock = super::backend::request_stock_icon_pixels(StockIcon::Info);
+        assert!(direct_stock.is_some(), "menu stock icon must decode");
+    }
+
+    #[test]
+    fn properties_mtp_never_queues() {
+        // MTP paths return empty rows without touching the shell worker, on
+        // every platform (the shell read would hang on them).
+        let mtp = PathBuf::from(r"\\MTP\dev123\obj456");
+        assert!(crate::mtp::is_mtp(&mtp));
+        assert!(super::read_properties(&mtp).is_empty());
+        #[cfg(windows)]
+        assert!(super::backend::request_properties(&mtp).is_empty());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn properties_omits_type_row() {
+        // The base row owns Type via kind_label; details must not push a
+        // second one.
+        let path = std::env::temp_dir().join(format!(
+            "ply_no_type_{}.txt",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&path, "type row check").unwrap();
+        let rows = super::read_properties(&path);
+        assert!(
+            rows.iter().all(|(label, _)| label != "Type"),
+            "details must not contain a Type row, got {rows:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn stock_icon_covers_menu_needs() {
+        let all = [
+            StockIcon::RecycleBin,
+            StockIcon::Shield,
+            StockIcon::Info,
+            StockIcon::Delete,
+            StockIcon::FolderOpen,
+            StockIcon::MixedFiles,
+            StockIcon::Folder,
+        ];
+        assert_eq!(all.len(), 7, "menu stock set must stay at seven");
+    }
+
+    #[test]
+    fn attributes_string_maps_bits() {
+        assert_eq!(format_attributes(0), "Normal");
+        assert_eq!(format_attributes(128), "Normal", "plain file reads Normal");
+        assert_eq!(format_attributes(0x1 | 0x2), "Read-only, Hidden");
+        assert_eq!(
+            format_attributes(0x10 | 0x2),
+            "Hidden, Directory",
+            "system/hidden dirs stay readable"
+        );
+        assert_eq!(
+            format_attributes(0x1 | 0x2 | 0x4 | 0x20 | 0x800 | 0x4000 | 0x400 | 0x10),
+            "Read-only, Hidden, System, Archive, Compressed, Encrypted, Link, Directory"
+        );
+    }
+
+    #[test]
+    fn size_on_disk_rounds_to_clusters() {
+        assert_eq!(round_to_cluster(0, 4096), 0);
+        assert_eq!(round_to_cluster(1, 4096), 4096);
+        assert_eq!(round_to_cluster(4096, 4096), 4096);
+        assert_eq!(round_to_cluster(4097, 4096), 8192);
+        assert_eq!(
+            round_to_cluster(123, 0),
+            123,
+            "unknown geometry passes through"
+        );
+    }
+
+    #[test]
+    fn media_duration_formats_like_explorer() {
+        assert_eq!(format_duration_100ns("600000000"), "1:00");
+        assert_eq!(format_duration_100ns("36610000000"), "1:01:01");
+        assert_eq!(format_duration_100ns("not-a-number"), "not-a-number");
     }
 
     #[test]

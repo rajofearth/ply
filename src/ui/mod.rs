@@ -7,17 +7,20 @@ mod sidebar;
 mod status;
 mod titlebar;
 
+pub(crate) use status::filter_placeholder;
+
 use std::sync::Arc;
 
 use gpui::{
-    Hsla, InteractiveElement, IntoElement, ObjectFit, ParentElement, Pixels, Render, RenderImage,
-    StatefulInteractiveElement, Styled, StyledImage, Svg, Window, actions, div, img,
-    prelude::FluentBuilder, px, svg,
+    Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, Hsla, InteractiveElement,
+    IntoElement, ObjectFit, ParentElement, Pixels, Render, RenderImage, StatefulInteractiveElement,
+    Styled, StyledImage, Svg, Window, actions, div, img, prelude::FluentBuilder, px, svg,
 };
 
-use crate::app::{Location, Ply, ViewMode, dismiss_topmost};
+use crate::app::{Location, MenuRow, Ply, ViewMode, dismiss_topmost};
 use crate::icons::Ico;
 use crate::theme;
+use crate::{MenuActivate, MenuDown, MenuLeft, MenuRight, MenuUp};
 
 actions!(
     ply,
@@ -61,6 +64,32 @@ pub fn icon(ico: Ico, size: Pixels, color: Hsla) -> Svg {
         .size(size)
         .flex_none()
         .text_color(color)
+}
+
+/// A Segoe Fluent Icons codepoint at the given px size, tinted like lucide.
+/// Font chain is Fluent -> MDL2 (Win10) -> UI Symbol; off Windows the chain
+/// simply misses and the caller keeps its lucide fallback, so this never
+/// replaces the lucide path, only supplements it where `MenuItem.glyph` lands.
+pub(crate) fn glyph_icon(codepoint: char, size: f32, color: Hsla) -> impl IntoElement {
+    div()
+        .flex_none()
+        .size(px(size))
+        .flex()
+        .items_center()
+        .justify_center()
+        .font(Font {
+            family: "Segoe Fluent Icons".into(),
+            features: FontFeatures::default(),
+            fallbacks: Some(FontFallbacks::from_fonts(vec![
+                "Segoe MDL2 Assets".to_string(),
+                "Segoe UI Symbol".to_string(),
+            ])),
+            weight: FontWeight::default(),
+            style: FontStyle::default(),
+        })
+        .text_size(px(size))
+        .text_color(color)
+        .child(codepoint.to_string())
 }
 
 /// A cached raster (thumbnail, shell icon) as a fixed-size image element.
@@ -165,8 +194,81 @@ impl Render for Ply {
             .on_action(cx.listener(|this, _: &GoUp, window, cx| this.go_up(window, cx)))
             .on_action(cx.listener(|this, _: &GoHome, window, cx| this.go_home(window, cx)))
             .on_action(cx.listener(|this, _: &Dismiss, _, cx| dismiss_topmost(this, cx)))
+            .on_action(cx.listener(|this, _: &MenuUp, window, cx| {
+                if this.menu.is_none() || this.typing(window, cx) {
+                    return;
+                }
+                if let Some(menu) = this.menu.as_mut() {
+                    menu.move_selection(-1);
+                }
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &MenuDown, window, cx| {
+                if this.menu.is_none() || this.typing(window, cx) {
+                    return;
+                }
+                if let Some(menu) = this.menu.as_mut() {
+                    menu.move_selection(1);
+                }
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &MenuLeft, window, cx| {
+                if this.menu.is_none() || this.typing(window, cx) {
+                    return;
+                }
+                let flying = this.menu.as_ref().is_some_and(|m| m.flyout.is_some());
+                if flying {
+                    this.set_flyout(None, cx);
+                } else {
+                    dismiss_topmost(this, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &MenuRight, window, cx| {
+                if this.menu.is_none() || this.typing(window, cx) {
+                    return;
+                }
+                let open = this
+                    .menu
+                    .as_ref()
+                    .and_then(|m| m.selected)
+                    .and_then(|i| this.menu.as_ref().and_then(|m| m.rows.get(i)))
+                    .is_some_and(
+                        |row| matches!(row, MenuRow::Item(item) if !item.children.is_empty()),
+                    );
+                if open {
+                    let ix = this.menu.as_ref().and_then(|m| m.selected);
+                    this.set_flyout(ix, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &MenuActivate, window, cx| {
+                if this.menu.is_none() || this.typing(window, cx) {
+                    return;
+                }
+                let pick = this
+                    .menu
+                    .as_ref()
+                    .and_then(|m| m.selected)
+                    .and_then(|i| this.menu.as_ref().and_then(|m| m.rows.get(i)))
+                    .and_then(|row| match row {
+                        MenuRow::Item(item) => {
+                            Some((!item.children.is_empty(), item.action.clone()))
+                        }
+                        MenuRow::Separator => None,
+                    });
+                match pick {
+                    Some((true, _)) => {
+                        let ix = this.menu.as_ref().and_then(|m| m.selected);
+                        this.set_flyout(ix, cx);
+                    }
+                    Some((false, Some(action))) => this.run(action, window, cx),
+                    _ => {}
+                }
+            }))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.reload(cx)))
             .on_action(cx.listener(|this, _: &Activate, window, cx| {
+                if this.menu.is_some() {
+                    return;
+                }
                 if !this.typing(window, cx) {
                     this.activate_selection(window, cx);
                 }
@@ -182,6 +284,9 @@ impl Render for Ply {
                 }
             }))
             .on_action(cx.listener(|this, _: &SelectUp, window, cx| {
+                if this.menu.is_some() {
+                    return;
+                }
                 if !this.typing(window, cx) {
                     if this.view == ViewMode::Grid {
                         let cols = grid_cols(window);
@@ -192,6 +297,9 @@ impl Render for Ply {
                 }
             }))
             .on_action(cx.listener(|this, _: &SelectDown, window, cx| {
+                if this.menu.is_some() {
+                    return;
+                }
                 if !this.typing(window, cx) {
                     if this.view == ViewMode::Grid {
                         let cols = grid_cols(window);
@@ -202,12 +310,18 @@ impl Render for Ply {
                 }
             }))
             .on_action(cx.listener(|this, _: &SelectLeft, window, cx| {
+                if this.menu.is_some() {
+                    return;
+                }
                 if !this.typing(window, cx) && this.view == ViewMode::Grid {
                     let cols = grid_cols(window);
                     this.move_grid_selection(cols, -1, 0, false, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &SelectRight, window, cx| {
+                if this.menu.is_some() {
+                    return;
+                }
                 if !this.typing(window, cx) && this.view == ViewMode::Grid {
                     let cols = grid_cols(window);
                     this.move_grid_selection(cols, 1, 0, false, cx);
