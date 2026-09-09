@@ -37,8 +37,8 @@ gpui_platform = { opt-level = 3 }
 
 # Prefer a smaller release binary; GPUI still dominates size/RAM.
 [profile.release]
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 strip = true
-opt-level = "s"
+opt-level = "z"
 panic = "abort"

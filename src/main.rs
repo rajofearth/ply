@@ -3,6 +3,10 @@
 mod app;
 mod budget;
 mod cache;
+// Spike A (D2): hand-rolled field state. Not wired into the app yet, so this
+// is allow(dead_code) until the caller swap lands and real owners exist.
+#[allow(dead_code)]
+mod field;
 mod fs_ops;
 mod icons;
 mod listing;

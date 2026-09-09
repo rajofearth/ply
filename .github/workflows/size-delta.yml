@@ -1,0 +1,67 @@
+name: size-delta
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Warn-only except the hard ceiling. The hard 10 MiB gate lives in
+# src/budget.rs and fails below. This workflow makes growth visible
+# on every PR so slow creep gets caught like fx does with its 52 KiB
+# per-PR warning. No secrets, no release publish, CI only.
+jobs:
+  size:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Report size and gate
+        shell: pwsh
+        run: |
+          $exe = "target/release/ply.exe"
+          $bytes = (Get-Item $exe).Length
+          $mib = $bytes / 1MB
+          $ceil = 10 * 1MB
+          $headroom = $ceil - $bytes
+          "{0:N2} MiB ({1} bytes), headroom {2:N0} KiB" -f $mib, $bytes, ($headroom / 1KB) | Out-Host
+          "### Release size" >> $env:GITHUB_STEP_SUMMARY
+          ("- ply.exe: {0:N2} MiB ({1} bytes)" -f $mib, $bytes) >> $env:GITHUB_STEP_SUMMARY
+          ("- Ceiling: 10.00 MiB, headroom: {0:N0} KiB" -f ($headroom / 1KB)) >> $env:GITHUB_STEP_SUMMARY
+          "$bytes" | Out-File -FilePath size-bytes.txt -NoNewline
+          if ($bytes -gt $ceil) {
+            "::error::Release binary exceeds 10 MiB ceiling. See src/budget.rs." | Out-Host
+          } elseif ($headroom -lt (0.5 * 1MB)) {
+            "::warning::Headroom under 0.5 MiB. Any new dep likely trips the gate. Hand-roll or justify." | Out-Host
+          }
+          $env:PLY_BUDGET_REQUIRE_RELEASE = "1"
+          cargo test budgets_report -- --nocapture
+
+      - name: Upload size baseline
+        uses: actions/upload-artifact@v4
+        with:
+          name: size-bytes-${{ github.sha }}
+          path: size-bytes.txt
+          retention-days: 90
+
+  # Cheap cross-platform guard. Ply ships Windows first but must not
+  # rot elsewhere. Check-only, no release build, so macOS and Linux
+  # breakage shows up early while staying fast.
+  check-unix:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Check all targets compile
+        run: cargo check --all-targets
