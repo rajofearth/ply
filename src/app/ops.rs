@@ -6,10 +6,6 @@ use std::sync::{
 use std::time::{Duration, SystemTime};
 
 use gpui::{Context, Pixels, Point, SharedString, Window, prelude::*};
-// TEMP SHIM (spike B): old rename/filter state for the UI call sites spike C
-// repoints. `InputEvent` drives the legacy rename subscription below;
-// `InputState` builds the legacy rename input beside the new field.
-use gpui_component::input::{InputEvent, InputState};
 
 use crate::field::{FieldAction, FieldEvent, field_event_action, stem_select_range};
 
@@ -382,13 +378,21 @@ impl Ply {
         }
         self.placeholder_for = Some(count);
         let text = crate::ui::filter_placeholder(count);
-        self.filter.update(cx, |input, cx| {
-            input.set_placeholder(text.clone(), window, cx)
-        });
-        // Keep the new field's placeholder identical; spike C deletes the
-        // legacy update above. Same text, so no frame ever shows a mismatch.
         self.filter_field
             .update(cx, |field, cx| field.set_placeholder(text, window, cx));
+    }
+
+    /// Clear the filter from the clear button: silent field write plus the
+    /// same refilter contract the typing subscription owns.
+    pub fn clear_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.filter_field.update(cx, |field, cx| {
+            field.set_value("", window, cx);
+        });
+        self.filter_text.clear();
+        self.rebuild_visible();
+        self.clear_selection_paths();
+        self.anchor = None;
+        cx.notify();
     }
 
     pub fn total_in_folder(&self) -> usize {
@@ -782,47 +786,20 @@ impl Ply {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         // Explorer match: the stem is pre-selected so typing replaces the
-        // name but keeps the extension. Write the value first (both states
-        // move the caret to the end without emitting Change), then select
-        // the stem: a range set any earlier would not survive `set_value`.
+        // name but keeps the extension. Write the value first (the caret
+        // moves to the end without emitting Change), then select the stem:
+        // a range set any earlier would not survive `set_value`.
         let stem = stem_select_range(&name);
-        // TEMP SHIM: legacy input keeps ui/browser.rs painting until spike C.
-        // It takes focus today so typing lands in the visible element; the
-        // new field is initialised identically (value + stem) but left
-        // unfocused until C repoints the element, moves focus to it, and
-        // deletes the shim.
-        let input = cx.new(|cx| InputState::new(window, cx));
-        input.update(cx, |input, cx| {
-            input.focus(window, cx);
-            input.set_value(name.clone(), window, cx);
-            let base = input.base_state().clone();
-            base.update(cx, |base, cx| base.set_selected_range(stem.clone(), cx));
-        });
         let field = cx.new(|cx| crate::field::FieldState::new(window, cx));
         field.update(cx, |field, cx| {
+            field.focus(window, cx);
             field.set_value(name, window, cx);
             field.set_selected_range(stem, cx);
         });
         // Deferred so the edit (and this subscription) is not torn down from
         // inside its own callback. Enter commits; losing focus cancels, like
         // Explorer. Esc reaches `dismiss_topmost`, which cancels too.
-        let commit = cx.subscribe(&input, |_, _, event: &InputEvent, cx| {
-            let Some(action) = legacy_rename_action(event) else {
-                return;
-            };
-            let ply = cx.entity();
-            cx.defer(move |cx| {
-                ply.update(cx, |this, cx| match action {
-                    FieldAction::Commit => this.commit_rename(cx),
-                    FieldAction::Cancel => this.cancel_rename(cx),
-                });
-            });
-        });
-        // Future path: same deferred commit/cancel contract for the new
-        // field. Stored beside `_commit` so both die with the edit; silent
-        // in spike B (the field never holds focus) and live once C moves
-        // focus to it.
-        let field_commit = cx.subscribe(&field, |_, _, event: &FieldEvent, cx| {
+        let commit = cx.subscribe(&field, |_, _, event: &FieldEvent, cx| {
             let Some(action) = field_event_action(event) else {
                 return;
             };
@@ -836,10 +813,8 @@ impl Ply {
         });
         self.rename = Some(Rename {
             path,
-            input,
             field,
             _commit: commit,
-            _field_commit: field_commit,
         });
         cx.notify();
     }
@@ -848,11 +823,7 @@ impl Ply {
         let Some(rename) = self.rename.take() else {
             return;
         };
-        // TEMP SHIM: the visible UI still types into legacy `input`, so the
-        // commit reads it. Spike C switches this line to `field` when the
-        // element repoints (the field already carries the same initial value
-        // and stem selection).
-        let value = rename.input.read(cx).value().to_string();
+        let value = rename.field.read(cx).value().to_string();
         match fs_ops::rename(&rename.path, &value) {
             Ok(target) => {
                 self.replace_selection(vec![target]);
@@ -1283,17 +1254,6 @@ impl Ply {
         if self.properties.take().is_some() {
             cx.notify();
         }
-    }
-}
-
-/// TEMP SHIM (spike B): legacy `InputEvent` onto the commit/cancel contract
-/// [`field_event_action`] owns, so the old subscription and the new one agree
-/// while both are live. Deleted with the shim in spike C.
-fn legacy_rename_action(event: &InputEvent) -> Option<FieldAction> {
-    match event {
-        InputEvent::PressEnter { .. } => Some(FieldAction::Commit),
-        InputEvent::Blur => Some(FieldAction::Cancel),
-        _ => None,
     }
 }
 
@@ -2744,40 +2704,6 @@ mod tests {
                 MenuRow::Separator => true,
             }),
             "directories must not offer Open-with"
-        );
-    }
-
-    #[test]
-    fn rename_legacy_mapping_matches_field_contract() {
-        // TEMP SHIM parity: the legacy subscription maps `InputEvent` onto
-        // the same commit/cancel contract `field_event_action` owns. Deleted
-        // with the shim in spike C; `field.rs` owns the contract tests.
-        assert_eq!(
-            legacy_rename_action(&InputEvent::PressEnter {
-                secondary: false,
-                shift: false
-            }),
-            Some(FieldAction::Commit)
-        );
-        assert_eq!(
-            legacy_rename_action(&InputEvent::Blur),
-            Some(FieldAction::Cancel)
-        );
-        assert_eq!(legacy_rename_action(&InputEvent::Change), None);
-        assert_eq!(legacy_rename_action(&InputEvent::Focus), None);
-        assert_eq!(
-            legacy_rename_action(&InputEvent::PressEnter {
-                secondary: false,
-                shift: false
-            }),
-            field_event_action(&FieldEvent::PressEnter {
-                secondary: false,
-                shift: false
-            })
-        );
-        assert_eq!(
-            legacy_rename_action(&InputEvent::Blur),
-            field_event_action(&FieldEvent::Blur)
         );
     }
 

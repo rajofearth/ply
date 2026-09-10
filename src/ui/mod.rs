@@ -361,7 +361,8 @@ impl Render for Ply {
             }))
             .on_action(cx.listener(|this, _: &FocusFilter, window, cx| {
                 if !this.is_home() {
-                    this.filter.update(cx, |input, cx| input.focus(window, cx));
+                    this.filter_field
+                        .update(cx, |field, cx| field.focus(window, cx));
                 }
             }))
             .on_action(cx.listener(|this, _: &CopySelectedPath, window, cx| {

@@ -25,8 +25,11 @@
 use std::ops::Range;
 
 use gpui::{
-    App, Bounds, ClipboardItem, Context, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
-    Pixels, ShapedLine, SharedString, Subscription, UTF16Selection, Window, actions, point,
+    App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, Entity,
+    EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, InspectorElementId,
+    IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
+    Pixels, Point, Render, ShapedLine, SharedString, Style, Subscription, TextRun, UTF16Selection,
+    UnderlineStyle, Window, actions, div, fill, point, prelude::*, px, relative, rems, rgba, size,
 };
 
 /// Key context for the field. The swap spike binds keys under this context so
@@ -200,11 +203,7 @@ impl FieldText {
     /// selection, in that order. Collapses the selection to the end of the
     /// insert and clears the mark. The [`EntityInputHandler`] impl below calls
     /// this, then emits [`FieldEvent::Change`].
-    pub fn replace_text_in_range(
-        &mut self,
-        range_utf16: Option<Range<usize>>,
-        new_text: &str,
-    ) {
+    pub fn replace_text_in_range(&mut self, range_utf16: Option<Range<usize>>, new_text: &str) {
         let range = range_utf16
             .as_ref()
             .map(|range_utf16| self.range_from_utf16(range_utf16))
@@ -261,7 +260,8 @@ pub struct FieldState {
     pub placeholder: SharedString,
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
-    subscriptions: Vec<Subscription>,
+    is_selecting: bool,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl FieldState {
@@ -279,7 +279,8 @@ impl FieldState {
             placeholder: SharedString::default(),
             last_layout: None,
             last_bounds: None,
-            subscriptions: vec![on_focus, on_blur],
+            is_selecting: false,
+            _subscriptions: vec![on_focus, on_blur],
         }
     }
 
@@ -324,6 +325,8 @@ impl FieldState {
         self.focus_handle.is_focused(window)
     }
 
+    /// Library-parity getter; IME and callers read selection through here.
+    #[allow(dead_code)]
     pub fn selected_range(&self) -> Range<usize> {
         self.text.selected_range.clone()
     }
@@ -341,6 +344,8 @@ impl FieldState {
         cx.notify();
     }
 
+    /// Library-parity getter; IME reads the composition mark through here.
+    #[allow(dead_code)]
     pub fn marked_range(&self) -> Option<Range<usize>> {
         self.text.marked_range.clone()
     }
@@ -413,6 +418,52 @@ impl FieldState {
             shift: false,
         });
     }
+
+    fn index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
+        if self.text.content.is_empty() {
+            return 0;
+        }
+        let (Some(bounds), Some(line)) = (self.last_bounds.as_ref(), self.last_layout.as_ref())
+        else {
+            return 0;
+        };
+        if position.y < bounds.top() {
+            return 0;
+        }
+        if position.y > bounds.bottom() {
+            return self.text.content.len();
+        }
+        line.closest_index_for_x(position.x - bounds.left())
+    }
+
+    fn on_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus_handle, cx);
+        self.is_selecting = true;
+        let ix = self.index_for_mouse_position(event.position);
+        if event.modifiers.shift {
+            self.text.select_to(ix);
+        } else {
+            self.text.move_to(ix);
+        }
+        cx.notify();
+    }
+
+    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
+        self.is_selecting = false;
+    }
+
+    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.is_selecting {
+            let ix = self.index_for_mouse_position(event.position);
+            self.text.select_to(ix);
+            cx.notify();
+        }
+    }
 }
 
 impl EventEmitter<FieldEvent> for FieldState {}
@@ -420,6 +471,224 @@ impl EventEmitter<FieldEvent> for FieldState {}
 impl Focusable for FieldState {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+/// Paint half, modelled on the gpui input example: one shaped line, a caret
+/// when the selection is empty and focused, a selection quad otherwise. Text
+/// colour comes from the parent (`window.text_style`, which the call sites
+/// set from the Ply palette), so light and dark both read. Geometry matches
+/// the library `Input` it replaces: 12px text, 1.25 line height, 20px tall
+/// with 4px side padding and no extra chrome.
+impl Render for FieldState {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .w_full()
+            .h(px(20.))
+            .items_center()
+            .px(px(4.))
+            .key_context(FIELD_KEY_CONTEXT)
+            .track_focus(&self.focus_handle(cx))
+            .cursor(CursorStyle::IBeam)
+            .text_xs()
+            .line_height(rems(1.25))
+            .on_action(cx.listener(Self::backspace))
+            .on_action(cx.listener(Self::delete))
+            .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(Self::cut))
+            .on_action(cx.listener(Self::copy))
+            .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::confirm))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .child(FieldElement { input: cx.entity() })
+    }
+}
+
+struct FieldElement {
+    input: Entity<FieldState>,
+}
+
+struct FieldPrepaint {
+    line: Option<ShapedLine>,
+    cursor: Option<PaintQuad>,
+    selection: Option<PaintQuad>,
+}
+
+impl IntoElement for FieldElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for FieldElement {
+    type RequestLayoutState = ();
+    type PrepaintState = FieldPrepaint;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = Style::default();
+        style.size.width = relative(1.).into();
+        style.size.height = window.line_height().into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        let input = self.input.read(cx);
+        let content = input.text.content.clone();
+        let selected_range = input.text.selected_range.clone();
+        let cursor = input.text.cursor_offset();
+        let style = window.text_style();
+
+        let (display_text, text_color) = if content.is_empty() {
+            (input.placeholder.clone(), style.color.opacity(0.6))
+        } else {
+            (content, style.color)
+        };
+
+        let run = TextRun {
+            len: display_text.len(),
+            font: style.font(),
+            color: text_color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let runs = if let Some(marked_range) = input.text.marked_range.as_ref() {
+            vec![
+                TextRun {
+                    len: marked_range.start,
+                    ..run.clone()
+                },
+                TextRun {
+                    len: marked_range.end - marked_range.start,
+                    underline: Some(UnderlineStyle {
+                        color: Some(run.color),
+                        thickness: px(1.0),
+                        wavy: false,
+                    }),
+                    ..run.clone()
+                },
+                TextRun {
+                    len: display_text.len() - marked_range.end,
+                    ..run
+                },
+            ]
+            .into_iter()
+            .filter(|run| run.len > 0)
+            .collect()
+        } else {
+            vec![run]
+        };
+
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let line = window
+            .text_system()
+            .shape_line(display_text, font_size, &runs, None);
+
+        let cursor_pos = line.x_for_index(cursor);
+        let (selection, cursor) = if selected_range.is_empty() {
+            (
+                None,
+                Some(fill(
+                    Bounds::new(
+                        point(bounds.left() + cursor_pos, bounds.top()),
+                        size(px(2.), bounds.bottom() - bounds.top()),
+                    ),
+                    style.color,
+                )),
+            )
+        } else {
+            (
+                Some(fill(
+                    Bounds::from_corners(
+                        point(
+                            bounds.left() + line.x_for_index(selected_range.start),
+                            bounds.top(),
+                        ),
+                        point(
+                            bounds.left() + line.x_for_index(selected_range.end),
+                            bounds.bottom(),
+                        ),
+                    ),
+                    rgba(0x3390ff40),
+                )),
+                None,
+            )
+        };
+        FieldPrepaint {
+            line: Some(line),
+            cursor,
+            selection,
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let focus_handle = self.input.read(cx).focus_handle.clone();
+        window.handle_input(
+            &focus_handle,
+            gpui::ElementInputHandler::new(bounds, self.input.clone()),
+            cx,
+        );
+        if let Some(selection) = prepaint.selection.take() {
+            window.paint_quad(selection);
+        }
+        let line = prepaint.line.take().unwrap();
+        line.paint(
+            bounds.origin,
+            window.line_height(),
+            gpui::TextAlign::Left,
+            None,
+            window,
+            cx,
+        )
+        .unwrap();
+
+        if focus_handle.is_focused(window)
+            && let Some(cursor) = prepaint.cursor.take()
+        {
+            window.paint_quad(cursor);
+        }
+
+        self.input.update(cx, |input, _cx| {
+            input.last_layout = Some(line);
+            input.last_bounds = Some(bounds);
+        });
     }
 }
 
@@ -481,11 +750,8 @@ impl EntityInputHandler for FieldState {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.text.replace_and_mark_text_in_range(
-            range_utf16,
-            new_text,
-            new_selected_range_utf16,
-        );
+        self.text
+            .replace_and_mark_text_in_range(range_utf16, new_text, new_selected_range_utf16);
         cx.emit(FieldEvent::Change);
         cx.notify();
     }
@@ -572,7 +838,14 @@ mod tests {
         assert_eq!(stem_select_range(".gitignore"), 0..".gitignore".len());
         assert_eq!(stem_select_range(""), 0..0);
         assert_eq!(stem_select_range("café.txt"), 0.."café".len());
-        for name in ["notes.txt", "archive.tar.gz", "Makefile", ".gitignore", "", "café.txt"] {
+        for name in [
+            "notes.txt",
+            "archive.tar.gz",
+            "Makefile",
+            ".gitignore",
+            "",
+            "café.txt",
+        ] {
             let range = stem_select_range(name);
             assert!(
                 range.start <= range.end,

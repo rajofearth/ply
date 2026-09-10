@@ -81,8 +81,8 @@ impl Ply {
         self.menu = None;
         self.filter_text.clear();
         self.placeholder_for = None;
-        self.filter.update(cx, |input, cx| {
-            input.set_value("", window, cx);
+        self.filter_field.update(cx, |field, cx| {
+            field.set_value("", window, cx);
         });
         match self.location.clone() {
             Location::Home => {

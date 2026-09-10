@@ -3,9 +3,6 @@
 mod app;
 mod budget;
 mod cache;
-// Spike A (D2): hand-rolled field state. Not wired into the app yet, so this
-// is allow(dead_code) until the caller swap lands and real owners exist.
-#[allow(dead_code)]
 mod field;
 mod fs_ops;
 mod icons;
@@ -39,7 +36,6 @@ fn main() {
     gpui_platform::application()
         .with_assets(icons::Assets)
         .run(|cx| {
-            gpui_component::init(cx);
             // Grayscale text: the subpixel text pipeline costs ~100 MB of
             // GPU-shared memory on first paint (measured); grayscale is
             // visually near-identical and skips it.

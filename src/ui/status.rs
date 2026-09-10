@@ -2,8 +2,6 @@ use gpui::{
     Context, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement, Styled,
     div, prelude::FluentBuilder, px,
 };
-use gpui_component::Sizable;
-use gpui_component::input::Input;
 
 use super::icon;
 use crate::app::{Ply, ViewMode};
@@ -64,7 +62,8 @@ pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
                             div()
                                 .flex_1()
                                 .min_w_0()
-                                .child(Input::new(&ply.filter).xsmall().appearance(false)),
+                                .text_color(p.foreground)
+                                .child(ply.filter_field.clone()),
                         )
                         .when(!ply.filter_text.is_empty(), |el| {
                             el.child(
@@ -82,9 +81,7 @@ pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> impl IntoElement {
                                     .hover(|s| s.bg(p.muted))
                                     .child("×")
                                     .on_click(cx.listener(|this, _, window, cx| {
-                                        this.filter.update(cx, |input, cx| {
-                                            input.set_value("", window, cx);
-                                        });
+                                        this.clear_filter(window, cx);
                                         window.blur();
                                     })),
                             )

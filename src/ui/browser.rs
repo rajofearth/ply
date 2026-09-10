@@ -1,15 +1,6 @@
 use std::ops::Range;
 use std::path::PathBuf;
 
-use gpui::AppContext;
-use gpui::{
-    AnyElement, ClickEvent, Context, Div, FontWeight, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, Stateful, StatefulInteractiveElement, Styled, Window, div,
-    prelude::FluentBuilder, px, uniform_list,
-};
-use gpui_component::Sizable;
-use gpui_component::input::Input;
-
 use super::icon;
 use super::sidebar::{DragLabel, PinDrag};
 use crate::app::{LoadState, Ply, ViewMode};
@@ -20,6 +11,12 @@ use crate::listing::{
 use crate::theme::Palette;
 use crate::thumbs;
 use chrono::{DateTime, Local};
+use gpui::AppContext;
+use gpui::{
+    AnyElement, ClickEvent, Context, Div, FontWeight, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, Stateful, StatefulInteractiveElement, Styled, Window, div,
+    prelude::FluentBuilder, px, uniform_list,
+};
 
 pub fn render(ply: &Ply, window: &Window, cx: &mut Context<Ply>) -> impl IntoElement {
     let list_view = ply.view == ViewMode::List;
@@ -564,19 +561,14 @@ fn rename_field(ply: &Ply, cx: &mut Context<Ply>) -> AnyElement {
         .border_color(p.border)
         .rounded(px(0.))
         .text_size(px(12.5))
+        .text_color(p.foreground)
         .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
             if ev.keystroke.key == "escape" {
                 cx.stop_propagation();
                 this.cancel_rename(cx);
             }
         }))
-        .child(
-            Input::new(&rename.input)
-                .xsmall()
-                .appearance(false)
-                .bordered(false)
-                .focus_bordered(false),
-        )
+        .child(rename.field.clone())
         .into_any_element()
 }
 
