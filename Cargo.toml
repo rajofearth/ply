@@ -15,6 +15,7 @@ open = "5"
 trash = "5.2.6"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 image = { version = "0.25", default-features = false }
+png = "0.18"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

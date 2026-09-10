@@ -63,14 +63,89 @@ fn cache_dir() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join("ply").join("thumbcache"))
 }
 
+/// PNG magic bytes (signature). Every file `store` writes starts with these.
+const PNG_MAGIC: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
+
 /// Read a cached thumbnail. Returns `(rgba_pixels, width, height)` on hit.
+///
+/// PNG-only by construction: `store` only ever writes PNG, so lookup decodes
+/// with the `png` crate directly instead of sniffing all formats. A corrupt or
+/// non-PNG file reads as a miss; the caller falls through to fresh shell
+/// extraction and `store` overwrites the bad bytes, so the cache heals on
+/// the next open.
 pub fn lookup(key: &str) -> Option<(Vec<u8>, u32, u32)> {
     let dir = cache_dir()?.join("normal").join(format!("{key}.png"));
     let data = fs::read(&dir).ok()?;
-    let img = image::load_from_memory(&data).ok()?;
-    let rgba = img.to_rgba8();
-    let (w, h) = rgba.dimensions();
-    Some((rgba.into_raw(), w, h))
+    debug_assert!(
+        data.starts_with(&PNG_MAGIC),
+        "thumb cache lookup saw non-PNG bytes"
+    );
+    decode_png_rgba(&data)
+}
+
+/// Decode PNG bytes to raw RGBA8. Returns `None` instead of panicking on any
+/// malformed input, so corrupt cache files heal via re-extraction.
+fn decode_png_rgba(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    if !data.starts_with(&PNG_MAGIC) {
+        return None;
+    }
+    let decoder = png::Decoder::new(std::io::Cursor::new(data));
+    let mut reader = decoder.read_info().ok()?;
+    let size = reader.output_buffer_size()?;
+    if size == 0 {
+        return None;
+    }
+    let mut raw = vec![0u8; size];
+    let info = reader.next_frame(&mut raw).ok()?;
+    let (w, h) = (info.width, info.height);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let pixels = (w as usize)
+        .checked_mul(h as usize)?
+        .checked_mul(4)?;
+    match (info.color_type, info.bit_depth) {
+        (png::ColorType::Rgba, png::BitDepth::Eight) => {
+            if raw.len() < pixels {
+                return None;
+            }
+            raw.truncate(pixels);
+            Some((raw, w, h))
+        }
+        (png::ColorType::Rgb, png::BitDepth::Eight) => {
+            if raw.len() < pixels / 4 * 3 {
+                return None;
+            }
+            let mut rgba = Vec::with_capacity(pixels);
+            for px in raw[..pixels / 4 * 3].chunks_exact(3) {
+                rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+            }
+            Some((rgba, w, h))
+        }
+        (png::ColorType::Grayscale, png::BitDepth::Eight) => {
+            if raw.len() < pixels / 4 {
+                return None;
+            }
+            let mut rgba = Vec::with_capacity(pixels);
+            for &g in &raw[..pixels / 4] {
+                rgba.extend_from_slice(&[g, g, g, 255]);
+            }
+            Some((rgba, w, h))
+        }
+        (png::ColorType::GrayscaleAlpha, png::BitDepth::Eight) => {
+            if raw.len() < pixels / 2 {
+                return None;
+            }
+            let mut rgba = Vec::with_capacity(pixels);
+            for px in raw[..pixels / 2].chunks_exact(2) {
+                rgba.extend_from_slice(&[px[0], px[0], px[0], px[1]]);
+            }
+            Some((rgba, w, h))
+        }
+        // Indexed, 16-bit, and sub-byte depths: `store` never writes these,
+        // so read as a miss and let the caller heal (re-extract + overwrite).
+        _ => None,
+    }
 }
 
 /// Delete one cached thumbnail, e.g. after it fails to decode: the source
@@ -104,18 +179,30 @@ pub fn store(key: &str, rgba: &[u8], w: u32, h: u32) {
     let Some(dir) = cache_dir() else { return };
     let normal_dir = dir.join("normal");
     let _ = fs::create_dir_all(&normal_dir);
-    let Some(img) = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(w, h, rgba.to_vec()) else {
+    let Some(bytes) = encode_png_rgba(rgba, w, h) else {
         return;
     };
-    let dyn_img = image::DynamicImage::ImageRgba8(img);
-    let mut cursor = std::io::Cursor::new(Vec::new());
-    if dyn_img
-        .write_to(&mut cursor, image::ImageFormat::Png)
-        .is_err()
-    {
-        return;
+    let _ = fs::write(normal_dir.join(format!("{key}.png")), bytes);
+}
+
+/// PNG-encode raw RGBA8 bytes with the `png` crate directly.
+fn encode_png_rgba(rgba: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
+    if w == 0 || h == 0 {
+        return None;
     }
-    let _ = fs::write(normal_dir.join(format!("{key}.png")), cursor.into_inner());
+    let expect = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
+    if rgba.len() != expect {
+        return None;
+    }
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut out, w, h);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut writer = enc.write_header().ok()?;
+        writer.write_image_data(rgba).ok()?;
+    }
+    Some(out)
 }
 
 /// Delete oldest-by-mtime files in `normal/` when total bytes exceed
@@ -182,23 +269,15 @@ mod tests {
     fn store_at(rgba: &[u8], w: u32, h: u32, key: &str, root: &Path) {
         let normal = root.join("normal");
         let _ = fs::create_dir_all(&normal);
-        let img = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(w, h, rgba.to_vec()).unwrap();
-        let dyn_img = image::DynamicImage::ImageRgba8(img);
-        let mut cursor = std::io::Cursor::new(Vec::new());
-        dyn_img
-            .write_to(&mut cursor, image::ImageFormat::Png)
-            .unwrap();
-        let _ = fs::write(normal.join(format!("{key}.png")), cursor.into_inner());
+        let bytes = encode_png_rgba(rgba, w, h).unwrap();
+        let _ = fs::write(normal.join(format!("{key}.png")), bytes);
     }
 
     /// Read a PNG from a custom root.
     fn lookup_at(key: &str, root: &Path) -> Option<(Vec<u8>, u32, u32)> {
         let path = root.join("normal").join(format!("{key}.png"));
         let data = fs::read(&path).ok()?;
-        let img = image::load_from_memory(&data).ok()?;
-        let rgba = img.to_rgba8();
-        let (w, h) = rgba.dimensions();
-        Some((rgba.into_raw(), w, h))
+        decode_png_rgba(&data)
     }
 
     fn fail_mark_at(key: &str, root: &Path) {
@@ -240,6 +319,20 @@ mod tests {
         assert_eq!(h, 96);
         assert_eq!(got, rgba);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn corrupt_bytes_return_none() {
+        // Random bytes, bare magic plus garbage, and a truncated real PNG
+        // must all read as a miss, never panic. The thumbs probe treats None
+        // as a miss and heals via fresh extraction.
+        assert!(decode_png_rgba(b"not a png at all").is_none());
+        assert!(decode_png_rgba(&[137, 80, 78, 71, 13, 10, 26, 10, 0, 1, 2, 3]).is_none());
+        assert!(decode_png_rgba(&[]).is_none());
+        let rgba = vec![7u8; 4 * 4 * 4];
+        let mut full = encode_png_rgba(&rgba, 4, 4).unwrap();
+        full.truncate(full.len() / 2);
+        assert!(decode_png_rgba(&full).is_none());
     }
 
     #[test]

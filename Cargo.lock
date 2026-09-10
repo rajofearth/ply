@@ -3943,6 +3943,7 @@ dependencies = [
  "libc",
  "notify",
  "open",
+ "png 0.18.1",
  "trash",
  "windows 0.62.2",
 ]
