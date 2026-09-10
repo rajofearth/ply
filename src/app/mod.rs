@@ -9,10 +9,19 @@ use std::sync::{Arc, atomic::AtomicBool};
 use std::time::Duration;
 
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, Pixels, Point, SharedString, Task, Window,
-    prelude::*,
+    App, Context, Entity, FocusHandle, Focusable, KeyBinding, Pixels, Point, SharedString, Task,
+    Window, prelude::*,
 };
-use gpui_component::input::{InputEvent, InputState};
+// TEMP SHIM (spike B): the old library filter/rename state stays alive only
+// because ui/status.rs and ui/browser.rs still render `Input::new(&...)`.
+// Spike C repoints those two call sites at `filter_field` / `Rename::field`,
+// then deletes this import and the `filter` / `Rename::input` fields.
+use gpui_component::input::InputState;
+
+use crate::field::{
+    FIELD_KEY_CONTEXT, FieldBackspace, FieldConfirm, FieldCopy, FieldCut, FieldDelete, FieldEvent,
+    FieldPaste, FieldSelectAll, FieldState,
+};
 
 use crate::listing::{Entry, Snapshot, SortKey};
 use crate::theme::{Mode, Palette};
@@ -233,10 +242,17 @@ pub enum MenuAction {
 
 /// A row being renamed inline. The subscription commits on Enter and
 /// cancels on blur or Esc, and lives here so it dies with the edit.
+/// `input` is the TEMP SHIM the old `Input` element in ui/browser.rs still
+/// renders; `field` is the new hand-rolled state spike C will paint.
+/// `commit_rename` still reads `input` (the visible element); `field` carries
+/// the same initial value and stem selection, so C only repoints the element,
+/// switches the commit read to `field`, and deletes `input`.
 pub struct Rename {
     pub path: PathBuf,
     pub input: Entity<InputState>,
+    pub field: Entity<FieldState>,
     _commit: gpui::Subscription,
+    _field_commit: gpui::Subscription,
 }
 
 /// Snapshot of the facts the Properties dialog shows.
@@ -375,6 +391,12 @@ pub struct Ply {
     pub sort: SortKey,
 
     pub filter: Entity<InputState>,
+    /// New hand-rolled filter state (spike B). Source of truth for
+    /// `filter_text` alongside the shim above: the old `Change` subscription
+    /// mirrors into it, and its own `Change` subscription refilters for the
+    /// future UI. TEMP DUAL-STATE: spike C repoints status.rs / ui/mod.rs at
+    /// this, then deletes `filter`.
+    pub filter_field: Entity<FieldState>,
     pub filter_text: String,
     /// Item count the filter placeholder was last written for.
     pub placeholder_for: Option<usize>,
@@ -437,9 +459,56 @@ pub struct Ply {
 
 impl Ply {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        // Keymap for the hand-rolled field. Handlers land with spike C's
+        // element (`key_context("Field")` + `on_action`); binding now means
+        // C paints a fully operable field with no further keymap work. Kept
+        // beside `gpui_component::init` (main.rs, spike D) until the library
+        // leaves the link.
+        cx.bind_keys([
+            KeyBinding::new("backspace", FieldBackspace, Some(FIELD_KEY_CONTEXT)),
+            KeyBinding::new("shift-backspace", FieldBackspace, Some(FIELD_KEY_CONTEXT)),
+            KeyBinding::new("delete", FieldDelete, Some(FIELD_KEY_CONTEXT)),
+            KeyBinding::new("shift-delete", FieldDelete, Some(FIELD_KEY_CONTEXT)),
+            KeyBinding::new("cmd-a", FieldSelectAll, Some(FIELD_KEY_CONTEXT)),
+            KeyBinding::new("ctrl-a", FieldSelectAll, Some(FIELD_KEY_CONTEXT)),
+            KeyBinding::new("cmd-x", FieldCut, Some(FIELD_KEY_CONTEXT)),
+            KeyBinding::new("ctrl-x", FieldCut, Some(FIELD_KEY_CONTEXT)),
+            KeyBinding::new("cmd-c", FieldCopy, Some(FIELD_KEY_CONTEXT)),
+            KeyBinding::new("ctrl-c", FieldCopy, Some(FIELD_KEY_CONTEXT)),
+            KeyBinding::new("cmd-v", FieldPaste, Some(FIELD_KEY_CONTEXT)),
+            KeyBinding::new("ctrl-v", FieldPaste, Some(FIELD_KEY_CONTEXT)),
+            KeyBinding::new("enter", FieldConfirm, Some(FIELD_KEY_CONTEXT)),
+            KeyBinding::new("shift-enter", FieldConfirm, Some(FIELD_KEY_CONTEXT)),
+            KeyBinding::new("secondary-enter", FieldConfirm, Some(FIELD_KEY_CONTEXT)),
+        ]);
+
+        // TEMP SHIM: old library filter stays for the UI call sites
+        // (status.rs renders it, ui/mod.rs focuses it). Its Change handler is
+        // unchanged and keeps current behaviour; the new field's own Change
+        // handler below carries the same refilter contract for spike C, when
+        // the UI repoints at `filter_field` and this shim (plus its mirror
+        // needs) is deleted. No cross-mirror here: subscriptions are
+        // window-free, and `filter_text` (not either entity's value) is the
+        // shared source the listing reads.
         let filter = cx.new(|cx| InputState::new(window, cx));
-        cx.subscribe(&filter, |this, input, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
+        let filter_field = cx.new(|cx| FieldState::new(window, cx));
+        cx.subscribe(
+            &filter,
+            |this, input, event: &gpui_component::input::InputEvent, cx| {
+                if matches!(event, gpui_component::input::InputEvent::Change) {
+                    this.filter_text = input.read(cx).value().to_string();
+                    this.rebuild_visible();
+                    this.clear_selection_paths();
+                    this.anchor = None;
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
+        // Future path: once spike C repoints the UI at `filter_field`, typing
+        // arrives here directly with the same refilter contract.
+        cx.subscribe(&filter_field, |this, input, event: &FieldEvent, cx| {
+            if matches!(event, FieldEvent::Change) {
                 this.filter_text = input.read(cx).value().to_string();
                 this.rebuild_visible();
                 this.clear_selection_paths();
@@ -466,6 +535,7 @@ impl Ply {
             view: ViewMode::List,
             sort: SortKey::default(),
             filter,
+            filter_field,
             filter_text: String::new(),
             placeholder_for: None,
             visible_indices: Vec::new(),
@@ -494,10 +564,11 @@ impl Ply {
         ply.start_watch_poll(cx);
         ply.start_volume_poll(cx);
         ply.start_lnk_refresh(cx);
-        // `gpui_component::init` (main.rs) pins the library theme to Light;
-        // push Ply's opening mode into it so filter/rename inputs paint a
-        // matching caret and selection from the first frame.
-        sync_library_theme(ply.mode, cx);
+        // Library theme glue is gone with the field swap: the hand-rolled
+        // field paints caret/selection from the Ply palette directly (spike
+        // C), so there is no `gpui_component::Theme` to push mode into.
+        // `gpui_component::init` itself stays in main.rs until spike D drops
+        // the dependency.
         cx.spawn(async move |_, cx| {
             cx.background_spawn(async move { crate::thumbs::warm_shell() })
                 .await;
@@ -542,9 +613,17 @@ impl Ply {
     }
 
     /// Whether a text field has focus, so bare-key shortcuts should stand down.
+    /// Signature unchanged so the twelve call sites in ui/mod.rs behave
+    /// identically. Checks both the shim and the new field: the old UI field
+    /// holds focus today, the hand-rolled one will after spike C.
     pub fn typing(&self, window: &Window, cx: &App) -> bool {
-        let focused = |input: &Entity<InputState>| input.focus_handle(cx).is_focused(window);
-        focused(&self.filter) || self.rename.as_ref().is_some_and(|r| focused(&r.input))
+        let legacy = |input: &Entity<InputState>| input.focus_handle(cx).is_focused(window);
+        legacy(&self.filter)
+            || self.filter_field.focus_handle(cx).is_focused(window)
+            || self
+                .rename
+                .as_ref()
+                .is_some_and(|r| legacy(&r.input) || r.field.focus_handle(cx).is_focused(window))
     }
 
     /// The OS window title (taskbar / alt-tab): `<folder> - Ply`, or
@@ -565,7 +644,6 @@ impl Ply {
 
     pub fn toggle_mode(&mut self, cx: &mut Context<Self>) {
         self.mode = self.mode.toggled();
-        sync_library_theme(self.mode, cx);
         cx.notify();
     }
 
@@ -681,41 +759,6 @@ impl StormGate {
         self.generation = generation;
         trip
     }
-}
-
-/// Library theme mode matching Ply's [`Mode`]. Pure, so tests cover the
-/// mapping without a GPUI context.
-pub fn library_theme_mode(mode: Mode) -> gpui_component::ThemeMode {
-    match mode {
-        Mode::Light => gpui_component::ThemeMode::Light,
-        Mode::Dark => gpui_component::ThemeMode::Dark,
-    }
-}
-
-/// Caret and selection colours the library theme should use for [`Mode`]:
-/// caret tracks the Ply foreground, selection tracks `select_strong`. Pure,
-/// so tests cover both modes without a GPUI context.
-pub fn library_caret_selection(mode: Mode) -> (gpui::Hsla, gpui::Hsla) {
-    let palette = mode.palette();
-    (palette.foreground, palette.select_strong)
-}
-
-/// Push Ply's [`Mode`] into the `gpui_component` library theme. The library
-/// `Input` paints its caret and selection from `cx.theme().caret` /
-/// `cx.theme().selection` (see `crates/ui/src/input/input.rs` in the pinned
-/// source, keys `caret` and `selection.background` in `default-theme.json`),
-/// and `gpui_component::init` pins those to Light. So every Ply mode change
-/// re-applies the library mode via [`gpui_component::Theme::change`] and then
-/// overrides caret/selection from the Ply palette. Callers: [`Ply::new`]
-/// (init) and [`Ply::toggle_mode`].
-pub fn sync_library_theme(mode: Mode, cx: &mut gpui::App) {
-    gpui_component::Theme::change(library_theme_mode(mode), None, cx);
-    let (caret, selection) = library_caret_selection(mode);
-    let theme = gpui_component::Theme::global_mut(cx);
-    theme.caret = caret;
-    theme.selection = selection;
-    theme.tokens.caret = caret.into();
-    theme.tokens.selection = selection.into();
 }
 
 /// Escape closes whatever is on top, innermost first. A menu flyout closes
@@ -954,34 +997,5 @@ mod tests {
         stale.selected = Some(7);
         stale.move_selection(1);
         assert_eq!(stale.selected, Some(0));
-    }
-
-    #[test]
-    fn library_theme_mode_follows_ply_mode() {
-        assert_eq!(
-            super::library_theme_mode(crate::theme::Mode::Light),
-            gpui_component::ThemeMode::Light
-        );
-        assert_eq!(
-            super::library_theme_mode(crate::theme::Mode::Dark),
-            gpui_component::ThemeMode::Dark
-        );
-    }
-
-    #[test]
-    fn library_caret_selection_tracks_palette_in_both_modes() {
-        for mode in [crate::theme::Mode::Light, crate::theme::Mode::Dark] {
-            let palette = mode.palette();
-            assert_eq!(
-                super::library_caret_selection(mode),
-                (palette.foreground, palette.select_strong),
-                "caret must equal foreground and selection must equal select_strong in {mode:?}"
-            );
-        }
-        // The sync must actually flip something, or toggling would be a no-op.
-        assert_ne!(
-            super::library_caret_selection(crate::theme::Mode::Light),
-            super::library_caret_selection(crate::theme::Mode::Dark)
-        );
     }
 }
