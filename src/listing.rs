@@ -1,5 +1,6 @@
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use chrono::{DateTime, Datelike, Local};
@@ -57,9 +58,23 @@ pub enum SortKey {
     Size,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Snapshot {
-    pub entries: Vec<Entry>,
+    /// Shared so the icon batch (`app/ops.rs` `reload`) borrows the same
+    /// allocation the listing paints from: handing the background task a
+    /// clone bumps a refcount instead of cloning up to 512 full `Entry`s.
+    /// Reads (`iter`, `len`, `get`, `&entries as &[Entry]`) work unchanged
+    /// through deref; sorting goes through `resort`, which sorts in place
+    /// when uniquely owned and only clones on genuine sharing.
+    pub entries: Arc<Vec<Entry>>,
+}
+
+impl Default for Snapshot {
+    fn default() -> Self {
+        Self {
+            entries: Arc::new(Vec::new()),
+        }
+    }
 }
 
 impl Snapshot {
@@ -69,12 +84,14 @@ impl Snapshot {
     }
 
     pub fn sorted(mut entries: Vec<Entry>, key: SortKey) -> Self {
-        entries.sort_by(|a, b| compare_entries(a, b, key));
-        Self { entries }
+        sort_entries(&mut entries, key);
+        Self {
+            entries: Arc::new(entries),
+        }
     }
 
     pub fn resort(&mut self, key: SortKey) {
-        self.entries.sort_by(|a, b| compare_entries(a, b, key));
+        sort_entries(Arc::make_mut(&mut self.entries), key);
     }
 
     /// Order-independent equality so a resorted listing is not a "change".
@@ -85,7 +102,7 @@ impl Snapshot {
         if a.len() != b.len() {
             return false;
         }
-        if a.iter().zip(b).all(|(x, y)| entry_meta_eq(x, y)) {
+        if a.iter().zip(b.iter()).all(|(x, y)| entry_meta_eq(x, y)) {
             return true;
         }
         let mut ia: Vec<_> = (0..a.len()).collect();
@@ -125,6 +142,136 @@ fn cmp_name(a: &str, b: &str) -> std::cmp::Ordering {
     }
 }
 
+/// Lowercase once per reload/resort/keystroke. ASCII folds byte-wise with no
+/// Unicode tables; anything else uses full casefold. For pure-ASCII input
+/// this equals `to_lowercase`, so mixed comparisons stay identical to the old
+/// lower-on-every-compare path (locked by `lowered_name_matches_lowercase`).
+fn lowered_name(name: &str) -> String {
+    if name.is_ascii() {
+        name.to_ascii_lowercase()
+    } else {
+        name.to_lowercase()
+    }
+}
+
+/// Sort with keys precomputed once, not once per comparison. Lowering (which
+/// allocates) inside the comparator costs O(n log n) allocations; this lowers
+/// each name once per reload/resort and reorders by moves only. A new
+/// generation always builds a new `Snapshot`, so precomputed keys can never
+/// go stale across reloads; `resort` recomputes them for the new key. Order
+/// is identical to `compare_entries` (locked by
+/// `precomputed_sort_matches_compare_entries`).
+fn sort_entries(entries: &mut Vec<Entry>, key: SortKey) {
+    struct Prep {
+        dir: bool,
+        lower: String,
+        kind: &'static str,
+    }
+    let mut prep: Vec<Prep> = Vec::with_capacity(entries.len());
+    // `Modified` orders by timestamp alone, so it skips the text keys.
+    let need_text = !matches!(key, SortKey::Modified);
+    for entry in entries.iter() {
+        prep.push(Prep {
+            dir: entry.is_directory(),
+            lower: if need_text {
+                lowered_name(&entry.name)
+            } else {
+                String::new()
+            },
+            kind: if need_text { kind_label(entry) } else { "" },
+        });
+    }
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    order.sort_by(|&a, &b| {
+        let (pa, pb) = (&prep[a], &prep[b]);
+        pb.dir.cmp(&pa.dir).then_with(|| match key {
+            SortKey::Name => pa.lower.cmp(&pb.lower),
+            SortKey::Modified => entries[b].modified.cmp(&entries[a].modified),
+            SortKey::Kind => pa.kind.cmp(pb.kind).then_with(|| pa.lower.cmp(&pb.lower)),
+            SortKey::Size => entries[b]
+                .size
+                .cmp(&entries[a].size)
+                .then_with(|| pa.lower.cmp(&pb.lower)),
+        })
+    });
+    // Permute by moves, keeping the existing allocation: each entry travels
+    // exactly once, nothing is cloned.
+    let mut slots: Vec<Option<Entry>> = entries.drain(..).map(Some).collect();
+    for i in order {
+        entries.push(slots[i].take().expect("sort order is a permutation"));
+    }
+}
+
+/// Indices into `entries` surviving `needle`, in listing order, written into
+/// `out` after clearing it so keystrokes reuse the allocation. The needle is
+/// lowered once per call; ASCII names then match with zero per-entry
+/// allocation (the old code called `to_lowercase` on every entry per
+/// keystroke). Results equal
+/// `name.to_lowercase().contains(needle.to_lowercase())` on all inputs
+/// (locked by `filter_matches_reference`, including Kelvin/ß/İ edges).
+pub fn filter_indices_into(entries: &[Entry], needle: &str, out: &mut Vec<usize>) {
+    out.clear();
+    if needle.is_empty() {
+        out.extend(0..entries.len());
+        return;
+    }
+    let lowered = lowered_name(needle);
+    out.reserve(entries.len());
+    for (i, entry) in entries.iter().enumerate() {
+        if name_contains_lowered(&entry.name, &lowered) {
+            out.push(i);
+        }
+    }
+}
+
+/// Substring test against an already-lowered needle. ASCII/ASCII pairs fold
+/// bytes inline with no allocation; anything else lowers the haystack once,
+/// the only remaining per-entry alloc, and only for non-ASCII names. Safe
+/// when the lowered needle is ASCII but the raw needle was not (e.g. Kelvin
+/// K folds to `k`): with both lowered sides ASCII the reference comparison
+/// reduces to ASCII-lowercase byte matching, which is exactly this path.
+fn name_contains_lowered(name: &str, lowered_needle: &str) -> bool {
+    if lowered_needle.is_empty() {
+        return true;
+    }
+    if name.is_ascii() && lowered_needle.is_ascii() {
+        ascii_contains(name.as_bytes(), lowered_needle.as_bytes())
+    } else {
+        lowered_name(name).contains(lowered_needle)
+    }
+}
+
+/// ASCII case-insensitive substring search with no allocation and no
+/// per-byte closures (plain loops stay fast in debug builds too, where the
+/// `windows().any()` + `all()` closure nest measured 3x slower than the
+/// old allocating filter on 10k entries).
+fn ascii_contains(hay: &[u8], ndl: &[u8]) -> bool {
+    if ndl.is_empty() {
+        return true;
+    }
+    if ndl.len() > hay.len() {
+        return false;
+    }
+    let first = ndl[0];
+    let mut i = 0;
+    while i + ndl.len() <= hay.len() {
+        if hay[i].to_ascii_lowercase() == first {
+            let mut j = 1;
+            while j < ndl.len() && hay[i + j].to_ascii_lowercase() == ndl[j] {
+                j += 1;
+            }
+            if j == ndl.len() {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+// Reference order for `precomputed_sort_matches_compare_entries`. Kept out of
+// release builds: the shipping path is `sort_entries` above.
+#[cfg(test)]
 fn compare_entries(a: &Entry, b: &Entry, key: SortKey) -> std::cmp::Ordering {
     b.is_directory()
         .cmp(&a.is_directory())
@@ -292,8 +439,11 @@ fn entry_from_dirent(dirent: std::fs::DirEntry) -> Option<Entry> {
 
 /// Hidden entries are always skipped; Ply exposes no Show Hidden control.
 fn collect_entries(path: &Path) -> anyhow::Result<Vec<Entry>> {
-    let mut entries = Vec::new();
-    for dirent in std::fs::read_dir(path)? {
+    let read = std::fs::read_dir(path)?;
+    // Grow once, not per entry: the `ReadDir` hint is 0 on most platforms, so
+    // floor it at a typical folder size.
+    let mut entries = Vec::with_capacity(read.size_hint().0.max(256));
+    for dirent in read {
         let Some(entry) = entry_from_dirent(dirent?) else {
             continue;
         };
@@ -581,18 +731,18 @@ mod tests {
         let mut b = file("notes.md");
         b.size = 3;
         let left = Snapshot {
-            entries: vec![a.clone(), b.clone()],
+            entries: Arc::new(vec![a.clone(), b.clone()]),
         };
         let mut b2 = b;
         b2.name = "NOTES.md".into();
         let right = Snapshot {
-            entries: vec![b2, a.clone()],
+            entries: Arc::new(vec![b2, a.clone()]),
         };
         assert!(left.same_contents(&right));
         let mut other = file("notes.md");
         other.size = 99;
         assert!(!left.same_contents(&Snapshot {
-            entries: vec![a, other],
+            entries: Arc::new(vec![a, other]),
         }));
     }
 
@@ -604,6 +754,187 @@ mod tests {
         );
         let names: Vec<_> = snap.entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["A.txt", "b.txt", "c.txt"]);
+    }
+
+    #[test]
+    fn lowered_name_matches_lowercase() {
+        // Includes the edges where ASCII-only folding would diverge: Kelvin
+        // sign (folds to ASCII `k`), sharp s (no-op lower), Turkish dotted
+        // capital I (expands to `i` + combining dot), CJK, emoji, empty.
+        for name in [
+            "",
+            "Readme.TXT",
+            "Makefile",
+            "café.TXT",
+            "界界.txt",
+            "K",
+            "k",
+            "STRASSE.txt",
+            "straße.txt",
+            "İSTANBUL.txt",
+            "istanbul.txt",
+            "📁 Photos.JPG",
+            "aBcDeF 123 !@#",
+        ] {
+            assert_eq!(lowered_name(name), name.to_lowercase(), "{name:?}");
+        }
+    }
+
+    fn mixed_entries() -> Vec<Entry> {
+        use std::time::{Duration, UNIX_EPOCH};
+        let mut entries = Vec::new();
+        let mut add = |name: &str, size: u64, secs: u64, dir: bool| {
+            let mut e = file(name);
+            e.size = size;
+            e.modified = Some(UNIX_EPOCH + Duration::from_secs(secs));
+            if dir {
+                e.kind = EntryKind::Directory;
+            }
+            entries.push(e);
+        };
+        add("b.txt", 30, 30, false);
+        add("A.txt", 10, 10, false);
+        add("c.TXT", 20, 20, false);
+        add("z-folder", 0, 5, true);
+        add("a-folder", 0, 50, true);
+        add("café.md", 15, 15, false);
+        add("CAFÉ.md", 25, 25, false);
+        add("photo.JPG", 100, 40, false);
+        add("notes.zip", 60, 35, false);
+        add("K", 5, 45, false);
+        add("k", 6, 46, false);
+        add("界.txt", 70, 12, false);
+        entries
+    }
+
+    fn reference_sorted(mut entries: Vec<Entry>, key: SortKey) -> Vec<String> {
+        entries.sort_by(|a, b| compare_entries(a, b, key));
+        entries.into_iter().map(|e| e.name).collect()
+    }
+
+    #[test]
+    fn precomputed_sort_matches_compare_entries() {
+        // Fresh sorts start from insertion order on both sides.
+        for key in [
+            SortKey::Name,
+            SortKey::Modified,
+            SortKey::Kind,
+            SortKey::Size,
+        ] {
+            let expected = reference_sorted(mixed_entries(), key);
+            let got: Vec<String> = Snapshot::sorted(mixed_entries(), key)
+                .entries
+                .iter()
+                .map(|e| e.name.clone())
+                .collect();
+            assert_eq!(got, expected, "fresh sort with {key:?}");
+        }
+        // Resorts start from Modified order on both sides: ties keep input
+        // order under any stable sort, so the reference must see the same
+        // input as `resort` (this bit the first version of this test, which
+        // compared a resort against an insertion-ordered fresh sort).
+        let base = Snapshot::sorted(mixed_entries(), SortKey::Modified);
+        for key in [
+            SortKey::Name,
+            SortKey::Modified,
+            SortKey::Kind,
+            SortKey::Size,
+        ] {
+            let mut reference: Vec<Entry> = base.entries.iter().cloned().collect();
+            reference.sort_by(|a, b| compare_entries(a, b, key));
+            let expected: Vec<String> = reference.into_iter().map(|e| e.name).collect();
+            let mut snap = base.clone();
+            snap.resort(key);
+            let got: Vec<String> = snap.entries.iter().map(|e| e.name.clone()).collect();
+            assert_eq!(got, expected, "resort with {key:?}");
+        }
+    }
+
+    fn reference_matches(name: &str, needle: &str) -> bool {
+        name.to_lowercase().contains(&needle.to_lowercase())
+    }
+
+    #[test]
+    fn filter_matches_reference() {
+        let names = [
+            "alpha.txt",
+            "ALPHA2.TXT",
+            "beta.mp4",
+            "almanac.png",
+            "delta.log",
+            "café.md",
+            "CAFÉ AU LAIT.txt",
+            "K",
+            "k.txt",
+            "Kelvin.txt",
+            "STRASSE.txt",
+            "straße.txt",
+            "界alpha.txt",
+            "Makefile",
+            "a",
+            "",
+        ];
+        let entries: Vec<Entry> = names.iter().map(|n| file(n)).collect();
+        let needles = [
+            "",
+            "a",
+            "AL",
+            "alpha",
+            "pha",
+            "mp4",
+            "xyz",
+            "m",
+            "é",
+            "E",
+            "k",
+            "K",
+            "ß",
+            "SS",
+            "界",
+            "alpha.txt",
+            " ",
+            ".",
+        ];
+        let mut scratch = Vec::new();
+        for needle in needles {
+            filter_indices_into(&entries, needle, &mut scratch);
+            let expected: Vec<usize> = entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| reference_matches(&e.name, needle))
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(scratch, expected, "needle {needle:?}");
+            // Reuse: a second pass over the same scratch must agree.
+            let mut again = std::mem::take(&mut scratch);
+            filter_indices_into(&entries, needle, &mut again);
+            assert_eq!(again, expected, "reused scratch, needle {needle:?}");
+            scratch = again;
+        }
+    }
+
+    #[test]
+    fn same_contents_still_holds_under_shared_ownership() {
+        // Cloning a Snapshot shares the allocation; equality still compares
+        // contents, and resorting the clone must not disturb the original.
+        // Names are case-unique here: `same_contents` pairs case-tied names
+        // positionally, so entries differing only by case need identical
+        // metadata to pair up (pre-existing semantics, unchanged).
+        let unique: Vec<Entry> = mixed_entries()
+            .into_iter()
+            .filter(|e| e.name != "k" && e.name != "CAFÉ.md")
+            .collect();
+        let snap = Snapshot::sorted(unique, SortKey::Name);
+        let before: Vec<String> = snap.entries.iter().map(|e| e.name.clone()).collect();
+        let shared = snap.clone();
+        assert!(snap.same_contents(&shared));
+        let mut moved = shared;
+        moved.resort(SortKey::Size);
+        assert!(snap.same_contents(&moved));
+        assert_eq!(snap.entries.len(), moved.entries.len());
+        // Copy-on-write: resorting the clone leaves the original's order alone.
+        let after: Vec<String> = snap.entries.iter().map(|e| e.name.clone()).collect();
+        assert_eq!(before, after);
     }
 
     #[test]

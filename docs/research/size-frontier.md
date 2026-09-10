@@ -69,6 +69,18 @@ D9. Sub 1MB verdict. Real only if the OS carries rendering, text, decoding, and 
 
 D10. RAM and speed program. Verdict first: total under 100 MiB including GPU is not real while keeping GPU compositing. Ship the 100 MiB non GPU gate as is, track total as info. Realistic: 40 to 70 non GPU idle on Home, 60 to 90 in a 10k folder, 180 to 280 total with GPU. Ranked changes: decode plus resize plus RenderImage build off the UI thread; split tiles 96 grid versus 32 to 48 list and sidebar; budget 8 to 4 MiB with locks 128 to 64 and flush live tiles on idle only; filter zero alloc compare plus 60 to 120 ms debounce; scratch vecs plus index select plus memo size and time for flat per frame allocs; icon batch 512 to 128 plus page on scroll; disk cache 128 to 32 to 64 MiB with background evict; gate volume, lnk, and watch timers when idle; defer Fluent font chain and add CLI early out before GPU init. Bench to add: 10k list sort, keystroke under 16 ms with zero per entry String alloc, 100 frames flat allocs, storm capped, same snapshot reload issues no notify.
 
+## D10 RAM pass, 2026-09-10 (thumbs, cache, browser lock)
+
+Landed, caps and flush policy only. Pixel and timing contracts unchanged: grid tiles still 96, storm settle 300 ms, coalesce 16 ms, working-set locks, generation guards, Snapshot quiet reloads. Suite 217 passed, budget gate PASS at 5.15 MiB.
+
+* Tile split: grid content stays 96, list view content extracts at new SMALL_THUMB_SIZE 48. List rows paint at 16, verified in browser.rs, so 48 is a 3x supersample. Size is part of CacheKey and the disk key. Full size disk keys hash exactly as before, so existing PNGs still hit. probe_key and the browser lock build share lock_key_for, so a painted tile is always a locked tile. Folder, exe, lnk, class, and stock icons are byte identical to before.
+* Caps: BUDGET 8 to 4 MiB, LOCK_CAP 128 to 64, PINNED_CAP 256 to 96, FLUSH_THRESHOLD 2 to 8 MiB so a fling stops tripping the full live tile flush mid flight.
+* Lock keys reuse a thread local scratch Vec per frame. clamp_lock_window behavior identical.
+* Type icon batch 512 to 128, first viewport plus overscan. Rows show class icons or blank slots until late icons land, by design.
+* Disk cache 128 to 48 MiB plus a 4000 file cap. evict keeps its signature. New evict_with_limits and evict_incremental bound work per call, and a readdir only fast path skips stat and sort when the cache is small.
+
+Left for the owner of app/ops.rs: page the type icon batch on scroll; flush live tiles on idle only, since drain_drops needs a storm signal for that; call evict_incremental from a background idle slice.
+
 ## Target math, MiB, conservative
 
 9.77 baseline. Minus 1.9 profile is 7.8. Minus 2.9 component cut is 4.9, under budget with no margin. Minus 1.0 codecs is 3.9. Minus 1.0 resvg fonts is 2.9. Minus 0.5 http chain is 2.4. Table scraps (regex subsets, uuid, chrono) take roughly 2.1. Half delivery of the fork still lands near 3.5.

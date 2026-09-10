@@ -26,41 +26,60 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{AppContext, Context, RenderImage};
 
-use crate::app::Ply;
+use crate::app::{Ply, ViewMode};
 use crate::listing::{Entry, KindClass, kind_class};
 
-/// One thumbnail size, in device-independent pixels on the larger side.
+/// Content thumbnail size for grid cells, in device-independent pixels on the
+/// larger side. Grid cells paint at 56px, so 96 stays a downscale there.
 pub const THUMB_SIZE: u32 = 96;
 
-/// Hard ceiling on cached pixel bytes: ~8 MiB of RGBA plus the capped
+/// Content thumbnail size for list rows, in device-independent pixels on the
+/// larger side. List rows paint at 16px (sidebar 16, menu 14, Home 24), so
+/// 48 is a 3x supersample there and matches the shell image list's
+/// extralarge tier. A quarter of the bytes per tile (9 KiB vs 36 KiB).
+/// Keyed into [`CacheKey`]: the same file holds a 96 raster in grid view and
+/// a 48 raster in list view, with one disk PNG per size.
+pub const SMALL_THUMB_SIZE: u32 = 48;
+
+/// Hard ceiling on cached pixel bytes: ~4 MiB of RGBA plus the capped
 /// on-screen working set. Bounds the live tile count; evictions queue GPU
 /// drops via `pending_drops` (see `drain_drops`).
-const BUDGET: usize = 8 * 1024 * 1024;
+const BUDGET: usize = 4 * 1024 * 1024;
 
 /// Evicted bytes that trigger a full live-tile flush (see `drain_drops`).
-const FLUSH_THRESHOLD: usize = 2 * 1024 * 1024;
+/// Sized so a fling rarely trips it mid-flight: the flush drops every live
+/// tile and the next paint re-uploads the visible ones, so tripping once per
+/// fling is pure atlas churn. An idle-only live flush (skip the live-tile
+/// drop while the paint storm is set) would remove the rest; that needs a
+/// render-path signal `drain_drops` does not take yet.
+const FLUSH_THRESHOLD: usize = 8 * 1024 * 1024;
 
-/// Cap on pinned sidebar/Home path icons. Dozens of 48px rasters; 256 is a
-/// generous ceiling (~2 MiB) that never meaningfully contends with content.
-const PINNED_CAP: usize = 256;
+/// Cap on pinned sidebar/Home path icons. Dozens of 48px rasters; 96 is a
+/// generous ceiling (~1 MiB) that never meaningfully contends with content.
+const PINNED_CAP: usize = 96;
 
-/// Cap on simultaneously locked (on-screen) thumbnails. Mirrors Chromium's
-/// `kMaxItemsInWorkingSet` scaled to Ply: a viewport of ~60-80 cells at 96x96x4
-/// bytes each uses ~2.8 MiB; 128 is two viewports + generous overscan and keeps
-/// locked memory under 5 MiB, well within the byte budget. The browser clamps
-/// its lock window to this cap (see `clamp_lock_window`), so the spill path
-/// below only ever sees off-screen keys.
-pub(crate) const LOCK_CAP: usize = 128;
+/// Cap on simultaneously locked (on-screen) thumbnails. A list viewport shows
+/// ~30 rows and the lock overscan adds ~48 each side; 64 covers the painted
+/// centre after `clamp_lock_window` and keeps locked memory near 2.3 MiB at
+/// 96px tiles (under 0.6 MiB when the list's 48px tiles are locked). The
+/// browser clamps its lock window to this cap (see `clamp_lock_window`), so
+/// the spill path below only ever sees off-screen keys. Fast-scroll blanking
+/// from a smaller set is covered by the paint-storm gate, which holds
+/// placeholders until the viewport settles.
+pub(crate) const LOCK_CAP: usize = 64;
 
-/// Identity of a cached raster: a path plus the "stamp" it was derived from.
-/// For media and executables the stamp is the own-file mtime, so editing the
-/// file re-extracts it. For `.lnk` shortcuts the stamp is the resolved icon
-/// source's identity (path + mtime + index), so rebuilding the target's icon
-/// invalidates the cached icon even though the link itself never moved.
-#[derive(Clone, PartialEq, Eq, Hash)]
+/// Identity of a cached raster: a path plus the "stamp" it was derived from,
+/// plus the tile size it was extracted for. For media and executables the
+/// stamp is the own-file mtime, so editing the file re-extracts it. For
+/// `.lnk` shortcuts the stamp is the resolved icon source's identity (path +
+/// mtime + index), so rebuilding the target's icon invalidates the cached
+/// icon even though the link itself never moved. The size splits list tiles
+/// (48) from grid tiles (96): same file, different entry, one disk PNG each.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct CacheKey {
     path: PathBuf,
     stamp: u64,
+    size: u32,
 }
 
 /// A decoded shell icon's system-image-list index plus its BGRA pixels and
@@ -84,10 +103,14 @@ pub(crate) struct ListingIcons {
     pub decoded: Vec<IndexedPixels>,
 }
 
-/// Up-front cap on how many listing entries pre-resolve type icons. Beyond it
-/// the on-demand probe path covers scrolling rows. Dir/exe lookups are ~25µs
-/// each and class lookups dedup by extension, so 512 stays well under a frame.
-pub(crate) const TYPE_ICON_BATCH_CAP: usize = 512;
+/// Up-front cap on how many listing entries pre-resolve type icons: the first
+/// viewport plus overscan. Beyond it the on-demand probe path covers scrolling
+/// rows (a row paints its class icon or a blank slot until its icon lands, by
+/// design). Dir/exe lookups are ~25µs each and class lookups dedup by
+/// extension, so 128 stays near a millisecond. Paging the batch on scroll
+/// (resolving the next window as the viewport moves) lives on the reload path
+/// in `app/ops.rs`, not here.
+pub(crate) const TYPE_ICON_BATCH_CAP: usize = 128;
 
 /// How many content extractions (GetImage) may be queued to the thumbnail pool
 /// at once. Above this, render-driven probes yield until a completion frees a
@@ -95,27 +118,42 @@ pub(crate) const TYPE_ICON_BATCH_CAP: usize = 512;
 /// of jobs that would starve names on the old single worker.
 pub(crate) const CONTENT_CAP: usize = 24;
 
-/// Default key: a path plus its own mtime (media, executables, fallback).
+/// Default key: a path plus its own mtime (media, executables, fallback), at
+/// full grid size. Content thumbnails in list view use `cache_key_sized` with
+/// [`SMALL_THUMB_SIZE`] instead.
 pub fn cache_key(path: &Path, mtime: Option<SystemTime>) -> CacheKey {
     stamped_key(path, mtime_nanos(mtime))
 }
 
 /// Key from an explicit stamp, for `.lnk` icons whose validity is keyed by the
-/// icon source rather than the link's own mtime.
+/// icon source rather than the link's own mtime. Full grid size.
 pub(crate) fn stamped_key(path: &Path, stamp: u64) -> CacheKey {
+    stamped_key_sized(path, stamp, THUMB_SIZE)
+}
+
+/// Key from an explicit stamp at an explicit tile size. Backs the list/grid
+/// thumbnail split: same (path, stamp), different size, different entry.
+pub(crate) fn stamped_key_sized(path: &Path, stamp: u64, size: u32) -> CacheKey {
     CacheKey {
         path: path.to_path_buf(),
         stamp,
+        size,
     }
+}
+
+/// Default key from a path plus mtime, at an explicit tile size.
+pub(crate) fn cache_key_sized(path: &Path, mtime: Option<SystemTime>, size: u32) -> CacheKey {
+    stamped_key_sized(path, mtime_nanos(mtime), size)
 }
 
 impl CacheKey {
     /// Stable disk-cache key for this entry: hash of the source path bytes
-    /// plus the stamp. Same (path, stamp) always maps to the same PNG file; a
-    /// changed stamp (edited file) maps to a different one, so no index table
-    /// is needed. Content thumbnails only; used by [`crate::cache`].
+    /// plus the stamp (plus the size for small tiles; full-size keys hash
+    /// exactly like before, so PNGs written before the split still hit). A
+    /// changed stamp (edited file) maps to a different file, so no index
+    /// table is needed. Content thumbnails only; used by [`crate::cache`].
     pub(crate) fn disk_key(&self) -> String {
-        crate::cache::content_key(&self.path, self.stamp)
+        crate::cache::content_key_sized(&self.path, self.stamp, self.size)
     }
 }
 
@@ -710,20 +748,49 @@ pub(crate) fn extension_of(entry: &Entry) -> String {
         .unwrap_or_default()
 }
 
-/// The cache key to probe for a visible entry. For `.lnk` shortcuts this uses
-/// the resolved icon-source stamp (path + source mtime + index) so the probe
-/// follows the source's identity; absent a resolution it falls back to the
-/// link's own mtime. Everything else keys by its own mtime.
-pub(crate) fn probe_key(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) -> CacheKey {
-    let cache = ply.thumb_cache().read(cx);
+/// Tile size for per-file content thumbnails in the current view: list rows
+/// paint at 16px so 48px tiles are plenty; grid cells paint at 56px and keep
+/// the full 96px tiles. Single source of truth for the size rule: both the
+/// render probe (`probe_key`) and the working-set lock (`lock_key_for`, used
+/// by the browser) go through it, so a painted tile is always a locked tile.
+pub(crate) fn content_size_for_view(view: ViewMode) -> u32 {
+    match view {
+        ViewMode::List => SMALL_THUMB_SIZE,
+        ViewMode::Grid => THUMB_SIZE,
+    }
+}
+
+/// The cache key for one entry. Shared by the render probe and the browser's
+/// working-set lock build so they can never disagree: content thumbnails key
+/// by view size, `.lnk` icons by resolved source stamp, everything else by its
+/// own mtime at full size (folder/exe path icons decode at 48px native, class
+/// icons never enter this map at all).
+pub(crate) fn lock_key_for(entry: &Entry, lnk_stamp: Option<u64>, content_size: u32) -> CacheKey {
     if is_lnk(entry) {
-        match cache.lnk_stamp(&entry.path) {
+        match lnk_stamp {
             Some(stamp) => stamped_key(&entry.path, stamp),
             None => cache_key(&entry.path, entry.modified),
         }
+    } else if wants_content_thumbnail(entry) {
+        cache_key_sized(&entry.path, entry.modified, content_size)
     } else {
         cache_key(&entry.path, entry.modified)
     }
+}
+
+/// The cache key to probe for a visible entry. For `.lnk` shortcuts this uses
+/// the resolved icon-source stamp (path + source mtime + index) so the probe
+/// follows the source's identity; absent a resolution it falls back to the
+/// link's own mtime. Content thumbnails key by view size. Everything else keys
+/// by its own mtime. Delegates to [`lock_key_for`] so probe and lock agree.
+pub(crate) fn probe_key(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>) -> CacheKey {
+    let cache = ply.thumb_cache().read(cx);
+    let lnk_stamp = if is_lnk(entry) {
+        cache.lnk_stamp(&entry.path)
+    } else {
+        None
+    };
+    lock_key_for(entry, lnk_stamp, content_size_for_view(ply.view))
 }
 
 /// Whether a thumbnail result from `request_gen` should be applied given the
@@ -818,6 +885,9 @@ pub fn request_thumbnail(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>, reques
     // extraction. Everything here is generation-guarded so a disk hit for a
     // now-stale folder never pollutes the working set.
     cx.spawn(async move |this, cx| {
+        // The tile size travels with the key: list-view content extracts at
+        // 48, grid content at 96 (`.lnk` icons always key at full size).
+        let tile_size = key.size;
         let (disk_failed, disk_hit) = if is_content {
             let dk = disk_key.clone();
             cx.background_spawn(async move {
@@ -870,7 +940,7 @@ pub fn request_thumbnail(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>, reques
                 });
                 return;
             }
-            match to_render_image(bytes, w, h) {
+            match to_render_image_sized(bytes, w, h, tile_size) {
                 Some(img) => {
                     let _ = this.update(cx, |this, cx| {
                         this.thumb_cache().update(cx, |c, _| {
@@ -908,7 +978,7 @@ pub fn request_thumbnail(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>, reques
             cx.background_spawn(async move { request_lnk(worker_path, THUMB_SIZE) })
                 .await
         } else {
-            cx.background_spawn(async move { request(worker_path, THUMB_SIZE).map(|p| (p, None)) })
+            cx.background_spawn(async move { request(worker_path, tile_size).map(|p| (p, None)) })
                 .await
         };
         // Check generation at completion time. Stale results are silently
@@ -956,13 +1026,14 @@ pub fn request_thumbnail(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>, reques
                     // thread, then insert into the working set. Best-effort
                     // write; a disk error never fails the app.
                     let write_key = disk_key.clone();
-                    if let Some((write_bytes, w, h)) = fit_thumb(bytes.clone(), w, h) {
+                    if let Some((write_bytes, w, h)) = fit_thumb_to(bytes.clone(), w, h, tile_size)
+                    {
                         cx.background_spawn(async move {
                             crate::cache::store(&write_key, &write_bytes, w, h);
                         })
                         .detach();
                     }
-                    let img = to_render_image(bytes, w, h);
+                    let img = to_render_image_sized(bytes, w, h, tile_size);
                     let _ = this.update(cx, |this, cx| {
                         this.thumb_cache().update(cx, |c, _| {
                             c.unmark_inflight(&key);
@@ -1294,32 +1365,38 @@ pub fn refresh_lnk(paths: &[PathBuf], cx: &mut Context<Ply>) {
     }
 }
 
-/// Normalise a decoded RGBA raster to at most [`THUMB_SIZE`] on its longer
-/// side BEFORE it becomes a `RenderImage`. The shell's `GetImage` can hand
-/// back bitmaps far larger than the requested size; without a cap every
-/// painted thumbnail becomes a full-size atlas tile (multi-MB tiles for
-/// camera photos), which dominates the GPU working set while browsing a
-/// media folder. The display always draws at the same cell size, so a small
-/// texture is visually identical but a fraction of the bytes.
-fn fit_thumb(bytes: Vec<u8>, w: u32, h: u32) -> Option<(Vec<u8>, u32, u32)> {
+/// Normalise a decoded RGBA raster to at most `cap` on its longer side
+/// BEFORE it becomes a `RenderImage`. The shell's `GetImage` can hand back
+/// bitmaps far larger than the requested size; without a cap every painted
+/// thumbnail becomes a full-size atlas tile (multi-MB tiles for camera
+/// photos), which dominates the GPU working set while browsing a media
+/// folder. The display always draws at the same cell size, so a small texture
+/// is visually identical but a fraction of the bytes. Grid content caps at
+/// [`THUMB_SIZE`], list-view content at [`SMALL_THUMB_SIZE`].
+fn fit_thumb_to(bytes: Vec<u8>, w: u32, h: u32, cap: u32) -> Option<(Vec<u8>, u32, u32)> {
     let buf = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(w, h, bytes)?;
     let (iw, ih) = buf.dimensions();
     let longest = iw.max(ih);
-    if longest <= THUMB_SIZE {
+    if longest <= cap {
         return Some((buf.into_raw(), iw, ih));
     }
-    let scale = THUMB_SIZE as f32 / longest as f32;
+    let scale = cap as f32 / longest as f32;
     let nw = ((iw as f32 * scale).round() as u32).max(1);
     let nh = ((ih as f32 * scale).round() as u32).max(1);
     let small = image::imageops::resize(&buf, nw, nh, image::imageops::FilterType::Triangle);
     Some((small.into_raw(), nw, nh))
 }
 
-fn to_render_image(bytes: Vec<u8>, w: u32, h: u32) -> Option<Arc<RenderImage>> {
-    let (bytes, w, h) = fit_thumb(bytes, w, h)?;
+/// Build a `RenderImage` from decoded RGBA, fitting to `cap` first.
+fn to_render_image_sized(bytes: Vec<u8>, w: u32, h: u32, cap: u32) -> Option<Arc<RenderImage>> {
+    let (bytes, w, h) = fit_thumb_to(bytes, w, h, cap)?;
     let buf = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(w, h, bytes)?;
     let frame = image::Frame::new(buf);
     Some(Arc::new(RenderImage::new(vec![frame])))
+}
+
+fn to_render_image(bytes: Vec<u8>, w: u32, h: u32) -> Option<Arc<RenderImage>> {
+    to_render_image_sized(bytes, w, h, THUMB_SIZE)
 }
 
 #[cfg(windows)]
@@ -2838,6 +2915,83 @@ mod tests {
             stamped_key(p, 0) != stamped_key(p, nanos),
             "different stamps must key different cache entries"
         );
+    }
+
+    // --- RAM pass: tile split and caps ---
+
+    #[test]
+    fn ram_caps_are_tight() {
+        assert_eq!(BUDGET, 4 * 1024 * 1024);
+        assert_eq!(LOCK_CAP, 64);
+        assert_eq!(PINNED_CAP, 96);
+        assert_eq!(FLUSH_THRESHOLD, 8 * 1024 * 1024);
+        assert_eq!(TYPE_ICON_BATCH_CAP, 128);
+        assert_eq!(THUMB_SIZE, 96);
+        assert_eq!(SMALL_THUMB_SIZE, 48);
+    }
+
+    #[test]
+    fn tile_size_splits_list_and_grid() {
+        use crate::app::ViewMode;
+        assert_eq!(content_size_for_view(ViewMode::List), SMALL_THUMB_SIZE);
+        assert_eq!(content_size_for_view(ViewMode::Grid), THUMB_SIZE);
+    }
+
+    #[test]
+    fn size_is_part_of_the_key_but_full_tiles_keep_their_disk_file() {
+        let p = Path::new("C:\\pics\\a.jpg");
+        let full = stamped_key_sized(p, 7, THUMB_SIZE);
+        let small = stamped_key_sized(p, 7, SMALL_THUMB_SIZE);
+        assert_ne!(full, small, "list and grid tiles must not share an entry");
+        assert_eq!(full, stamped_key(p, 7), "the default key stays full-size");
+        assert_eq!(
+            full.disk_key(),
+            crate::cache::content_key(p, 7),
+            "PNGs written before the split must still hit"
+        );
+        assert_ne!(full.disk_key(), small.disk_key());
+    }
+
+    #[test]
+    fn lock_key_follows_the_same_size_rule_as_the_probe() {
+        // Content entries key by view size; folders keep the full-size key.
+        let photo = entry("photo.jpg");
+        assert!(wants_content_thumbnail(&photo));
+        let k_list = lock_key_for(&photo, None, SMALL_THUMB_SIZE);
+        let k_grid = lock_key_for(&photo, None, THUMB_SIZE);
+        assert_ne!(k_list, k_grid);
+        assert_eq!(
+            k_list,
+            cache_key_sized(&photo.path, photo.modified, SMALL_THUMB_SIZE)
+        );
+        let folder = dir("Folder");
+        assert_eq!(
+            lock_key_for(&folder, None, SMALL_THUMB_SIZE),
+            stamped_key(&folder.path, mtime_nanos(folder.modified)),
+            "path icons do not take the split"
+        );
+        // `.lnk` follows the source stamp, never the view size.
+        let lnk = entry("App.lnk");
+        assert_eq!(
+            lock_key_for(&lnk, Some(99), SMALL_THUMB_SIZE),
+            stamped_key(&lnk.path, 99)
+        );
+        assert_eq!(
+            lock_key_for(&lnk, None, SMALL_THUMB_SIZE),
+            cache_key(&lnk.path, lnk.modified)
+        );
+    }
+
+    #[test]
+    fn small_fit_caps_the_long_side_at_48() {
+        let rgba = vec![9u8; 200 * 100 * 4];
+        let (bytes, w, h) = fit_thumb_to(rgba, 200, 100, SMALL_THUMB_SIZE).unwrap();
+        assert_eq!((w, h), (48, 24));
+        assert_eq!(bytes.len(), 48 * 24 * 4);
+        // The same raster at the full cap keeps its own size.
+        let rgba = vec![9u8; 200 * 100 * 4];
+        let (_, w, h) = fit_thumb_to(rgba, 200, 100, THUMB_SIZE).unwrap();
+        assert_eq!((w, h), (96, 48));
     }
 
     // --- Working-set lock tests ---

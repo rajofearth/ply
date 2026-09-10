@@ -381,6 +381,9 @@ pub struct Ply {
     /// listing, and `typing()` stands down while it holds focus.
     pub filter_field: Entity<FieldState>,
     pub filter_text: String,
+    /// Debounce generation for filter rebuilds: each keystroke bumps it and
+    /// schedules a rebuild 80 ms out; only the latest generation rebuilds.
+    filter_gen: u64,
     /// Item count the filter placeholder was last written for.
     pub placeholder_for: Option<usize>,
     /// Indices into the Ready listing that survive `filter_text`.
@@ -464,16 +467,39 @@ impl Ply {
         ]);
 
         // Filter typing refilters the listing. `filter_text` (not the
-        // entity's value) is the shared source the listing reads.
+        // entity's value) is the shared source the listing reads. Rebuilds
+        // are debounced 80 ms (D10's 60-120 ms band) so a burst of keystrokes
+        // pays one refilter, not one per key; the generation drops superseded
+        // timers and the needle check drops stale ones. Selection clears with
+        // the rebuild, in the same order as before, just delayed.
         let filter_field = cx.new(|cx| FieldState::new(window, cx));
         cx.subscribe(&filter_field, |this, input, event: &FieldEvent, cx| {
-            if matches!(event, FieldEvent::Change) {
-                this.filter_text = input.read(cx).value().to_string();
-                this.rebuild_visible();
-                this.clear_selection_paths();
-                this.anchor = None;
-                cx.notify();
+            if !matches!(event, FieldEvent::Change) {
+                return;
             }
+            let needle = input.read(cx).value().to_string();
+            if this.filter_text == needle {
+                return; // unchanged: no rebuild, no notify
+            }
+            this.filter_text = needle.clone();
+            this.filter_gen += 1;
+            let seen = this.filter_gen;
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                this.update(cx, |this, cx| {
+                    if this.filter_gen != seen || this.filter_text != needle {
+                        return;
+                    }
+                    this.rebuild_visible();
+                    this.clear_selection_paths();
+                    this.anchor = None;
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
         })
         .detach();
 
@@ -495,6 +521,7 @@ impl Ply {
             sort: SortKey::default(),
             filter_field,
             filter_text: String::new(),
+            filter_gen: 0,
             placeholder_for: None,
             visible_indices: Vec::new(),
             visible_entries: Vec::new(),

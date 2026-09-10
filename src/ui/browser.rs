@@ -77,21 +77,26 @@ pub fn render(ply: &Ply, window: &Window, cx: &mut Context<Ply>) -> impl IntoEle
         let hi = (vp.end + LOCK_OVERSCAN).min(entries.len());
         let center = (vp.start + vp.end) / 2;
         let (lo, hi) = clamp_lock_window(lo, hi, center);
+        // Content tiles key by view size (48px rows in list view, 96px cells
+        // in grid); the probe builds the same keys through `lock_key_for`,
+        // so a painted tile is always a locked tile.
+        let content_size = thumbs::content_size_for_view(ply.view);
         let thumb = ply.thumb_cache();
         thumb.update(cx, |cache, _| {
-            let mut keys = Vec::with_capacity(hi - lo);
-            for e in &entries[lo..hi] {
-                let key = if thumbs::is_lnk(e) {
-                    match cache.lnk_stamp(&e.path) {
-                        Some(stamp) => thumbs::stamped_key(&e.path, stamp),
-                        None => thumbs::cache_key(&e.path, e.modified),
-                    }
-                } else {
-                    thumbs::cache_key(&e.path, e.modified)
-                };
-                keys.push(key);
-            }
-            cache.set_working_set(&keys);
+            LOCK_KEYS_SCRATCH.with(|scratch| {
+                let mut keys = scratch.borrow_mut();
+                keys.clear();
+                keys.reserve(hi.saturating_sub(lo));
+                for e in &entries[lo..hi] {
+                    let lnk_stamp = if thumbs::is_lnk(e) {
+                        cache.lnk_stamp(&e.path)
+                    } else {
+                        None
+                    };
+                    keys.push(thumbs::lock_key_for(e, lnk_stamp, content_size));
+                }
+                cache.set_working_set(&keys);
+            });
         });
     }
 
@@ -189,6 +194,14 @@ const PREFETCH_OVERSCAN: usize = 64;
 /// window is clamped to `LOCK_CAP` (see `clamp_lock_window`), so this only
 /// needs to cover a frame or two of fast scrolling.
 const LOCK_OVERSCAN: usize = 48;
+
+// Scratch for the working-set lock keys, reused across frames so the render
+// path stops allocating one key vector per frame. Capacity persists; the
+// keys themselves still clone their paths, exactly as before.
+thread_local! {
+    static LOCK_KEYS_SCRATCH: std::cell::RefCell<Vec<thumbs::CacheKey>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
 
 /// Shrink `[lo, hi)` symmetrically around `center` to at most `LOCK_CAP`
 /// entries. The spill path evicts by smallest-byte-first in hash order, so
@@ -645,7 +658,10 @@ mod tests {
     fn lock_window_clamps_to_cap_around_painted_center() {
         use crate::thumbs::LOCK_CAP;
         // Small window passes through untouched.
-        assert_eq!(clamp_lock_window(100, 172, 136), (100, 172));
+        assert_eq!(clamp_lock_window(100, 160, 130), (100, 160));
+        // A window one past the cap clamps symmetrically around the center.
+        let (lo, hi) = clamp_lock_window(100, 100 + LOCK_CAP + 1, 100 + LOCK_CAP / 2);
+        assert_eq!(hi - lo, LOCK_CAP);
         // Oversized window shrinks symmetrically around the painted center.
         let (lo, hi) = clamp_lock_window(0, 1000, 500);
         assert_eq!(hi - lo, LOCK_CAP);

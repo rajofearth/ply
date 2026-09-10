@@ -45,8 +45,17 @@ impl Fnv1a {
     }
 }
 
-/// Hard ceiling for the on-disk cache (~128 MiB).
-pub const DISK_CACHE_MAX_BYTES: u64 = 128 * 1024 * 1024;
+/// Hard ceiling for the on-disk cache (~48 MiB).
+pub const DISK_CACHE_MAX_BYTES: u64 = 48 * 1024 * 1024;
+
+/// Hard ceiling on cached file count. Bounds readdir/stat work and keeps a
+/// small-file-heavy cache from sprawling in count while staying under bytes.
+pub const DISK_CACHE_MAX_FILES: u64 = 4000;
+
+/// Per-file size the launch fast path assumes: count times this ceiling
+/// bounds the total without stating every file. Stored PNGs are fitted
+/// thumbnails (at most 96px), so encoded bytes stay far below this.
+const SCAN_FAST_PATH_FILE_CEIL: u64 = 64 * 1024;
 
 /// Compute a stable content key from a source path and mtime stamp.
 /// The same (path, stamp) always produces the same hex string; a different
@@ -55,6 +64,21 @@ pub fn content_key(path: &Path, stamp: u64) -> String {
     let mut h = Fnv1a::new();
     h.write_bytes(path.as_os_str().to_string_lossy().as_bytes());
     h.write_u64(stamp);
+    format!("{:016x}", h.finish_u64())
+}
+
+/// [`content_key`] at an explicit tile size. Full-size keys hash exactly like
+/// `content_key`, so PNGs written before the list/grid split still hit; small
+/// tiles mix the size in and live next to the full file. Disk bytes stay PNG
+/// either way, so the format never changes.
+pub fn content_key_sized(path: &Path, stamp: u64, size: u32) -> String {
+    if size == crate::thumbs::THUMB_SIZE {
+        return content_key(path, stamp);
+    }
+    let mut h = Fnv1a::new();
+    h.write_bytes(path.as_os_str().to_string_lossy().as_bytes());
+    h.write_u64(stamp);
+    h.write_u64(size as u64);
     format!("{:016x}", h.finish_u64())
 }
 
@@ -101,9 +125,7 @@ fn decode_png_rgba(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     if w == 0 || h == 0 {
         return None;
     }
-    let pixels = (w as usize)
-        .checked_mul(h as usize)?
-        .checked_mul(4)?;
+    let pixels = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
     match (info.color_type, info.bit_depth) {
         (png::ColorType::Rgba, png::BitDepth::Eight) => {
             if raw.len() < pixels {
@@ -206,46 +228,88 @@ fn encode_png_rgba(rgba: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
 }
 
 /// Delete oldest-by-mtime files in `normal/` when total bytes exceed
-/// `max_bytes`. Best-effort; never panics.
+/// `max_bytes` or the file count exceeds [`DISK_CACHE_MAX_FILES`].
+/// Best-effort; never panics.
 pub fn evict(max_bytes: u64) {
-    let Some(dir) = cache_dir() else { return };
-    evict_at(&dir.join("normal"), max_bytes);
+    evict_with_limits(max_bytes, DISK_CACHE_MAX_FILES);
 }
 
-/// Evict files in `normal_dir` whose aggregate size exceeds `max_bytes`,
-/// oldest-first by mtime. Removing entries whose source file no longer exists
-/// is a future extension; for now the cache is only size-bounded.
-fn evict_at(normal_dir: &Path, max_bytes: u64) {
+/// [`evict`] with explicit caps, so tests and the background pass can tune
+/// each bound independently.
+pub fn evict_with_limits(max_bytes: u64, max_files: u64) {
+    let Some(dir) = cache_dir() else { return };
+    evict_at_limited(&dir.join("normal"), max_bytes, max_files, usize::MAX);
+}
+
+/// Evict oldest-first, removing at most `max_remove` files per call. Returns
+/// the files removed; call again until it returns 0 to drain fully. Lets the
+/// app bound background eviction work per idle slice instead of deleting
+/// thousands of files in one launch pass.
+#[allow(dead_code)] // wired up by the background idle pass next; unit-covered.
+pub fn evict_incremental(max_bytes: u64, max_files: u64, max_remove: usize) -> usize {
+    let Some(dir) = cache_dir() else { return 0 };
+    evict_at_limited(&dir.join("normal"), max_bytes, max_files, max_remove)
+}
+
+/// Evict files in `normal_dir` whose aggregate size exceeds `max_bytes` or
+/// whose count exceeds `max_files`, oldest-first by mtime. Fast path: when a
+/// plain readdir (no stat, no sort) already proves the cache is small, return
+/// without stating every file, so a warm launch does one directory read and
+/// nothing else. Removing entries whose source file no longer exists is a
+/// future extension; for now the cache is only size- and count-bounded.
+/// Returns the files removed.
+fn evict_at_limited(normal_dir: &Path, max_bytes: u64, max_files: u64, max_remove: usize) -> usize {
     let Ok(entries) = fs::read_dir(normal_dir) else {
-        return;
+        return 0;
     };
+    let names: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+
+    // Fast path: count times a per-file ceiling every stored PNG stays under
+    // proves both caps hold without a single stat call.
+    if names.len() as u64 <= max_files
+        && (names.len() as u64).saturating_mul(SCAN_FAST_PATH_FILE_CEIL) <= max_bytes
+    {
+        return 0;
+    }
 
     // Collect (path, size, mtime) for every cached file.
-    let mut files: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
+    let mut files: Vec<(PathBuf, u64, SystemTime)> = Vec::with_capacity(names.len());
     let mut total: u64 = 0;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let meta = match fs::metadata(&path) {
+    for path in &names {
+        let meta = match fs::metadata(path) {
             Ok(m) => m,
             Err(_) => continue,
         };
         let size = meta.len();
         let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
         total += size;
-        files.push((path, size, mtime));
+        files.push((path.clone(), size, mtime));
     }
 
     // Sort oldest-first for LRU-style eviction.
     files.sort_by_key(|a| a.2);
 
-    // Evict oldest entries until under the cap.
+    // Evict oldest entries until under both caps (or the per-call budget).
+    let mut removed = 0usize;
     for (path, size, _) in &files {
-        if total <= max_bytes {
+        if total <= max_bytes && names.len() as u64 - removed as u64 <= max_files {
+            break;
+        }
+        if removed >= max_remove {
             break;
         }
         let _ = fs::remove_file(path);
         total = total.saturating_sub(*size);
+        removed += 1;
     }
+    removed
+}
+
+/// Back-compat seam for the existing tests: full eviction at the default file
+/// cap, removing everything over budget in one call.
+#[cfg(test)]
+fn evict_at(normal_dir: &Path, max_bytes: u64) {
+    evict_at_limited(normal_dir, max_bytes, DISK_CACHE_MAX_FILES, usize::MAX);
 }
 
 #[cfg(test)]
@@ -422,5 +486,79 @@ mod tests {
         let key = content_key(Path::new("test.png"), 0);
         assert_eq!(key.len(), 16);
         assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn sized_keys_split_small_tiles_but_keep_full_tiles_stable() {
+        let p = Path::new("C:\\pics\\a.jpg");
+        assert_eq!(
+            content_key_sized(p, 7, 96),
+            content_key(p, 7),
+            "PNGs written before the split must still hit"
+        );
+        assert_ne!(
+            content_key_sized(p, 7, 48),
+            content_key(p, 7),
+            "small tiles live next to the full file"
+        );
+        assert_eq!(content_key_sized(p, 7, 48), content_key_sized(p, 7, 48));
+    }
+
+    #[test]
+    fn file_count_cap_evicts_down_to_the_cap() {
+        let root = temp_dir_for("filecap");
+        let normal = root.join("normal");
+        let _ = fs::create_dir_all(&normal);
+        let rgba: Vec<u8> = vec![64u8; 8 * 8 * 4];
+        for i in 0..4 {
+            store_at(&rgba, 8, 8, &format!("key{i:016x}"), &root);
+        }
+        // Bytes cap huge: only the count cap binds. Exactly two must remain.
+        evict_at_limited(&normal, u64::MAX, 2, usize::MAX);
+        let remaining: Vec<_> = fs::read_dir(&normal).unwrap().flatten().collect();
+        assert_eq!(remaining.len(), 2);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn incremental_evict_bounds_work_per_call() {
+        let root = temp_dir_for("incremental");
+        let normal = root.join("normal");
+        let _ = fs::create_dir_all(&normal);
+        let rgba: Vec<u8> = vec![64u8; 8 * 8 * 4];
+        for i in 0..4 {
+            store_at(&rgba, 8, 8, &format!("inc{i:016x}"), &root);
+        }
+        // One removal per call until the count cap holds.
+        assert_eq!(evict_at_limited(&normal, u64::MAX, 1, 1), 1);
+        assert_eq!(evict_at_limited(&normal, u64::MAX, 1, 1), 1);
+        assert_eq!(evict_at_limited(&normal, u64::MAX, 1, 1), 1);
+        assert_eq!(evict_at_limited(&normal, u64::MAX, 1, 0), 0);
+        assert_eq!(evict_at_limited(&normal, u64::MAX, 1, usize::MAX), 0);
+        let remaining: Vec<_> = fs::read_dir(&normal).unwrap().flatten().collect();
+        assert_eq!(remaining.len(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn warm_cache_under_cap_keeps_everything() {
+        let root = temp_dir_for("warmevict");
+        let normal = root.join("normal");
+        let _ = fs::create_dir_all(&normal);
+        let rgba: Vec<u8> = vec![64u8; 8 * 8 * 4];
+        for i in 0..3 {
+            store_at(&rgba, 8, 8, &format!("warm{i:016x}"), &root);
+        }
+        // Three tiny files sit far under both caps: the fast path must not
+        // touch them.
+        evict_at_limited(
+            &normal,
+            DISK_CACHE_MAX_BYTES,
+            DISK_CACHE_MAX_FILES,
+            usize::MAX,
+        );
+        let remaining: Vec<_> = fs::read_dir(&normal).unwrap().flatten().collect();
+        assert_eq!(remaining.len(), 3);
+        let _ = fs::remove_dir_all(&root);
     }
 }

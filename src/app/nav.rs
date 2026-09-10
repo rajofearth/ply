@@ -171,7 +171,8 @@ impl Ply {
                 let dirs = result
                     .map(|s| {
                         this.remember_names(&s);
-                        s.entries.into_iter().map(|e| e.path).collect()
+                        // `Snapshot` shares its entries; borrow the paths out.
+                        s.entries.iter().map(|e| e.path.clone()).collect()
                     })
                     .unwrap_or_default();
                 this.children.insert(path, dirs);

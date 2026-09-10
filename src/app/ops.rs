@@ -91,12 +91,13 @@ impl Ply {
                         {
                             return;
                         }
-                        let batch_entries: Vec<_> = snapshot
-                            .entries
-                            .iter()
-                            .take(crate::thumbs::TYPE_ICON_BATCH_CAP)
-                            .cloned()
-                            .collect();
+                        // Share (not clone) the entries with the icon batch:
+                        // bumping the refcount hands the background task the
+                        // same allocation the listing paints from, instead of
+                        // cloning up to 512 full `Entry`s. Names still commit
+                        // below before any shell call runs, so a slow icon
+                        // lookup can never hold the listing at Loading.
+                        let shared = snapshot.entries.clone();
                         this.remember_names(&snapshot);
                         // Commit names now. Type icons are pre-resolved by the
                         // detached batch below and steered in when they land;
@@ -108,7 +109,7 @@ impl Ply {
                         cx.spawn(async move |this, cx| {
                             let icons = cx
                                 .background_spawn(async move {
-                                    crate::thumbs::resolve_listing_type_icons(&batch_entries)
+                                    crate::thumbs::resolve_listing_type_icons(&shared)
                                 })
                                 .await;
                             let _ = this.update(cx, |this, cx| {
@@ -144,7 +145,7 @@ impl Ply {
     /// Portable-device paths are object IDs, so keep the names the listing
     /// reported; nothing else can recover them later.
     pub(super) fn remember_names(&mut self, snapshot: &Snapshot) {
-        for entry in &snapshot.entries {
+        for entry in snapshot.entries.iter() {
             if crate::mtp::is_mtp(&entry.path) {
                 self.mtp_names
                     .insert(entry.path.clone(), entry.name.clone());
@@ -155,8 +156,11 @@ impl Ply {
     pub(super) fn start_watch_poll(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             loop {
+                // Idle cadence, 250-500 ms per D10: the watcher itself pushes
+                // events; this only drains them. The 75 ms settle debounce
+                // below and the atime filtering in `watch.rs` are unchanged.
                 cx.background_executor()
-                    .timer(Duration::from_millis(120))
+                    .timer(Duration::from_millis(300))
                     .await;
                 if this
                     .update(cx, |this, cx| {
@@ -179,16 +183,21 @@ impl Ply {
 
     /// Periodically re-resolve `.lnk` icon sources so a rebuilt target or a
     /// replaced icon file refreshes on its own, without the link's mtime
-    /// changing or the folder being touched.
+    /// changing or the folder being touched. Paused while there is nothing to
+    /// refresh (no `.lnk` visible) and while the window is minimized: shell
+    /// work no one can see. Both pauses are per-tick gates, so icons refresh
+    /// on the first tick after a link appears or the window returns, and
+    /// navigation/reload re-resolve the batch anyway.
     pub(super) fn start_lnk_refresh(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(4000))
                     .await;
-                let lnks = this
+                let paused = this
                     .update(cx, |this, _| {
-                        this.visible()
+                        let lnks = this
+                            .visible()
                             .iter()
                             .filter(|e| {
                                 Path::new(&e.name)
@@ -196,15 +205,18 @@ impl Ply {
                                     .is_some_and(|x| x.eq_ignore_ascii_case("lnk"))
                             })
                             .map(|e| e.path.clone())
-                            .collect::<Vec<_>>()
+                            .collect::<Vec<_>>();
+                        // One shared gate (truth table in tests): no links
+                        // or a minimized window means paused for this tick.
+                        should_refresh_lnk(!lnks.is_empty(), app_minimized()).then_some(lnks)
                     })
                     .ok();
-                let Some(lnks) = lnks else {
+                let Some(paused) = paused else {
                     break;
                 };
-                if lnks.is_empty() {
+                let Some(lnks) = paused else {
                     continue;
-                }
+                };
                 let _ = this.update(cx, |_this, cx| crate::thumbs::refresh_lnk(&lnks, cx));
             }
         })
@@ -326,24 +338,31 @@ impl Ply {
     /// mirror the result into the owned [`Ply::visible_entries`] cache so the
     /// render path never allocates a fresh `Vec` per frame.
     pub(super) fn rebuild_visible(&mut self) {
-        self.visible_indices = Vec::new();
-        self.visible_entries = Vec::new();
+        // Reuse both allocations across keystrokes: `clear` keeps the
+        // capacity, `filter_indices_into` fills `visible_indices` in place,
+        // and the entry cache only tops up what it lacks.
+        self.visible_indices.clear();
+        self.visible_entries.clear();
         let LoadState::Ready(snapshot) = &self.listing else {
             return;
         };
-        let indices = filter_indices(&snapshot.entries, &self.filter_text);
         if self.filter_text.is_empty() {
             // Unfiltered: `visible()` serves the snapshot's own slice, so no
             // clone cache is kept here; only the index set needs rebuilding.
-            self.visible_indices = indices;
+            self.visible_indices.extend(0..snapshot.entries.len());
             return;
         }
-        self.visible_entries = indices
-            .iter()
-            .filter_map(|&i| snapshot.entries.get(i))
-            .cloned()
-            .collect();
-        self.visible_indices = indices;
+        crate::listing::filter_indices_into(
+            &snapshot.entries,
+            &self.filter_text,
+            &mut self.visible_indices,
+        );
+        self.visible_entries.reserve(self.visible_indices.len());
+        for &i in &self.visible_indices {
+            if let Some(entry) = snapshot.entries.get(i) {
+                self.visible_entries.push(entry.clone());
+            }
+        }
     }
 
     /// Entries in the current folder that survive the filter box, as a slice in
@@ -419,59 +438,97 @@ impl Ply {
     }
 
     pub fn click_row(&mut self, ix: usize, extend: bool, toggle: bool, cx: &mut Context<Self>) {
-        let paths: Vec<PathBuf> = self.visible().iter().map(|e| e.path.clone()).collect();
-        let Some(path) = paths.get(ix).cloned() else {
-            return;
-        };
-        if extend && let Some(anchor) = self.anchor {
-            let (lo, hi) = if anchor <= ix {
-                (anchor, ix)
-            } else {
-                (ix, anchor)
+        // Resolve by index: clone only the clicked/range paths, never the
+        // whole visible list.
+        enum Click {
+            Range(Vec<PathBuf>),
+            Toggle(PathBuf),
+            Single(PathBuf),
+        }
+        let click = {
+            let visible = self.visible();
+            let Some(target) = visible.get(ix).map(|e| e.path.clone()) else {
+                return;
             };
-            self.replace_selection(paths[lo..=hi].to_vec());
-        } else if toggle {
-            match self.selection.iter().position(|p| *p == path) {
-                Some(at) => {
-                    let removed = self.selection.remove(at);
-                    self.selection_set.remove(&removed);
-                }
-                None => {
-                    self.selection_set.insert(path.clone());
-                    self.selection.push(path);
-                }
+            if extend && let Some(anchor) = self.anchor {
+                let (mut lo, mut hi) = if anchor <= ix {
+                    (anchor, ix)
+                } else {
+                    (ix, anchor)
+                };
+                // A stale anchor (listing shrank under it) used to panic on
+                // the slice below; clamp instead. Valid anchors are untouched,
+                // so every non-crashing input behaves exactly as before.
+                hi = hi.min(visible.len().saturating_sub(1));
+                lo = lo.min(hi);
+                Click::Range(visible[lo..=hi].iter().map(|e| e.path.clone()).collect())
+            } else if toggle {
+                Click::Toggle(target)
+            } else {
+                Click::Single(target)
             }
-            self.anchor = Some(ix);
-        } else {
-            self.replace_selection(vec![path]);
-            self.anchor = Some(ix);
+        };
+        match click {
+            Click::Range(paths) => {
+                self.replace_selection(paths);
+            }
+            Click::Toggle(path) => {
+                match self.selection.iter().position(|p| *p == path) {
+                    Some(at) => {
+                        let removed = self.selection.remove(at);
+                        self.selection_set.remove(&removed);
+                    }
+                    None => {
+                        self.selection_set.insert(path.clone());
+                        self.selection.push(path);
+                    }
+                }
+                self.anchor = Some(ix);
+            }
+            Click::Single(path) => {
+                self.replace_selection(vec![path]);
+                self.anchor = Some(ix);
+            }
         }
         cx.notify();
     }
 
     /// Arrow-key movement. `extend` grows the range from the anchor.
     pub fn move_selection(&mut self, delta: isize, extend: bool, cx: &mut Context<Self>) {
-        let paths: Vec<PathBuf> = self.visible().iter().map(|e| e.path.clone()).collect();
-        if paths.is_empty() {
-            return;
-        }
-        let current = self
-            .selection
-            .last()
-            .and_then(|last| paths.iter().position(|p| p == last))
-            .unwrap_or(0) as isize;
-        let next = (current + delta).clamp(0, paths.len() as isize - 1) as usize;
+        // Index-resolved like `click_row`: the current position is found by
+        // scanning paths without cloning them, then only the target/range is
+        // cloned.
+        let (current, next, len) = {
+            let visible = self.visible();
+            if visible.is_empty() {
+                return;
+            }
+            let current = self
+                .selection
+                .last()
+                .and_then(|last| visible.iter().position(|e| e.path == *last))
+                .unwrap_or(0) as isize;
+            let next = (current + delta).clamp(0, visible.len() as isize - 1) as usize;
+            (current as usize, next, visible.len())
+        };
         if extend {
-            let anchor = self.anchor.unwrap_or(current as usize);
-            let (lo, hi) = if anchor <= next {
+            let anchor = self.anchor.unwrap_or(current);
+            let (mut lo, mut hi) = if anchor <= next {
                 (anchor, next)
             } else {
                 (next, anchor)
             };
-            self.replace_selection(paths[lo..=hi].to_vec());
+            hi = hi.min(len.saturating_sub(1));
+            lo = lo.min(hi);
+            let paths: Vec<PathBuf> = self.visible()[lo..=hi]
+                .iter()
+                .map(|e| e.path.clone())
+                .collect();
+            self.replace_selection(paths);
             self.anchor = Some(anchor);
         } else {
-            self.replace_selection(vec![paths[next].clone()]);
+            let path = self.visible()[next].path.clone();
+            self.replace_selection(vec![path]);
             self.anchor = Some(next);
         }
         cx.notify();
@@ -486,18 +543,23 @@ impl Ply {
         extend: bool,
         cx: &mut Context<Self>,
     ) {
-        let paths: Vec<PathBuf> = self.visible().iter().map(|e| e.path.clone()).collect();
-        if paths.is_empty() || cols == 0 {
-            return;
-        }
+        // Index-resolved like `click_row`: scan for the current position
+        // without cloning, then clone only the target/range. The grid math
+        // below is unchanged; only path sourcing changed.
+        let total = {
+            let visible = self.visible();
+            if visible.is_empty() || cols == 0 {
+                return;
+            }
+            visible.len()
+        };
         let cur = self
             .selection
             .last()
-            .and_then(|last| paths.iter().position(|p| p == last))
+            .and_then(|last| self.visible().iter().position(|e| e.path == *last))
             .unwrap_or(0);
         let row = cur / cols;
         let col = cur % cols;
-        let total = paths.len();
         let last_row_len = total.saturating_sub((total / cols) * cols);
         let max_row = if last_row_len == 0 {
             total / cols - 1
@@ -521,15 +583,23 @@ impl Ply {
 
         if extend {
             let anchor = self.anchor.unwrap_or(cur);
-            let (lo, hi) = if anchor <= next {
+            let (mut lo, mut hi) = if anchor <= next {
                 (anchor, next)
             } else {
                 (next, anchor)
             };
-            self.replace_selection(paths[lo..=hi].to_vec());
+            // Same stale-anchor clamp as `click_row`; valid anchors untouched.
+            hi = hi.min(total.saturating_sub(1));
+            lo = lo.min(hi);
+            let paths: Vec<PathBuf> = self.visible()[lo..=hi]
+                .iter()
+                .map(|e| e.path.clone())
+                .collect();
+            self.replace_selection(paths);
             self.anchor = Some(anchor);
         } else {
-            self.replace_selection(vec![paths[next].clone()]);
+            let path = self.visible()[next].path.clone();
+            self.replace_selection(vec![path]);
             self.anchor = Some(next);
         }
         cx.notify();
@@ -1900,20 +1970,72 @@ fn marked(
     .into()
 }
 
+/// Whether the `.lnk` timer should fire this tick. Pure so the truth table is
+/// testable without a window: links visible and window up means refresh.
+fn should_refresh_lnk(has_lnk: bool, minimized: bool) -> bool {
+    has_lnk && !minimized
+}
+
+/// True while every top-level window of this process is minimized. GPUI
+/// exposes no minimized query, so ask the window manager directly once per
+/// 4 s tick (microseconds against the shell work it gates). Fail-open:
+/// any probing failure reports not-minimized so icons refresh rather than
+/// going stale from a probing error.
+#[cfg(windows)]
+fn app_minimized() -> bool {
+    use windows::Win32::Foundation::{HWND, LPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowThreadProcessId, IsIconic,
+    };
+    use windows::core::BOOL;
+
+    struct Scan {
+        pid: u32,
+        found: bool,
+        all_iconic: bool,
+    }
+
+    unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let scan = unsafe { &mut *(lparam.0 as *mut Scan) };
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+        if pid == scan.pid && pid != 0 {
+            scan.found = true;
+            if unsafe { !IsIconic(hwnd).as_bool() } {
+                scan.all_iconic = false;
+                return BOOL(0); // found a live window; stop enumerating
+            }
+        }
+        BOOL(1)
+    }
+
+    let mut scan = Scan {
+        pid: std::process::id(),
+        found: false,
+        all_iconic: true,
+    };
+    // `EnumWindows` reports cancellation as Err; the scan state is the answer.
+    let _ = unsafe { EnumWindows(Some(visit), LPARAM(&mut scan as *mut Scan as isize)) };
+    scan.found && scan.all_iconic
+}
+
+/// No minimized query off Windows; fail open so the timer behaves as before.
+#[cfg(not(windows))]
+fn app_minimized() -> bool {
+    false
+}
+
 /// Indices into `entries` that survive the filter, in listing order. An empty
 /// filter keeps every index. Pure and ordered, so the owned `visible_entries`
 /// cache and the index set stay identical to the old `Vec<&Entry>` slice.
+/// Matching lives in `listing::filter_indices_into` (zero-alloc ASCII fast
+/// path). Test-only wrapper: the shipping path (`rebuild_visible`) fills its
+/// scratch vec in place instead of allocating per call.
+#[cfg(test)]
 fn filter_indices(entries: &[Entry], filter: &str) -> Vec<usize> {
-    if filter.is_empty() {
-        return (0..entries.len()).collect();
-    }
-    let needle = filter.to_lowercase();
-    entries
-        .iter()
-        .enumerate()
-        .filter(|(_, e)| e.name.to_lowercase().contains(&needle))
-        .map(|(i, _)| i)
-        .collect()
+    let mut out = Vec::new();
+    crate::listing::filter_indices_into(entries, filter, &mut out);
+    out
 }
 
 #[cfg(test)]
@@ -1992,6 +2114,14 @@ mod tests {
         assert_eq!(cached.len(), 2);
         assert_eq!(cached[0].name, "alpha.txt");
         assert_eq!(cached[1].name, "almanac.png");
+    }
+
+    #[test]
+    fn lnk_refresh_gate_is_links_visible_and_window_up() {
+        assert!(should_refresh_lnk(true, false));
+        assert!(!should_refresh_lnk(false, false), "no links: paused");
+        assert!(!should_refresh_lnk(true, true), "minimized: paused");
+        assert!(!should_refresh_lnk(false, true), "both: paused");
     }
 
     #[test]
