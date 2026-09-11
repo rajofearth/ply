@@ -1,142 +1,51 @@
 # Ply engineering philosophy
 
-Ply is a file explorer, not a coding agent. Most of what keeps it small and fast
-came from studying one that is. vercel-labs/fx is a coding agent harness and CLI
-written in Zig. 585 source files, near 605k lines, zero package dependencies, a
-terminal UI that diffs changed cells, and a release binary measured at 6.12 MiB
-against a claimed 7.8 MiB ceiling. It warns on every pull request when the binary
-grows past 52 KiB.
+Software stays small and fast on purpose, never by accident. These are the beliefs behind that purpose.
 
-We studied fx as technique, not as product. Nobody needs a second one. What
-transferred was discipline rather than code, and this doc records it with the Ply
-numbers behind it. Every claim here traces to `docs/research/size-frontier.md`,
-an ADR, or `src/budget.rs`.
+## Do not link it
 
-## The smallest binary is the one you do not link
+The smallest binary is the one you never link. Every dependency is a standing cost paid on every launch, in bytes and in startup time, whether its code runs or not.
 
-Ply's release binary went from 9.77 MiB to 5.15 MiB in two cuts. Neither was a
-rewrite.
+The suckless tradition judges skill by lines removed. Apply the same test to the dependency list. A crate that serves one call site has to justify itself against the local code that would replace it.
 
-The first was the release profile. Fat LTO, `opt-level = "z"`, one codegen unit,
-strip, `panic = "abort"` took 9.77 to 7.52 MiB and saved 2.26. Link time went to
-11 minutes. For an IO-bound explorer that is a fine trade.
+## Let the platform do the hard work
 
-The second was deleting gpui-component. Ply used it for exactly one thing, a text
-field. That field had a measured marginal cost of 3.6 MiB, because the library
-drags in html5ever, markdown, ropey, lsp types, and a second copy of resvg.
-Hand-rolling the field took 7.52 to 5.15 and saved 2.37.
+Whatever the machine underneath already provides, call it instead of bundling it. Decoders, shapers, thumbnail caches, the compositor. They ship with the OS, they update with the OS, and they cost this binary nothing.
 
-A `default-features = false` line was not enough. Zed's gpui re-enables all
-fifteen of `image`'s codecs no matter what Ply asks for. When Ply moved its own
-PNG calls to the `png` crate directly, the measured change was +1,536 bytes.
-Effectively zero. That null result is the lesson. Feature unification means your
-own feature flags lie to you. Check `cargo tree` before you believe the manifest.
+This is mechanical sympathy in the original sense. Work in harmony with the layer below you rather than fighting it. It does not mean the platform is always faster. It means you check before you carry your own copy.
 
-## Let the OS do the hard work
+## Do work on demand
 
-Ply decodes and shapes as little as it can. Thumbnails come from the Windows
-shell. Text comes from DirectWrite through gpui_platform's font-kit. On the
-Windows target, wgpu, naga, cosmic-text, swash, skrifa, pathfinder, and tokio all
-measure empty. They appear only under `--target all`, pulled in by gpui's web
-path. There is no shaper to subset and no DX12-only cut to make on Windows.
+Nothing loads, scans, or warms up before something on screen needs it. Enumerate the folder in view, not the drive. Expand the branch the user opened, not the tree. Fetch the icon when the row paints.
 
-fx makes the same bet from the other side. Its terminal renders, and it writes
-only the cells that changed. If the OS already solved the problem, call the OS.
+Two borrowed ideas share this one. YAGNI says do not build the speculative feature. Demand paging says do not touch the page before the fault. One governs what gets built, the other governs when it runs.
 
-## Enumerate what you show, never index the machine
+## Never redo work
 
-ADR 0002. Ply lists the folder you are looking at and stops there. Sidebar
-branches load subfolders only when you expand the chevron. There is no background
-scan of a drive, no worktree, no index.
+If the inputs did not change, the output is already known. Fingerprint the listing and skip the reload. Key the cache and skip the extraction. Render only the rows in the window plus a little overscan.
 
-fx keeps a lazy catalog. Ply keeps none. The watch covers the Current Folder
-only, ignores atime events so reading a folder cannot retrigger itself, and skips
-`cx.notify()` when the Snapshot fingerprint has not changed. Directory IO and
-volume discovery run off the UI thread, because enumerating volumes can block on
-a network share that never answers.
+DRY names this, with one honest exception its own authors allow. A cache is a deliberate local duplication, and it stays honest only while the key stays exact. The moment two paths can disagree about freshness, the cache becomes the bug.
 
-## Paint only what changed
+## Measure first
 
-fx diffs terminal cells. Ply cannot diff a GPU scene at that granularity, so it
-applies the same idea one layer up. `uniform_list` virtualizes fixed-height rows.
-The Snapshot fingerprint stops a quiet reload from repainting at all. Working-set
-locks and generation guards stop a fast scroll from rebuilding tiles it is about
-to discard. Storm settle is 300 ms and coalesce is 16 ms. Decode, resize, and
-RenderImage build stay off the UI thread.
+No optimization without a number. Profile the binary by section, weigh each dependency with the tree, time the hot path on real data. Then decide.
 
-## Measure, then decide
-
-There is no optimization in Ply without a number.
-
-The hard ceiling is 10 MiB, in `src/budget.rs`. `cargo test budgets_report --
---nocapture` prints the release size and fails the suite when it is over. At
-baseline the headroom was 0.23 MiB, and that is what started the size work.
-
-`.github/workflows/size-delta.yml` builds release on every PR, reports MiB and
-headroom, warns when headroom drops under 0.5 MiB, and uploads the byte count as
-an artifact. The component cut was booked at 2.9 against a measured 3.6,
-deliberately conservative so LTO interaction could not turn the win into a
-surprise. The PNG-only change that bought nothing is in the record too. A
-measurement that says no is still a result.
+Knuth, in full rather than the bumper sticker: forget small efficiencies 97 percent of the time, because guesses about hot spots fail. Then spend everything on the measured 3 percent, where even a loop win is worth taking. Budgets are how this survives contact with pull requests. A ceiling that fails the build beats a paragraph that asks nicely.
 
 ## Small core, thin shells
 
-Keep platform-specific code behind a trait, and give unsupported platforms a
-stub that compiles.
+Push complexity down behind small interfaces and keep the core portable. Platform code lives behind a trait, and every unsupported target gets a stub that compiles, so the core never learns the name of an OS API.
 
-Ply is real on Windows. macOS and Linux are open but not yet built. When the
-thumbnail backend lands as a trait, Windows implements it with the shell and the
-other targets get stubs, not half ports. CI already runs `cargo check
---all-targets` on Ubuntu and macOS so those stubs cannot rot. The recommendation
-on file is Linux first, because the freedesktop thumbnail spec is documented and
-testable without Apple hardware.
+Gall's law earns its place with the qualifier intact. A working complex system evolves from a working simple one, and a simple one may or may not work. So the core ships simple first and the shells arrive later, one platform at a time. Ousterhout's deep modules say the same from the other side. Small surface, real work hidden underneath.
 
-## Where Rust differs from Zig
+## Prefer boring local code
 
-Not everything transfers, and pretending otherwise would be dishonest.
+Simple is not the same as easy. Hickey's distinction holds up. Simple means unentangled, one fold, nothing hidden. Easy means near at hand, familiar to the reader. A framework call is easy. A hundred lines of plain local code is simple. Prefer simple.
 
-Zig monomorphizes nothing by default. Rust monomorphizes per crate, so generics
-over a large dependency tree inflate `.text`, and gpui links whether or not Ply
-touches most of it. Feature unification is a Cargo behavior, which is why
-`image`'s codecs came back and why those cuts need a fork rather than a flag.
-Zig's zero dependencies come from carrying no package graph at all. Ply cannot
-match that while the UI is gpui.
+The boring technology argument sets the price. Every novel dependency spends an innovation token and brings failure modes nobody in the room has debugged yet. Spend tokens where the product lives, never on plumbing.
 
-What transfers is the approach. Diffed redraws, hostile flags policed by CI,
-explicit capacity reuse, bounded lazy work. What does not transfer is the 100 KB
-floor. Ply is a graphical explorer on a GPU framework, and that floor belongs to
-a different kind of program.
+## Pay for use only
 
-## What we deliberately did not do
+Stroustrup's zero-overhead principle, stated straight: what you do not use, you do not pay for. Features compile per target, codecs link per format, backends ship per OS. Anything unconditional is a candidate for a flag or a fork.
 
-No fork of zed for now. The rule was 1 MiB measured saving or stop. The image
-fork's Ply-side change measured zero, so we banked 5.15 MiB and revisit only if
-headroom pressure returns.
-
-No DX12-only build. wgpu is already absent on Windows, so there is nothing to
-cut, and the mask would break macOS and Linux and kill GLES and software
-fallback. It would only be worth revisiting above 1 MiB.
-
-No UPX. It lacks arm64 support and trips Windows Security.
-
-No native rewrite and no allocator crate. A C or no-std rewrite chases under
-0.7 MiB while giving up the borrow checker and the safe Win32 layer. fx's
-explicit allocators transfer as capacity reuse and scratch buffers, not as a new
-dependency.
-
-egui stays as insurance. It measured 3.2 MiB, it is not the plan, and it only
-gets a look if the gpui route stalls.
-
-## Adding a feature
-
-Measure first. Build release and run `cargo test budgets_report -- --nocapture`
-before and after. A change with no number is a guess.
-
-Prefer the OS. If the platform already does the job, call it and ship no bytes.
-
-Hand-roll before you depend. A text field cost 3.6 MiB as a dependency. Local
-code under a hundred lines does not need a crate.
-
-Gate it. Put the ceiling in `src/budget.rs` and let the size workflow report the
-delta on the PR. If the number does not justify the change, do not ship the
-change.
+Read the caveat with the quote. It promises no overhead versus hand-written code, not zero cost. The binary still has a floor, set by the runtime, the renderer, and the standard library. Know the floor so nobody chases bytes below it.
