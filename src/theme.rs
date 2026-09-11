@@ -121,3 +121,117 @@ static UI_FONT: LazyLock<Font> = LazyLock::new(|| {
 pub fn ui_font() -> Font {
     UI_FONT.clone()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn same(a: Hsla, b: Hsla) -> bool {
+        (a.h - b.h).abs() < 1e-6
+            && (a.s - b.s).abs() < 1e-6
+            && (a.l - b.l).abs() < 1e-6
+            && (a.a - b.a).abs() < 1e-6
+    }
+
+    fn neutrals(p: &Palette) -> [(&'static str, Hsla); 11] {
+        [
+            ("background", p.background),
+            ("foreground", p.foreground),
+            ("card", p.card),
+            ("muted", p.muted),
+            ("muted_foreground", p.muted_foreground),
+            ("accent", p.accent),
+            ("sidebar", p.sidebar),
+            ("chart_bar", p.chart_bar),
+            ("chart_bar_track", p.chart_bar_track),
+            ("select_strong", p.select_strong),
+            ("overlay", p.overlay),
+        ]
+    }
+
+    #[test]
+    fn mode_toggle_is_an_involution() {
+        assert_eq!(Mode::Light.toggled(), Mode::Dark);
+        assert_eq!(Mode::Dark.toggled(), Mode::Light);
+        assert_eq!(Mode::Light.toggled().toggled(), Mode::Light);
+    }
+
+    #[test]
+    fn palette_follows_the_mode() {
+        let light = Mode::Light.palette();
+        let dark = Mode::Dark.palette();
+        assert!(light.background.l > 0.9, "light background must be bright");
+        assert!(
+            dark.background.l < 0.1,
+            "dark background must be near black"
+        );
+        assert!(light.foreground.l < dark.foreground.l, "text inverts");
+    }
+
+    #[test]
+    fn neutral_scale_has_zero_saturation() {
+        // Documented invariant: only `destructive` carries hue.
+        for mode in [Mode::Light, Mode::Dark] {
+            let p = mode.palette();
+            for (name, token) in neutrals(&p) {
+                assert!(
+                    token.s.abs() < 1e-4,
+                    "{mode:?} {name} must be zero-hue, saturated {}",
+                    token.s
+                );
+            }
+            assert!(
+                p.destructive.s > 0.1,
+                "{mode:?} destructive must carry the only hue"
+            );
+        }
+    }
+
+    #[test]
+    fn select_strong_is_never_the_hover_fill() {
+        // Active rows use `select_strong`, so it must stay distinct from the
+        // `muted`/`accent` hover fill in both modes.
+        for mode in [Mode::Light, Mode::Dark] {
+            let p = mode.palette();
+            assert!(!same(p.select_strong, p.muted), "{mode:?} select vs muted");
+            assert!(
+                !same(p.select_strong, p.accent),
+                "{mode:?} select vs accent"
+            );
+            assert!(same(p.accent, p.muted), "{mode:?} accent mirrors muted");
+        }
+    }
+
+    #[test]
+    fn destructive_is_opaque_in_both_modes() {
+        for mode in [Mode::Light, Mode::Dark] {
+            let p = mode.palette();
+            assert!(p.destructive.s > 0.1, "{mode:?} destructive carries hue");
+            assert!((p.destructive.a - 1.0).abs() < 1e-4, "{mode:?} destructive");
+        }
+    }
+
+    #[test]
+    fn overlay_is_black_at_forty_percent() {
+        for mode in [Mode::Light, Mode::Dark] {
+            let o = mode.palette().overlay;
+            assert!(o.l.abs() < 1e-4, "{mode:?} overlay must be black");
+            assert!((o.a - 0.4).abs() < 1e-4, "{mode:?} overlay alpha");
+        }
+    }
+
+    #[test]
+    fn ui_font_matches_the_platform_and_has_fallbacks() {
+        let f = ui_font();
+        let expected = if cfg!(windows) {
+            "Segoe UI Variable"
+        } else if cfg!(target_os = "macos") {
+            ".SystemUIFont"
+        } else {
+            "Ubuntu"
+        };
+        assert_eq!(f.family.to_string(), expected);
+        let fallbacks = f.fallbacks.expect("a fallback list is always set");
+        assert!(!fallbacks.0.is_empty(), "fallbacks must not be empty");
+    }
+}

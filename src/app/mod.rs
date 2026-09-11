@@ -478,7 +478,7 @@ impl Ply {
                 return;
             }
             let needle = input.read(cx).value().to_string();
-            if this.filter_text == needle {
+            if !filter_value_is_new(&this.filter_text, &needle) {
                 return; // unchanged: no rebuild, no notify
             }
             this.filter_text = needle.clone();
@@ -489,7 +489,8 @@ impl Ply {
                     .timer(Duration::from_millis(80))
                     .await;
                 this.update(cx, |this, cx| {
-                    if this.filter_gen != seen || this.filter_text != needle {
+                    if !filter_rebuild_is_current(this.filter_gen, seen, &this.filter_text, &needle)
+                    {
                         return;
                     }
                     this.rebuild_visible();
@@ -701,6 +702,21 @@ impl Ply {
     }
 }
 
+/// Whether a fresh field value differs from the filter already applied. A
+/// re-emitted `Change` carrying the same value must not bump the generation or
+/// schedule a rebuild. Pure so the subscription's skip is unit-tested.
+fn filter_value_is_new(applied: &str, incoming: &str) -> bool {
+    applied != incoming
+}
+
+/// Whether a debounced filter rebuild is still current: the generation must be
+/// the newest one and the field must still hold the needle that scheduled it.
+/// A later keystroke bumps the generation and a cleared or changed field
+/// changes the text, either of which drops the stale timer. Pure.
+fn filter_rebuild_is_current(now_gen: u64, seen_gen: u64, now_text: &str, needle: &str) -> bool {
+    now_gen == seen_gen && now_text == needle
+}
+
 /// Fling detector with no latching state. Fed the painted viewport start
 /// plus the listing generation on every render; reports whether the
 /// viewport is currently whipping past content. Comparing consecutive
@@ -907,6 +923,41 @@ mod tests {
         assert!(g.update(200, 1));
         assert!(g.update(400, 1), "sustained fling stays gated");
         assert!(g.update(600, 1));
+    }
+
+    #[test]
+    fn filter_value_is_new_skips_unchanged_value() {
+        // The subscription only schedules a rebuild when the field's value
+        // actually changed; a re-emitted Change (or a no-op write) is dropped
+        // before it bumps the generation or notifies.
+        assert!(!super::filter_value_is_new("", ""));
+        assert!(!super::filter_value_is_new("alpha", "alpha"));
+        assert!(super::filter_value_is_new("", "alpha"));
+        assert!(super::filter_value_is_new("alphabet", "alpha"), "backspace");
+        assert!(super::filter_value_is_new("alpha", "alphabet"), "new key");
+    }
+
+    #[test]
+    fn filter_rebuild_commit_requires_latest_generation_and_needle() {
+        // A debounced timer only rebuilds when it is still the newest
+        // generation and the field still holds the needle that scheduled it.
+        assert!(super::filter_rebuild_is_current(3, 3, "al", "al"));
+        assert!(
+            !super::filter_rebuild_is_current(4, 3, "alp", "alp"),
+            "superseded by a later key"
+        );
+        assert!(
+            !super::filter_rebuild_is_current(4, 3, "alp", "al"),
+            "stale generation and needle"
+        );
+        assert!(
+            !super::filter_rebuild_is_current(3, 3, "", "al"),
+            "field cleared before the timer fired"
+        );
+        assert!(
+            super::filter_rebuild_is_current(0, 0, "", ""),
+            "the initial state is current"
+        );
     }
 
     fn menu_item(label: &str, enabled: bool) -> super::MenuRow {

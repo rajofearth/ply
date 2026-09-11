@@ -854,6 +854,12 @@ mod tests {
         name.to_lowercase().contains(&needle.to_lowercase())
     }
 
+    fn filter_indices_of(entries: &[Entry], needle: &str) -> Vec<usize> {
+        let mut out = Vec::new();
+        filter_indices_into(entries, needle, &mut out);
+        out
+    }
+
     #[test]
     fn filter_matches_reference() {
         let names = [
@@ -935,6 +941,115 @@ mod tests {
         // Copy-on-write: resorting the clone leaves the original's order alone.
         let after: Vec<String> = snap.entries.iter().map(|e| e.name.clone()).collect();
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn arc_clone_shares_allocation_and_resort_is_copy_on_write() {
+        // A `Snapshot` clone must bump the refcount, not deep-copy: this is the
+        // whole reason `entries` is an `Arc`.
+        let snap = Snapshot::sorted(mixed_entries(), SortKey::Name);
+        let before: Vec<String> = snap.entries.iter().map(|e| e.name.clone()).collect();
+        let mut shared = snap.clone();
+        assert!(
+            Arc::ptr_eq(&snap.entries, &shared.entries),
+            "clone must share the entries allocation"
+        );
+        // `resort` mutates through `Arc::make_mut`, so a shared snapshot copies
+        // before sorting: the original allocation and order stay put.
+        shared.resort(SortKey::Size);
+        assert!(
+            !Arc::ptr_eq(&snap.entries, &shared.entries),
+            "resorting a shared snapshot must copy on write"
+        );
+        let after: Vec<String> = snap.entries.iter().map(|e| e.name.clone()).collect();
+        assert_eq!(before, after, "shared resort must not reorder the original");
+        let shared_names: Vec<&str> = shared.entries.iter().map(|e| e.name.as_str()).collect();
+        let before_names: Vec<&str> = before.iter().map(String::as_str).collect();
+        assert_ne!(shared_names, before_names, "the clone itself did reorder");
+    }
+
+    #[test]
+    fn resort_on_unique_snapshot_stays_in_place() {
+        // The perf half of the contract: a uniquely owned snapshot sorts the
+        // existing allocation instead of cloning it first.
+        let mut snap = Snapshot::sorted(mixed_entries(), SortKey::Name);
+        let ptr = Arc::as_ptr(&snap.entries);
+        snap.resort(SortKey::Size);
+        assert_eq!(
+            Arc::as_ptr(&snap.entries),
+            ptr,
+            "unique resort must reuse the allocation"
+        );
+    }
+
+    #[test]
+    fn modified_sort_is_stable_for_equal_stamps() {
+        // Equal keys must not reorder: `same_contents` pairs equal names by
+        // position, so an unstable sort would make quiet reloads look dirty.
+        use std::time::{Duration, UNIX_EPOCH};
+        let t = UNIX_EPOCH + Duration::from_secs(7);
+        let names = ["c.txt", "a.txt", "b.txt"];
+        let entries: Vec<Entry> = names
+            .iter()
+            .map(|n| {
+                let mut e = file(n);
+                e.modified = Some(t);
+                e
+            })
+            .collect();
+        let snap = Snapshot::sorted(entries, SortKey::Modified);
+        let got: Vec<&str> = snap.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(got, names, "equal modified stamps must keep input order");
+    }
+
+    #[test]
+    fn filter_oracle_edges() {
+        // Empty needle keeps every index, even for an empty listing.
+        assert_eq!(filter_indices_of(&[], ""), Vec::<usize>::new());
+        let entries = vec![
+            file(""),
+            file("alpha.txt"),
+            file("ALPHA.TXT"),
+            file("café.md"),
+            file("CAFÉ.md"),
+            file("界alpha"),
+            file("界"),
+        ];
+        // A needle equal to a whole name matches every casing of that name.
+        assert_eq!(filter_indices_of(&entries, "alpha.txt"), vec![1, 2]);
+        assert_eq!(
+            filter_indices_of(&entries, "ALPHA.TXT"),
+            filter_indices_of(&entries, "alpha.txt")
+        );
+        // Non-ASCII needle matches its own name and the other casing.
+        assert_eq!(filter_indices_of(&entries, "café"), vec![3, 4]);
+        assert_eq!(filter_indices_of(&entries, "CAFÉ"), vec![3, 4]);
+        // CJK prefix.
+        assert_eq!(filter_indices_of(&entries, "界a"), vec![5]);
+        assert_eq!(filter_indices_of(&entries, "界"), vec![5, 6]);
+        // The empty name is matched only by the empty needle.
+        assert_eq!(filter_indices_of(&entries, "a"), vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn collect_entries_reserve_does_not_change_results() {
+        // More entries than the collector's 256 floor: growing past the reserve
+        // must be transparent, so the listing still matches a manual sort.
+        let dir = std::env::temp_dir().join(format!("ply-reserve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let count = 300usize;
+        let mut expected: Vec<String> = Vec::with_capacity(count);
+        for i in 0..count {
+            let name = format!("f{i:04}.txt");
+            std::fs::write(dir.join(&name), b"x").unwrap();
+            expected.push(name);
+        }
+        expected.sort_by(|a, b| cmp_name(a, b));
+        let snap = list_sorted(&dir, SortKey::Name).unwrap();
+        let got: Vec<String> = snap.entries.iter().map(|e| e.name.clone()).collect();
+        assert_eq!(got, expected);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

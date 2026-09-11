@@ -1553,4 +1553,145 @@ mod tests {
         assert_eq!(expand_env_vars(r"C:\plain\a.exe"), r"C:\plain\a.exe");
         unsafe { std::env::remove_var("PLY_TEST_EXPAND") };
     }
+
+    #[test]
+    fn rename_rejects_every_invalid_name() {
+        let dir = unique_tmp("rename-invalid");
+        let file = dir.join("keep.txt");
+        std::fs::write(&file, b"x").unwrap();
+        for bad in [
+            "",
+            "   ",
+            "a/b",
+            r"a\b",
+            "b?.txt",
+            "b*.txt",
+            "b<.txt",
+            "b>.txt",
+            "b:.txt",
+            "b|.txt",
+            "b\".txt",
+            "con.txt/inner",
+            ".",
+            "..",
+        ] {
+            assert!(rename(&file, bad).is_err(), "name {bad:?} must be rejected");
+        }
+        assert!(file.exists(), "a rejected rename must not move the file");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rename_trims_surrounding_whitespace() {
+        let dir = unique_tmp("rename-trim");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let after = rename(&file, "  b.txt  ").unwrap();
+        assert_eq!(after, dir.join("b.txt"));
+        assert!(after.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rename_same_name_is_a_noop_success() {
+        let dir = unique_tmp("rename-same");
+        let file = dir.join("same.txt");
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(rename(&file, "same.txt").unwrap(), file);
+        assert!(file.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unique_in_preserves_extension_and_counts_up() {
+        let dir = unique_tmp("unique-ext");
+        std::fs::write(dir.join("a.txt"), b"").unwrap();
+        assert_eq!(unique_in(&dir, "a.txt"), "a (2).txt");
+        std::fs::write(dir.join("a (2).txt"), b"").unwrap();
+        assert_eq!(unique_in(&dir, "a.txt"), "a (3).txt");
+        // Extensionless names keep the suffix form.
+        std::fs::write(dir.join("plain"), b"").unwrap();
+        assert_eq!(unique_in(&dir, "plain"), "plain (2)");
+        // A free name passes through unchanged.
+        assert_eq!(unique_in(&dir, "fresh.txt"), "fresh.txt");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn create_folder_dedupes_and_refuses_mtp() {
+        let dir = unique_tmp("mkdir");
+        let first = create_folder(&dir, "New folder").unwrap();
+        assert_eq!(first, dir.join("New folder"));
+        let second = create_folder(&dir, "New folder").unwrap();
+        assert_eq!(second, dir.join("New folder (2)"));
+        assert!(first.is_dir() && second.is_dir());
+        #[cfg(windows)]
+        assert!(create_folder(Path::new(r"\\MTP\DEV\o1"), "New folder").is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn admin_target_is_case_insensitive_and_needs_an_extension() {
+        assert!(is_admin_target(Path::new(r"C:\Tools\SETUP.EXE")));
+        assert!(is_admin_target(Path::new("script.BAT")));
+        assert!(is_admin_target(Path::new("deploy.CMD")));
+        assert!(is_admin_target(Path::new("install.msi")));
+        assert!(!is_admin_target(Path::new("archive.exe.txt")));
+        assert!(!is_admin_target(Path::new("noext")));
+        assert!(!is_admin_target(Path::new("run.bat.bak")));
+    }
+
+    #[test]
+    fn terminal_exe_path_is_absolute_and_platform_specific() {
+        let p = terminal_exe_path();
+        assert!(p.is_absolute(), "{p:?} must be absolute");
+        #[cfg(windows)]
+        assert_eq!(p, PathBuf::from(r"C:\Windows\System32\cmd.exe"));
+        #[cfg(not(windows))]
+        assert_eq!(p, PathBuf::from("/bin/sh"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn volume_root_falls_back_to_fixed_when_unmappable() {
+        assert_eq!(volume_root(Path::new("C:")), PathBuf::from(r"C:\"));
+        assert_eq!(volume_root(Path::new(r"\\server")), PathBuf::from(r"C:\"));
+        assert_eq!(
+            volume_root(Path::new(r"relative\path")),
+            PathBuf::from(r"C:\")
+        );
+        // Deep UNC trims to the share root.
+        assert_eq!(
+            volume_root(Path::new(r"\\server\share\deep\file.txt")),
+            PathBuf::from(r"\\server\share")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn expand_env_vars_handles_adjacent_and_unterminated() {
+        unsafe { std::env::set_var("PLY_TEST_A", "X") };
+        unsafe { std::env::set_var("PLY_TEST_B", "Y") };
+        assert_eq!(expand_env_vars("%PLY_TEST_A%%PLY_TEST_B%"), "XY");
+        assert_eq!(expand_env_vars("%PLY_TEST_A%tail"), "Xtail");
+        assert_eq!(expand_env_vars("%PLY_TEST_A%"), "X");
+        // An opening percent with no closing partner passes through untouched.
+        assert_eq!(expand_env_vars("50% done"), "50% done");
+        unsafe { std::env::remove_var("PLY_TEST_A") };
+        unsafe { std::env::remove_var("PLY_TEST_B") };
+    }
+
+    #[test]
+    fn quote_path_for_copy_wraps_once() {
+        assert_eq!(quote_path_for_copy(Path::new("")), r#""""#);
+        // A lone quote is length one, so it is treated as unquoted and wrapped.
+        assert_eq!(quote_path_for_copy(Path::new(r#"""#)), r#"""""#);
+        let quoted = quote_path_for_copy(Path::new("a b"));
+        assert_eq!(quoted, "\"a b\"");
+        assert_eq!(
+            quote_path_for_copy(Path::new(&quoted)),
+            quoted,
+            "quoting is idempotent"
+        );
+    }
 }

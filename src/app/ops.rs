@@ -357,12 +357,11 @@ impl Ply {
             &self.filter_text,
             &mut self.visible_indices,
         );
-        self.visible_entries.reserve(self.visible_indices.len());
-        for &i in &self.visible_indices {
-            if let Some(entry) = snapshot.entries.get(i) {
-                self.visible_entries.push(entry.clone());
-            }
-        }
+        clone_indices_into(
+            &snapshot.entries,
+            &self.visible_indices,
+            &mut self.visible_entries,
+        );
     }
 
     /// Entries in the current folder that survive the filter box, as a slice in
@@ -451,16 +450,7 @@ impl Ply {
                 return;
             };
             if extend && let Some(anchor) = self.anchor {
-                let (mut lo, mut hi) = if anchor <= ix {
-                    (anchor, ix)
-                } else {
-                    (ix, anchor)
-                };
-                // A stale anchor (listing shrank under it) used to panic on
-                // the slice below; clamp instead. Valid anchors are untouched,
-                // so every non-crashing input behaves exactly as before.
-                hi = hi.min(visible.len().saturating_sub(1));
-                lo = lo.min(hi);
+                let (lo, hi) = selection_span(anchor, ix, visible.len());
                 Click::Range(visible[lo..=hi].iter().map(|e| e.path.clone()).collect())
             } else if toggle {
                 Click::Toggle(target)
@@ -513,13 +503,7 @@ impl Ply {
         };
         if extend {
             let anchor = self.anchor.unwrap_or(current);
-            let (mut lo, mut hi) = if anchor <= next {
-                (anchor, next)
-            } else {
-                (next, anchor)
-            };
-            hi = hi.min(len.saturating_sub(1));
-            lo = lo.min(hi);
+            let (lo, hi) = selection_span(anchor, next, len);
             let paths: Vec<PathBuf> = self.visible()[lo..=hi]
                 .iter()
                 .map(|e| e.path.clone())
@@ -583,14 +567,7 @@ impl Ply {
 
         if extend {
             let anchor = self.anchor.unwrap_or(cur);
-            let (mut lo, mut hi) = if anchor <= next {
-                (anchor, next)
-            } else {
-                (next, anchor)
-            };
-            // Same stale-anchor clamp as `click_row`; valid anchors untouched.
-            hi = hi.min(total.saturating_sub(1));
-            lo = lo.min(hi);
+            let (lo, hi) = selection_span(anchor, next, total);
             let paths: Vec<PathBuf> = self.visible()[lo..=hi]
                 .iter()
                 .map(|e| e.path.clone())
@@ -2025,6 +2002,39 @@ fn app_minimized() -> bool {
     false
 }
 
+/// Inclusive index span for a shift-extend selection, clamped to a listing of
+/// `len` entries. `anchor` (where the extend started) and `target` (the newly
+/// reached row) can both be stale: the listing may have shrunk under a stored
+/// anchor, and grid movement can overshoot the last row. The end clamps to the
+/// last valid index and the start to the end, so `entries[lo..=hi]` never
+/// panics. Valid anchors and targets are untouched, so every previously
+/// reachable input behaves exactly as before. Callers pass `len >= 1`.
+fn selection_span(anchor: usize, target: usize, len: usize) -> (usize, usize) {
+    let (lo, hi) = if anchor <= target {
+        (anchor, target)
+    } else {
+        (target, anchor)
+    };
+    let hi = hi.min(len.saturating_sub(1));
+    let lo = lo.min(hi);
+    (lo, hi)
+}
+
+/// Append clones of `entries[i]` for each `i` in `indices`, resetting `out`
+/// first so a keystroke reuses one allocation. Indices are expected to come
+/// from `entries`; an out-of-range index is skipped rather than panicking.
+/// Pure, so the `visible_entries` cache contract is unit-tested without a
+/// window.
+fn clone_indices_into(entries: &[Entry], indices: &[usize], out: &mut Vec<Entry>) {
+    out.clear();
+    out.reserve(indices.len());
+    for &i in indices {
+        if let Some(entry) = entries.get(i) {
+            out.push(entry.clone());
+        }
+    }
+}
+
 /// Indices into `entries` that survive the filter, in listing order. An empty
 /// filter keeps every index. Pure and ordered, so the owned `visible_entries`
 /// cache and the index set stay identical to the old `Vec<&Entry>` slice.
@@ -2114,6 +2124,56 @@ mod tests {
         assert_eq!(cached.len(), 2);
         assert_eq!(cached[0].name, "alpha.txt");
         assert_eq!(cached[1].name, "almanac.png");
+    }
+
+    #[test]
+    fn selection_span_covers_forward_and_backward() {
+        assert_eq!(selection_span(1, 4, 10), (1, 4));
+        assert_eq!(selection_span(4, 1, 10), (1, 4));
+        assert_eq!(selection_span(2, 2, 10), (2, 2));
+    }
+
+    #[test]
+    fn selection_span_clamps_stale_anchor_and_overshoot() {
+        // Listing shrank under a stored anchor: the old inline slice ran past
+        // the end and panicked; the span must end at the last valid index.
+        assert_eq!(selection_span(999, 2, 3), (2, 2));
+        assert_eq!(selection_span(500, 1, 2), (1, 1));
+        // Grid movement can overshoot the last row; clamp both directions.
+        assert_eq!(selection_span(0, 99, 4), (0, 3));
+        assert_eq!(selection_span(99, 99, 4), (3, 3));
+        // Single-entry listing and the no-op span.
+        assert_eq!(selection_span(0, 0, 1), (0, 0));
+    }
+
+    #[test]
+    fn clone_indices_into_reuses_out_and_stays_correct() {
+        let entries = vec![
+            file("alpha.txt"),
+            file("beta.mp4"),
+            file("almanac.png"),
+            file("delta.log"),
+        ];
+        let mut out = Vec::new();
+        clone_indices_into(&entries, &[0, 2], &mut out);
+        assert_eq!(
+            out.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            ["alpha.txt", "almanac.png"]
+        );
+        let cap = out.capacity();
+        // A later rebuild must reset the contents and reuse the allocation,
+        // which is the point of the owned `visible_entries` cache.
+        clone_indices_into(&entries, &[3], &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "delta.log");
+        assert!(
+            out.capacity() >= cap,
+            "out must reuse its allocation across rebuilds"
+        );
+        // An out-of-range index is skipped, never a panic.
+        clone_indices_into(&entries, &[1, 99], &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "beta.mp4");
     }
 
     #[test]

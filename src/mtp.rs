@@ -715,4 +715,59 @@ mod tests {
         assert!(!is_mtp(Path::new(r"C:\Users")));
         assert!(!is_mtp(Path::new("/home")));
     }
+
+    #[test]
+    fn key_for_is_deterministic_distinct_and_hex() {
+        let a = key_for(r"\\?\usb#vid_22d9&pid_2765#a");
+        let b = key_for(r"\\?\usb#vid_22d9&pid_2765#b");
+        assert_eq!(a.len(), 16, "keys are sixteen hex digits");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(a, key_for(r"\\?\usb#vid_22d9&pid_2765#a"));
+        assert_ne!(a, b, "different PnP ids must not collide");
+        assert_eq!(key_for(""), "cbf29ce484222325", "FNV-1a offset basis");
+    }
+
+    #[test]
+    fn key_is_byte_exact_and_path_safe() {
+        let upper = key_for(r"\\?\USB#VID_1#FOO");
+        let lower = key_for(r"\\?\usb#vid_1#foo");
+        assert_ne!(upper, lower, "hashing must not case-fold");
+        assert!(
+            !upper.contains('\\') && !upper.contains('/'),
+            "key must be one path component"
+        );
+    }
+
+    #[test]
+    fn root_of_builds_the_unc_device_root() {
+        assert_eq!(root_of("abc"), PathBuf::from(r"\\MTP\abc"));
+        assert_eq!(root_of(""), PathBuf::from(r"\\MTP\"));
+    }
+
+    #[test]
+    fn parse_rejects_drive_and_relative_paths() {
+        // Non-UNC prefixes and relative paths never name a device.
+        assert_eq!(parse(Path::new(r"C:\Users")), None);
+        assert_eq!(parse(Path::new("relative/path")), None);
+        assert_eq!(parse(Path::new("")), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parse_rejects_other_unc_hosts() {
+        assert_eq!(parse(Path::new(r"\\server\share\file")), None);
+        assert_eq!(
+            parse(Path::new(r"\\MTP\abc\s1\o2")),
+            Some(("abc".to_string(), "o2".to_string()))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parse_takes_the_deepest_normal_component() {
+        assert_eq!(
+            parse(&root_of("abc").join("s1").join("o1").join("o2")),
+            Some(("abc".to_string(), "o2".to_string()))
+        );
+    }
 }

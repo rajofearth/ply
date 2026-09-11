@@ -66,4 +66,63 @@ mod tests {
         let caps = for_path(&path);
         assert!(!caps.watch && !caps.rename && !caps.trash && !caps.reveal && !caps.open_direct);
     }
+
+    const FULL: Caps = Caps {
+        watch: true,
+        rename: true,
+        trash: true,
+        reveal: true,
+        open_direct: true,
+    };
+    const NONE: Caps = Caps {
+        watch: false,
+        rename: false,
+        trash: false,
+        reveal: false,
+        open_direct: false,
+    };
+
+    #[test]
+    fn capability_truth_table_covers_every_path_kind() {
+        // Local paths are fully capable on every platform.
+        for local in [r"C:\Users", r"C:\Users\me\notes.txt", "/home/me", "/home"] {
+            let path = Path::new(local);
+            assert_eq!(for_path(path), FULL, "local {local:?}");
+            assert!(!is_portable(path), "local {local:?}");
+        }
+
+        // The synthetic Recycle Bin root parses identically on every platform.
+        assert_eq!(
+            for_path(Path::new(crate::recycle_bin::ROOT_STR)),
+            NONE,
+            "recycle bin"
+        );
+
+        // Portable-device paths only resolve where Windows UNC parsing exists.
+        #[cfg(windows)]
+        for mtp in [r"\\MTP\DEVICE", r"\\MTP\DEVICE\o1", r"\\MTP\dev\s1\o2"] {
+            let path = Path::new(mtp);
+            assert!(is_portable(path), "portable {mtp:?}");
+            assert_eq!(for_path(path), NONE, "portable {mtp:?}");
+        }
+    }
+
+    #[test]
+    fn caps_are_granted_all_or_nothing() {
+        // No path may land in a half-capable state: five capabilities, all or
+        // none. Guards against a future match arm enabling one flag only.
+        let mut paths = vec![
+            PathBuf::from(r"C:\Users"),
+            PathBuf::from("/home/me"),
+            PathBuf::from(crate::recycle_bin::ROOT_STR),
+        ];
+        #[cfg(windows)]
+        paths.push(PathBuf::from(r"\\MTP\DEVICE\o1"));
+        for path in &paths {
+            let c = for_path(path);
+            let all = c.watch && c.rename && c.trash && c.reveal && c.open_direct;
+            let none = !c.watch && !c.rename && !c.trash && !c.reveal && !c.open_direct;
+            assert!(all || none, "half-capable caps for {path:?}: {c:?}");
+        }
+    }
 }

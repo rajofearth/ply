@@ -71,4 +71,26 @@ mod tests {
         // only the exact root is treated as the Recycle Bin location.
         assert!(!is_recycle_bin(&root().join("someitem")));
     }
+
+    #[test]
+    fn detection_is_exact_and_case_sensitive() {
+        assert!(is_recycle_bin(Path::new(ROOT_STR)));
+        assert!(is_recycle_bin(&root()));
+        // Lookalikes and same-named real paths are ordinary locations.
+        for other in [
+            r"\\RecycleBinX",
+            r"\\RecycleBins",
+            r"C:\RecycleBin",
+            r"C:\Users\RecycleBin",
+            r"\\recyclebin",
+        ] {
+            assert!(!is_recycle_bin(Path::new(other)), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn root_constant_is_stable() {
+        assert_eq!(ROOT_STR, r"\\RecycleBin");
+        assert_eq!(root(), PathBuf::from(ROOT_STR));
+    }
 }

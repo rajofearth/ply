@@ -646,4 +646,93 @@ mod tests {
         assert!(loaded.contains(&b));
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    fn named(kind: VolumeKind, name: &str) -> Volume {
+        Volume {
+            name: name.into(),
+            path: PathBuf::from(name),
+            kind,
+            free: 1,
+            total: 2,
+        }
+    }
+
+    #[test]
+    fn partition_splits_drives_from_devices_and_network() {
+        let volumes = vec![
+            named(VolumeKind::Network, "N"),
+            named(VolumeKind::Drive, "C"),
+            named(VolumeKind::Device, "Phone"),
+            named(VolumeKind::Drive, "D"),
+            named(VolumeKind::Network, "M"),
+        ];
+        let (drives, devices) = partition_drives_devices(&volumes);
+        assert_eq!(
+            drives.iter().map(|v| v.name.as_str()).collect::<Vec<_>>(),
+            vec!["C", "D"],
+            "drives keep input order and hold only Drive"
+        );
+        assert_eq!(
+            devices.iter().map(|v| v.name.as_str()).collect::<Vec<_>>(),
+            vec!["N", "Phone", "M"],
+            "devices & network keep input order"
+        );
+        assert!(drives.iter().all(|v| v.kind == VolumeKind::Drive));
+        assert!(devices.iter().all(|v| v.kind != VolumeKind::Drive));
+    }
+
+    #[test]
+    fn partition_of_empty_is_two_empty_buckets() {
+        let (drives, devices) = partition_drives_devices(&[]);
+        assert!(drives.is_empty() && devices.is_empty());
+    }
+
+    #[test]
+    fn volume_icon_maps_each_kind() {
+        use crate::icons::Ico;
+        assert_eq!(volume_icon(VolumeKind::Drive), Ico::HardDrive);
+        assert_eq!(volume_icon(VolumeKind::Device), Ico::Usb);
+        assert_eq!(volume_icon(VolumeKind::Network), Ico::Network);
+        assert_eq!(named(VolumeKind::Device, "x").ico(), Ico::Usb);
+        assert_eq!(named(VolumeKind::Network, "x").ico(), Ico::Network);
+    }
+
+    #[test]
+    fn merge_places_mtp_at_the_end_without_network() {
+        let lettered = vec![named(VolumeKind::Drive, "C"), named(VolumeKind::Drive, "D")];
+        let mtp = vec![named(VolumeKind::Device, "Phone")];
+        let merged = merge_lettered_and_mtp(lettered, mtp);
+        assert_eq!(
+            merged.iter().map(|v| v.name.as_str()).collect::<Vec<_>>(),
+            vec!["C", "D", "Phone"]
+        );
+    }
+
+    #[test]
+    fn merge_on_empty_lettered_yields_only_mtp() {
+        let merged = merge_lettered_and_mtp(Vec::new(), vec![named(VolumeKind::Device, "Phone")]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].name, "Phone");
+    }
+
+    #[test]
+    fn pct_used_is_clamped_when_free_exceeds_total() {
+        // A flaky share can report free > total; saturating_sub keeps used at 0.
+        assert_eq!(vol(200, 100).pct_used(), 0.0);
+        assert!((vol(0, 100).pct_used() - 100.0).abs() < f32::EPSILON);
+        assert!((vol(50, 200).pct_used() - 75.0).abs() < f32::EPSILON);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn logical_drives_mask_is_zero_off_windows() {
+        assert_eq!(logical_drives_mask(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn logical_drives_mask_stays_within_26_bits() {
+        // GetLogicalDrives defines only A..Z; anything above bit 25 is junk.
+        assert_eq!(logical_drives_mask() & !0x03FF_FFFF, 0);
+    }
 }

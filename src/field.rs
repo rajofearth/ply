@@ -936,4 +936,202 @@ mod tests {
         assert_eq!(text.previous_boundary(5), 1);
         assert_eq!(text.next_boundary(1), 5);
     }
+
+    #[test]
+    fn cursor_offset_follows_selection_direction() {
+        let forward = text_with("hello", 1..4);
+        assert_eq!(forward.cursor_offset(), 4);
+
+        let reversed = FieldText {
+            selection_reversed: true,
+            ..forward
+        };
+        assert_eq!(reversed.cursor_offset(), 1);
+    }
+
+    #[test]
+    fn select_to_backwards_reverses_and_orders_the_range() {
+        // Dragging the caret left of the anchor flips direction and keeps the
+        // range ordered, exactly like a mouse drag in the library input.
+        let mut text = text_with("hello", 3..3);
+        text.select_to(1);
+        assert_eq!(text.selected_range, 1..3);
+        assert!(text.selection_reversed);
+        assert_eq!(text.cursor_offset(), 1);
+
+        // Dragging back past the anchor reverts to forward.
+        text.select_to(5);
+        assert_eq!(text.selected_range, 3..5);
+        assert!(!text.selection_reversed);
+        assert_eq!(text.cursor_offset(), 5);
+    }
+
+    #[test]
+    fn select_all_covers_the_whole_content() {
+        // `FieldState::select_all` is `move_to(0)` then `select_to(len)`; prove
+        // the pure composition yields a full, forward, cursor-at-end range.
+        for (content, reversed) in [("hello", false), ("café", true), ("", false)] {
+            let mut text = FieldText {
+                content: content.into(),
+                selected_range: 2..2,
+                selection_reversed: reversed,
+                ..Default::default()
+            };
+            text.move_to(0);
+            text.select_to(text.content.len());
+            assert_eq!(text.selected_range, 0..content.len(), "content {content:?}");
+            assert!(!text.selection_reversed);
+            assert_eq!(text.cursor_offset(), content.len());
+        }
+    }
+
+    #[test]
+    fn empty_content_backspace_guard_holds() {
+        // `FieldState::backspace` bells with no edit when the cursor already
+        // sits on the only boundary. Prove the pure predicate it reads: empty
+        // content and content starts both have cursor == previous_boundary.
+        let empty = text_with("", 0..0);
+        assert_eq!(
+            empty.cursor_offset(),
+            empty.previous_boundary(empty.cursor_offset())
+        );
+
+        let start = text_with("hi", 0..0);
+        assert_eq!(
+            start.cursor_offset(),
+            start.previous_boundary(start.cursor_offset())
+        );
+
+        let end = text_with("hi", 2..2);
+        assert_ne!(
+            end.cursor_offset(),
+            end.previous_boundary(end.cursor_offset())
+        );
+    }
+
+    #[test]
+    fn marked_range_takes_precedence_over_selection() {
+        // Explicit IME range beats the marked range, which beats the selection,
+        // in that order. Each case replaces a different span so the winning
+        // source is provable from the content.
+        struct Case {
+            explicit: Option<Range<usize>>,
+            marked: Option<Range<usize>>,
+            selection: Range<usize>,
+            want: &'static str,
+            caret: Range<usize>,
+        }
+        let cases = [
+            Case {
+                explicit: Some(0..1),
+                marked: Some(1..3),
+                selection: 4..5,
+                want: "Xello",
+                caret: 1..1,
+            },
+            Case {
+                explicit: None,
+                marked: Some(1..3),
+                selection: 4..5,
+                want: "hXlo",
+                caret: 2..2,
+            },
+            Case {
+                explicit: None,
+                marked: None,
+                selection: 4..5,
+                want: "hellX",
+                caret: 5..5,
+            },
+        ];
+        for case in cases {
+            let mut text = FieldText {
+                content: "hello".into(),
+                selected_range: case.selection,
+                marked_range: case.marked,
+                ..Default::default()
+            };
+            text.replace_text_in_range(case.explicit, "X");
+            assert_eq!(text.content.to_string(), case.want);
+            assert_eq!(text.selected_range, case.caret);
+            assert_eq!(text.marked_range, None, "every splice clears the mark");
+        }
+    }
+
+    #[test]
+    fn replace_collapses_selection_after_multibyte_insert() {
+        // The caret lands on the end of the inserted text, on a valid UTF-8
+        // boundary, even when the insert is wider than one byte.
+        let mut text = text_with("café au lait", 0..5);
+        text.replace_text_in_range(None, "thé");
+        assert_eq!(text.content.to_string(), "thé au lait");
+        assert_eq!(text.selected_range, "thé".len().."thé".len());
+        assert!(text.content.is_char_boundary(text.selected_range.start));
+    }
+
+    #[test]
+    fn boundary_helpers_clamp_out_of_range_offsets() {
+        let len = "café".len();
+        let text = text_with("café", 0..0);
+        // Beyond the end clamps to the content length before walking.
+        assert_eq!(text.previous_boundary(99), len - "é".len());
+        assert_eq!(text.next_boundary(99), len);
+        // Multi-byte edges walk exactly one char.
+        assert_eq!(text.previous_boundary(len), len - "é".len());
+        assert_eq!(text.next_boundary(len - "é".len()), len);
+    }
+
+    #[test]
+    fn utf16_offsets_round_trip_around_astral_chars() {
+        // "a😀b": a is 1 unit/1 byte, the emoji 2 units/4 bytes, b 1 unit/1 byte.
+        let text = text_with("a😀b", 0..0);
+        for (utf8, utf16) in [(0, 0), (1, 1), (5, 3), (6, 4)] {
+            assert_eq!(text.offset_from_utf16(utf16), utf8, "utf16 {utf16}");
+            assert_eq!(text.offset_to_utf16(utf8), utf16, "utf8 {utf8}");
+        }
+        // A UTF-16 index landing mid-astral advances to the char end, so an
+        // offset from the IME never splits a char.
+        assert_eq!(text.offset_from_utf16(2), 5);
+    }
+
+    #[test]
+    fn text_for_range_reports_the_actual_utf16_range() {
+        let text = text_with("a😀b", 0..0);
+
+        let mut actual = None;
+        assert_eq!(
+            text.text_for_range(1..3, &mut actual),
+            Some("😀".to_string())
+        );
+        assert_eq!(actual, Some(1..3));
+
+        // A range past the end clamps to the content.
+        let mut actual = None;
+        assert_eq!(
+            text.text_for_range(3..99, &mut actual),
+            Some("b".to_string())
+        );
+        assert_eq!(actual, Some(3..4));
+    }
+
+    #[test]
+    fn replace_and_mark_tracks_a_composition_sub_range() {
+        // The IME supplies both the composed text and where inside it the
+        // caret belongs; the mark spans the insert, the selection the sub-range.
+        let mut text = text_with("ab", 2..2);
+        text.replace_and_mark_text_in_range(None, "xy", Some(1..2));
+        assert_eq!(text.content.to_string(), "abxy");
+        assert_eq!(text.marked_range, Some(2..4));
+        assert_eq!(text.selected_range, 3..4);
+    }
+
+    #[test]
+    fn replace_layer_keeps_newlines_that_paste_folds() {
+        // `FieldState::paste` runs `text.replace('\n', " ")` before splicing, so
+        // the pure layer must keep whatever it is handed verbatim.
+        let mut text = text_with("ab", 2..2);
+        text.replace_text_in_range(None, "x\ny");
+        assert_eq!(text.content.to_string(), "abx\ny");
+        assert_eq!("a\nb\n".replace('\n', " "), "a b ");
+    }
 }

@@ -3002,7 +3002,7 @@ mod tests {
     fn make_thumb(cache: &mut ThumbCache, path: &str, stamp: u64) -> CacheKey {
         let key = stamped_key(Path::new(path), stamp);
         let pixels: Vec<u8> = (0..36864)
-            .map(|i| (i ^ path.len() as usize) as u8)
+            .map(|i| (i ^ path.len()) as u8)
             .collect();
         let img = to_render_image(pixels, 96, 96).unwrap();
         cache.insert(key.clone(), img);
@@ -3014,7 +3014,7 @@ mod tests {
         let mut c = ThumbCache::new();
         let k0 = make_thumb(&mut c, "a.png", 1);
         let k1 = make_thumb(&mut c, "b.png", 2);
-        c.set_working_set(&[k0.clone()]);
+        c.set_working_set(std::slice::from_ref(&k0));
 
         c.clear_content();
 
@@ -3069,7 +3069,7 @@ mod tests {
         let k1 = make_thumb(&mut c, "b.png", 2);
 
         // Lock k0: it must survive any eviction pressure.
-        c.set_working_set(&[k0.clone()]);
+        c.set_working_set(std::slice::from_ref(&k0));
         assert!(c.locked_set.contains(&k0));
 
         // Flood with enough entries to blow past the budget.
@@ -3109,7 +3109,7 @@ mod tests {
         let k0 = make_thumb(&mut c, "a.png", 1);
 
         // Lock, then unlock.
-        c.set_working_set(&[k0.clone()]);
+        c.set_working_set(std::slice::from_ref(&k0));
         assert!(c.locked_set.contains(&k0));
         c.set_working_set(&[]);
         assert!(!c.locked_set.contains(&k0));
@@ -3126,7 +3126,7 @@ mod tests {
         let k0 = make_thumb(&mut c, "a.png", 1);
 
         // Lock k0. Its bytes leave the evictable budget.
-        c.set_working_set(&[k0.clone()]);
+        c.set_working_set(std::slice::from_ref(&k0));
         assert_eq!(c.bytes, 0);
 
         // Insert many evictable entries: eviction must keep bytes under BUDGET.
@@ -3147,7 +3147,7 @@ mod tests {
     fn insert_force_updates_locked_entry_in_place() {
         let mut c = ThumbCache::new();
         let k0 = make_thumb(&mut c, "a.png", 1);
-        c.set_working_set(&[k0.clone()]);
+        c.set_working_set(std::slice::from_ref(&k0));
 
         // Re-extract while locked: the new image replaces the old in-place.
         let new_pixels: Vec<u8> = vec![42u8; 36864];
@@ -3189,7 +3189,7 @@ mod tests {
         let k0 = make_thumb(&mut c, "a.png", 1);
 
         // Lock, unlock, then re-insert (simulates re-decode on demand).
-        c.set_working_set(&[k0.clone()]);
+        c.set_working_set(std::slice::from_ref(&k0));
         c.set_working_set(&[]);
         let new_img = to_render_image(vec![99u8; 36864], 96, 96).unwrap();
         c.insert(k0.clone(), new_img);
@@ -3313,5 +3313,244 @@ mod tests {
         );
         // Visible portion is first in iteration order.
         assert!(visible.last() < lookahead_only.first());
+    }
+
+    // --- cache bookkeeping and tier helpers ---
+
+    #[test]
+    fn is_lnk_matches_only_the_lnk_extension() {
+        assert!(is_lnk(&entry("App.lnk")));
+        assert!(
+            is_lnk(&entry("APP.LNK")),
+            "extension match is case-insensitive"
+        );
+        assert!(!is_lnk(&entry("link.txt")));
+        assert!(!is_lnk(&entry("lnk")));
+    }
+
+    #[test]
+    fn inflight_is_tracked_per_key_and_per_path() {
+        let mut c = ThumbCache::new();
+        let k = stamped_key(Path::new("C:\\a.png"), 1);
+        assert!(!c.is_inflight(&k) && !c.inflight_path(&k.path));
+        c.mark_inflight(k.clone());
+        assert!(c.is_inflight(&k));
+        assert!(c.inflight_path(&k.path), "the path guard ignores the stamp");
+        assert!(c.inflight_path(Path::new("C:\\a.png")));
+        assert!(!c.inflight_path(Path::new("C:\\b.png")));
+    }
+
+    #[test]
+    fn content_slots_reserve_and_release_without_underflow() {
+        let mut c = ThumbCache::new();
+        assert_eq!(c.content_pending(), 0);
+        c.reserve_content();
+        c.reserve_content();
+        assert_eq!(c.content_pending(), 2);
+        c.release_content();
+        assert_eq!(c.content_pending(), 1);
+        c.release_content();
+        c.release_content();
+        assert_eq!(c.content_pending(), 0, "release must saturate at zero");
+    }
+
+    #[test]
+    fn lnk_stamp_round_trips_per_path() {
+        let mut c = ThumbCache::new();
+        let p = Path::new("C:\\links\\a.lnk");
+        assert_eq!(c.lnk_stamp(p), None);
+        c.set_lnk_stamp(p, 0xabc);
+        assert_eq!(c.lnk_stamp(p), Some(0xabc));
+        assert_eq!(c.lnk_stamp(Path::new("C:\\links\\b.lnk")), None);
+    }
+
+    #[test]
+    fn failed_keys_are_remembered_then_capped() {
+        let mut c = ThumbCache::new();
+        let k = stamped_key(Path::new("C:\\bad.png"), 1);
+        assert!(!c.is_failed(&k));
+        c.mark_failed(k.clone());
+        assert!(c.is_failed(&k));
+
+        // The failure set clears once it would exceed its 512-entry cap, so a
+        // stream of persistent failures cannot pin an unbounded set.
+        for i in 0..600u64 {
+            c.mark_failed(stamped_key(Path::new(&format!("C:\\bad{i}.png")), i));
+        }
+        let last = stamped_key(Path::new("C:\\bad-last.png"), 999);
+        c.mark_failed(last.clone());
+        assert!(c.is_failed(&last) && c.failed.len() <= 512);
+    }
+
+    #[test]
+    fn stock_inflight_is_tracked_per_icon() {
+        let mut c = ThumbCache::new();
+        assert!(!c.stock_is_inflight(StockIcon::Info));
+        c.mark_stock_inflight(StockIcon::Info);
+        assert!(c.stock_is_inflight(StockIcon::Info));
+        assert!(!c.stock_is_inflight(StockIcon::Shield));
+        assert!(c.stock_icon(StockIcon::Info).is_none());
+        assert!(!c.stock_is_failed(StockIcon::Info));
+    }
+
+    #[test]
+    fn share_index_reuses_the_first_raster_for_one_index() {
+        let mut c = ThumbCache::new();
+        let a = to_render_image(vec![1u8; 256], 8, 8).unwrap();
+        let b = to_render_image(vec![2u8; 256], 8, 8).unwrap();
+        let first = c.share_index(Some(5), a);
+        let second = c.share_index(Some(5), b);
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "one index shares a single raster"
+        );
+
+        let other = to_render_image(vec![3u8; 256], 8, 8).unwrap();
+        let third = c.share_index(Some(6), other);
+        assert!(
+            !std::sync::Arc::ptr_eq(&first, &third),
+            "new index is its own"
+        );
+
+        // `None` (no shell index) passes the raster through untouched.
+        let passthrough = to_render_image(vec![4u8; 256], 8, 8).unwrap();
+        let got = c.share_index(None, passthrough);
+        assert!(!std::sync::Arc::ptr_eq(&first, &got));
+    }
+
+    #[test]
+    fn apply_listing_icons_keys_paths_and_classes_separately() {
+        let folder = dir("C:\\pics");
+        let file = entry("C:\\pics\\note.txt");
+        let entries = vec![folder.clone(), file.clone()];
+        let icons = ListingIcons {
+            per_entry: vec![(0, 7), (1, 9)],
+            decoded: vec![(7, vec![1u8; 256], 8, 8), (9, vec![2u8; 256], 8, 8)],
+        };
+        let mut c = ThumbCache::new();
+        c.apply_listing_icons(&entries, &icons);
+
+        // A folder path icon is keyed by path plus stamp.
+        let key = stamped_key(&folder.path, mtime_nanos(folder.modified));
+        assert!(
+            c.get(&key).is_some(),
+            "path icon must store under its path key"
+        );
+        // A document's icon is keyed by extension, not by path.
+        assert!(c.class_icon("txt").is_some());
+        assert!(c.get(&cache_key(&file.path, file.modified)).is_none());
+    }
+
+    #[test]
+    fn insert_does_not_replace_an_existing_entry() {
+        let mut c = ThumbCache::new();
+        let k = stamped_key(Path::new("C:\\a.png"), 1);
+        let first = to_render_image(vec![1u8; 256], 8, 8).unwrap();
+        let second = to_render_image(vec![2u8; 256], 8, 8).unwrap();
+        c.insert(k.clone(), first.clone());
+        c.insert(k.clone(), second);
+        let got = c.get(&k).unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&got, &first),
+            "insert keeps the first raster"
+        );
+    }
+
+    #[test]
+    fn insert_force_replaces_an_evictable_entry_in_place() {
+        let mut c = ThumbCache::new();
+        let k = stamped_key(Path::new("C:\\a.png"), 1);
+        let first = to_render_image(vec![1u8; 256], 8, 8).unwrap();
+        let second = to_render_image(vec![2u8; 256], 8, 8).unwrap();
+        c.insert(k.clone(), first);
+        let bytes_before = c.bytes;
+        c.insert_force(k.clone(), second.clone());
+        let got = c.get(&k).unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&got, &second),
+            "force replaces the raster"
+        );
+        assert_eq!(c.map.len(), 1, "no duplicate LRU slot");
+        assert_eq!(c.order.len(), 1, "LRU order keeps one slot");
+        assert_eq!(
+            c.bytes, bytes_before,
+            "same-size replacement keeps bytes flat"
+        );
+    }
+
+    #[test]
+    fn pinned_get_returns_inserted() {
+        let mut c = ThumbCache::new();
+        let k = stamped_key(Path::new("C:\\"), 0);
+        assert!(c.pinned_get(&k).is_none());
+        c.insert_pinned(k.clone(), to_render_image(vec![3u8; 256], 8, 8).unwrap());
+        assert!(c.pinned_get(&k).is_some());
+        assert_eq!(c.pinned_order.len(), 1);
+    }
+
+    #[test]
+    fn drain_below_flush_threshold_returns_only_evicted_tiles() {
+        let mut c = ThumbCache::new();
+        // Enough 96x96 tiles to evict under BUDGET, but far fewer evicted bytes
+        // than FLUSH_THRESHOLD.
+        for i in 0..130u64 {
+            make_thumb(&mut c, &format!("x{i}.png"), i + 1);
+        }
+        let pending = c.pending_drops.len();
+        assert!(pending > 0, "budget pressure must evict something");
+        assert!(
+            pending * 36864 < FLUSH_THRESHOLD,
+            "this batch must stay under the flush threshold"
+        );
+        let dropped = c.drain_drops();
+        assert_eq!(
+            dropped.len(),
+            pending,
+            "no live-tile flush below the threshold"
+        );
+        assert!(c.dropped_since_flush > 0 && c.dropped_since_flush < FLUSH_THRESHOLD);
+    }
+
+    #[test]
+    fn drain_past_flush_threshold_drops_live_tiles_and_resets() {
+        let mut c = ThumbCache::new();
+        let k0 = make_thumb(&mut c, "pinned.png", 1);
+        c.set_working_set(&[k0]);
+        for i in 0..600u64 {
+            make_thumb(&mut c, &format!("x{i}.png"), i + 1);
+        }
+        let pending = c.pending_drops.len();
+        let live = c.map.len() + c.locked_map.len();
+        assert!(
+            pending * 36864 >= FLUSH_THRESHOLD,
+            "evicted bytes must pass the flush threshold"
+        );
+        let dropped = c.drain_drops();
+        assert_eq!(
+            dropped.len(),
+            pending + live,
+            "a full flush also drops every live tile"
+        );
+        assert_eq!(c.dropped_since_flush, 0, "the flush resets the counter");
+    }
+
+    #[test]
+    fn clear_content_resets_flush_accounting_and_queues_everything() {
+        let mut c = ThumbCache::new();
+        for i in 0..130u64 {
+            make_thumb(&mut c, &format!("x{i}.png"), i + 1);
+        }
+        c.clear_content();
+        assert_eq!(
+            c.dropped_since_flush, 0,
+            "navigation resets the flush counter"
+        );
+        assert!(c.map.is_empty() && c.locked_map.is_empty());
+        let dropped = c.drain_drops();
+        assert_eq!(
+            dropped.len(),
+            130,
+            "every inserted raster is queued for a GPU drop"
+        );
     }
 }

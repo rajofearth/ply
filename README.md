@@ -60,5 +60,7 @@ Ply is mostly read-only, but Rename and Delete are real. Delete goes to the
 platform recycle bin and never deletes permanently.
 
 See [CONTEXT.md](CONTEXT.md) for the domain language,
-[AGENTS.md](AGENTS.md) for how coding agents should work in this repo, and
-[docs/adr](docs/adr) for decisions.
+[AGENTS.md](AGENTS.md) for how coding agents should work in this repo,
+[docs/adr](docs/adr) for decisions, and
+[docs/philosophy.md](docs/philosophy.md) for the size and efficiency philosophy
+we borrow from fx.

@@ -139,7 +139,7 @@ fn decode_png_rgba(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
                 return None;
             }
             let mut rgba = Vec::with_capacity(pixels);
-            for px in raw[..pixels / 4 * 3].chunks_exact(3) {
+            for px in raw[..pixels / 4 * 3].as_chunks::<3>().0 {
                 rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
             }
             Some((rgba, w, h))
@@ -159,7 +159,7 @@ fn decode_png_rgba(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
                 return None;
             }
             let mut rgba = Vec::with_capacity(pixels);
-            for px in raw[..pixels / 2].chunks_exact(2) {
+            for px in raw[..pixels / 2].as_chunks::<2>().0 {
                 rgba.extend_from_slice(&[px[0], px[0], px[0], px[1]]);
             }
             Some((rgba, w, h))
@@ -400,6 +400,27 @@ mod tests {
     }
 
     #[test]
+    fn lookup_magic_invalid_returns_none() {
+        // A `.png` whose bytes lack the signature, one that is only the
+        // signature, and a JPEG-style header all read as a miss, so the caller
+        // heals by re-extracting instead of panicking. The valid PNG under the
+        // same key proves the miss is about the bytes, not the lookup path.
+        let root = temp_dir_for("magic");
+        let normal = root.join("normal");
+        let _ = fs::create_dir_all(&normal);
+        fs::write(normal.join("bad0.png"), b"not a png").unwrap();
+        fs::write(normal.join("bad1.png"), PNG_MAGIC).unwrap();
+        fs::write(normal.join("bad2.png"), [0xFFu8, 0xD8, 0xFF, 0xE0]).unwrap();
+        assert!(lookup_at("bad0", &root).is_none());
+        assert!(lookup_at("bad1", &root).is_none());
+        assert!(lookup_at("bad2", &root).is_none());
+        let rgba = vec![9u8; 2 * 2 * 4];
+        store_at(&rgba, 2, 2, "good", &root);
+        assert_eq!(lookup_at("good", &root).unwrap().0, rgba);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn fail_mark_and_failed() {
         let root = temp_dir_for("failmark");
         let _ = fs::create_dir_all(&root);
@@ -428,26 +449,30 @@ mod tests {
         let file_size = fs::metadata(&old_path).unwrap().len();
         assert_eq!(file_size, fs::metadata(&new_path).unwrap().len());
 
+        // Pin distinct mtimes so "oldest-first" is deterministic. Both files
+        // are written in the same test, so without this the tie rides on
+        // readdir order, which is name-ordered on NTFS but hash-ordered on
+        // some other filesystems.
+        let t0 = UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        fs::File::options()
+            .write(true)
+            .open(&old_path)
+            .unwrap()
+            .set_modified(t0)
+            .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&new_path)
+            .unwrap()
+            .set_modified(t0 + std::time::Duration::from_secs(10))
+            .unwrap();
+
         // Cap at just under two files so exactly one must be evicted.
         let cap = file_size * 2 - 1;
         evict_at(&normal, cap);
 
-        // Eviction is oldest-first by mtime. Both files were created in the
-        // same test, so both have the same mtime. Exactly one should be
-        // evicted to bring total under the cap. Which one is an
-        // implementation detail (the sort is stable, so the first file in
-        // directory order is evicted). Verify exactly one remains.
-        let remaining: Vec<_> = fs::read_dir(&normal).unwrap().flatten().collect();
-        assert_eq!(
-            remaining.len(),
-            1,
-            "exactly one file should remain after eviction"
-        );
-        assert_ne!(
-            remaining[0].path(),
-            old_path,
-            "the evicted file should be gone"
-        );
+        assert!(!old_path.exists(), "the oldest file must be evicted first");
+        assert!(new_path.exists(), "the newest file must survive");
         let _ = fs::remove_dir_all(&root);
     }
 
