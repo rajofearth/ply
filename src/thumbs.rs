@@ -68,6 +68,21 @@ const PINNED_CAP: usize = 96;
 /// placeholders until the viewport settles.
 pub(crate) const LOCK_CAP: usize = 64;
 
+// Scratch buffers for the working-set lock, reused across frames so the
+// render path stops building a fresh hash set and unlock vector per call
+// (same pattern as the browser's `LOCK_KEYS_SCRATCH`). Capacity persists;
+// the keys themselves still clone their paths, exactly as before.
+thread_local! {
+    static WORKING_SET_SCRATCH: std::cell::RefCell<WorkingSetScratch> =
+        std::cell::RefCell::new(WorkingSetScratch::default());
+}
+
+#[derive(Default)]
+struct WorkingSetScratch {
+    promote: HashSet<CacheKey>,
+    unlock: Vec<CacheKey>,
+}
+
 /// Identity of a cached raster: a path plus the "stamp" it was derived from,
 /// plus the tile size it was extracted for. For media and executables the
 /// stamp is the own-file mtime, so editing the file re-extracts it. For
@@ -576,42 +591,47 @@ impl ThumbCache {
     /// LRU. If the locked count exceeds [`LOCK_CAP`], excess entries are evicted
     /// from the back of the locked set (oldest lock).
     pub fn set_working_set(&mut self, new_keys: &[CacheKey]) {
-        let new: HashSet<CacheKey> = new_keys.iter().cloned().collect();
+        WORKING_SET_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            let WorkingSetScratch { promote, unlock } = &mut *scratch;
+            promote.clear();
+            for key in new_keys {
+                promote.insert(key.clone());
+            }
+            let new = &mut *promote;
 
-        // Promote: evictable -> locked.
-        for key in new.iter() {
-            if self.locked_set.contains(key) {
-                continue;
+            // Promote: evictable -> locked.
+            for key in new.iter() {
+                if self.locked_set.contains(key) {
+                    continue;
+                }
+                if let Some(img) = self.map.remove(key) {
+                    self.bytes = self.bytes.saturating_sub(byte_size(&img));
+                    // The LRU order mirrors the evictable map exactly: a promoted
+                    // key leaves it, or its stale slot would let a live entry be
+                    // evicted early (and the deque would grow without bound while
+                    // scrolling, since demote pushes the key back on exit).
+                    self.order.retain(|k| k != key);
+                    self.locked_bytes = self.locked_bytes.saturating_add(byte_size(&img));
+                    self.locked_map.insert(key.clone(), img);
+                    self.locked_set.insert(key.clone());
+                }
             }
-            if let Some(img) = self.map.remove(key) {
-                self.bytes = self.bytes.saturating_sub(byte_size(&img));
-                // The LRU order mirrors the evictable map exactly: a promoted
-                // key leaves it, or its stale slot would let a live entry be
-                // evicted early (and the deque would grow without bound while
-                // scrolling, since demote pushes the key back on exit).
-                self.order.retain(|k| k != key);
-                self.locked_bytes = self.locked_bytes.saturating_add(byte_size(&img));
-                self.locked_map.insert(key.clone(), img);
-                self.locked_set.insert(key.clone());
-            }
-        }
 
-        // Demote: locked -> evictable.
-        let to_unlock: Vec<CacheKey> = self
-            .locked_set
-            .iter()
-            .filter(|k| !new.contains(k))
-            .cloned()
-            .collect();
-        for key in &to_unlock {
-            if let Some(img) = self.locked_map.remove(key) {
-                self.locked_bytes = self.locked_bytes.saturating_sub(byte_size(&img));
-                self.bytes = self.bytes.saturating_add(byte_size(&img));
-                self.map.insert(key.clone(), img.clone());
-                self.order.push_back(key.clone());
+            // Demote: locked -> evictable.
+            let to_unlock = &mut *unlock;
+            to_unlock.clear();
+            to_unlock.extend(self.locked_set.iter().filter(|k| !new.contains(k)).cloned());
+            for key in to_unlock {
+                if let Some(img) = self.locked_map.remove(key) {
+                    self.locked_bytes = self.locked_bytes.saturating_sub(byte_size(&img));
+                    self.bytes = self.bytes.saturating_add(byte_size(&img));
+                    self.map.insert(key.clone(), img.clone());
+                    self.order.push_back(key.clone());
+                }
+                self.locked_set.remove(key);
             }
-            self.locked_set.remove(key);
-        }
+        });
 
         // Enforce lock cap: evict oldest locked entries beyond the cap.
         while self.locked_set.len() > LOCK_CAP {
@@ -643,7 +663,7 @@ impl ThumbCache {
                 if let Some(existing) = self.index_icons.get(&i) {
                     return existing.clone();
                 }
-                if self.index_icons.len() >= 1024 {
+                if self.index_icons.len() >= 256 {
                     self.index_icons.clear();
                 }
                 self.index_icons.insert(i, img.clone());
@@ -2048,7 +2068,7 @@ mod backend {
             return Some(hit.clone());
         }
         let (bytes, w, h) = list_icon_at(index)?;
-        if cache.len() >= 1024 {
+        if cache.len() >= 256 {
             cache.clear();
         }
         let bytes = Arc::new(bytes);
@@ -2998,9 +3018,7 @@ mod tests {
     /// stays predictable.
     fn make_thumb(cache: &mut ThumbCache, path: &str, stamp: u64) -> CacheKey {
         let key = stamped_key(Path::new(path), stamp);
-        let pixels: Vec<u8> = (0..36864)
-            .map(|i| (i ^ path.len()) as u8)
-            .collect();
+        let pixels: Vec<u8> = (0..36864).map(|i| (i ^ path.len()) as u8).collect();
         let img = to_render_image(pixels, 96, 96).unwrap();
         cache.insert(key.clone(), img);
         key

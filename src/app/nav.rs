@@ -88,7 +88,6 @@ impl Ply {
             Location::Home => {
                 self.watch = None;
                 self.visible_indices.clear();
-                self.visible_entries.clear();
                 self.refresh_volumes(cx);
             }
             Location::Folder(path) => {
@@ -100,7 +99,6 @@ impl Ply {
                 };
                 self.listing = LoadState::Loading;
                 self.visible_indices.clear();
-                self.visible_entries.clear();
                 self.reload(cx);
             }
         }

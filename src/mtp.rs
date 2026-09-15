@@ -617,24 +617,29 @@ mod windows_impl {
             std::fs::create_dir_all(&dir)?;
             let target = dir.join(&info.name);
 
+            let mut file = std::fs::File::create(&target)?;
             let mut buffer = vec![0u8; chunk.clamp(16 * 1024, 1024 * 1024) as usize];
-            let mut out = Vec::new();
             loop {
                 let mut read = 0u32;
-                stream
+                if let Err(e) = stream
                     .Read(
                         buffer.as_mut_ptr() as *mut _,
                         buffer.len() as u32,
                         Some(&mut read),
                     )
                     .ok()
-                    .map_err(|e| anyhow!("Transfer failed: {e}"))?;
+                {
+                    let _ = std::fs::remove_file(&target);
+                    return Err(anyhow!("Transfer failed: {e}"));
+                }
                 if read == 0 {
                     break;
                 }
-                out.extend_from_slice(&buffer[..read as usize]);
+                if let Err(e) = std::io::Write::write_all(&mut file, &buffer[..read as usize]) {
+                    let _ = std::fs::remove_file(&target);
+                    return Err(anyhow!("Could not write the copy: {e}"));
+                }
             }
-            std::fs::write(&target, &out)?;
             Ok(target)
         }
     }

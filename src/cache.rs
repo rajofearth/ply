@@ -229,23 +229,14 @@ fn encode_png_rgba(rgba: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
 
 /// Delete oldest-by-mtime files in `normal/` when total bytes exceed
 /// `max_bytes` or the file count exceeds [`DISK_CACHE_MAX_FILES`].
-/// Best-effort; never panics.
+/// Best-effort; never panics. Runs through [`evict_incremental`] with the
+/// per-call bound removed, so the caps are checked by one shared path.
 pub fn evict(max_bytes: u64) {
-    evict_with_limits(max_bytes, DISK_CACHE_MAX_FILES);
+    evict_incremental(max_bytes, DISK_CACHE_MAX_FILES, usize::MAX);
 }
 
-/// [`evict`] with explicit caps, so tests and the background pass can tune
-/// each bound independently.
-pub fn evict_with_limits(max_bytes: u64, max_files: u64) {
-    let Some(dir) = cache_dir() else { return };
-    evict_at_limited(&dir.join("normal"), max_bytes, max_files, usize::MAX);
-}
-
-/// Evict oldest-first, removing at most `max_remove` files per call. Returns
-/// the files removed; call again until it returns 0 to drain fully. Lets the
-/// app bound background eviction work per idle slice instead of deleting
-/// thousands of files in one launch pass.
-#[allow(dead_code)] // wired up by the background idle pass next; unit-covered.
+/// [`evict_incremental`] with the removal bound removed. Kept as the
+/// byte-cap-and-file-cap spelling the background pass and tests tune.
 pub fn evict_incremental(max_bytes: u64, max_files: u64, max_remove: usize) -> usize {
     let Some(dir) = cache_dir() else { return 0 };
     evict_at_limited(&dir.join("normal"), max_bytes, max_files, max_remove)

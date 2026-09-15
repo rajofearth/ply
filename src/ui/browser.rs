@@ -1,5 +1,6 @@
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::Path;
+use std::sync::Arc;
 
 use super::icon;
 use super::sidebar::{DragLabel, PinDrag};
@@ -22,8 +23,7 @@ pub fn render(ply: &Ply, window: &Window, cx: &mut Context<Ply>) -> impl IntoEle
     let list_view = ply.view == ViewMode::List;
     let count = ply.visible_len();
     let request_gen = ply.list_generation;
-    let entries = ply.visible();
-    let total = entries.len();
+    let total = count;
     let visible_count = if list_view {
         let row_h = 29.;
         (f32::from(window.viewport_size().height) / row_h).ceil() as usize
@@ -54,16 +54,16 @@ pub fn render(ply: &Ply, window: &Window, cx: &mut Context<Ply>) -> impl IntoEle
     // off-screen ones.
     {
         let pf_start = vp.start.saturating_sub(PREFETCH_OVERSCAN);
-        let pf_end = (vp.end + PREFETCH_OVERSCAN).min(entries.len());
+        let pf_end = (vp.end + PREFETCH_OVERSCAN).min(total);
         // Visible entries first, then the overscan window.
-        for entry in &entries[vp.clone()] {
-            thumbs::ensure_entry_icons(ply, entry, cx, request_gen);
+        for entry in vp.clone().filter_map(|ix| ply.entry_at_visible(ix)) {
+            prefetch_icons(ply, entry, cx, request_gen);
         }
-        for entry in &entries[pf_start..vp.start] {
-            thumbs::ensure_entry_icons(ply, entry, cx, request_gen);
+        for entry in (pf_start..vp.start).filter_map(|ix| ply.entry_at_visible(ix)) {
+            prefetch_icons(ply, entry, cx, request_gen);
         }
-        for entry in &entries[vp.end..pf_end] {
-            thumbs::ensure_entry_icons(ply, entry, cx, request_gen);
+        for entry in (vp.end..pf_end).filter_map(|ix| ply.entry_at_visible(ix)) {
+            prefetch_icons(ply, entry, cx, request_gen);
         }
     }
 
@@ -74,7 +74,7 @@ pub fn render(ply: &Ply, window: &Window, cx: &mut Context<Ply>) -> impl IntoEle
     // evictable and re-decodes on demand when scrolled back into view.
     {
         let lo = vp.start.saturating_sub(LOCK_OVERSCAN);
-        let hi = (vp.end + LOCK_OVERSCAN).min(entries.len());
+        let hi = (vp.end + LOCK_OVERSCAN).min(total);
         let center = (vp.start + vp.end) / 2;
         let (lo, hi) = clamp_lock_window(lo, hi, center);
         // Content tiles key by view size (48px rows in list view, 96px cells
@@ -87,7 +87,7 @@ pub fn render(ply: &Ply, window: &Window, cx: &mut Context<Ply>) -> impl IntoEle
                 let mut keys = scratch.borrow_mut();
                 keys.clear();
                 keys.reserve(hi.saturating_sub(lo));
-                for e in &entries[lo..hi] {
+                for e in (lo..hi).filter_map(|ix| ply.entry_at_visible(ix)) {
                     let lnk_stamp = if thumbs::is_lnk(e) {
                         cache.lnk_stamp(&e.path)
                     } else {
@@ -122,11 +122,9 @@ pub fn render(ply: &Ply, window: &Window, cx: &mut Context<Ply>) -> impl IntoEle
                 // wins; the list asks for its visible slice once per frame.
                 this.last_viewport = range.clone();
                 this.last_viewport_gen = req_gen;
-                let entries = this.visible();
                 range
                     .filter_map(|ix| {
-                        entries
-                            .get(ix)
+                        this.entry_at_visible(ix)
                             .map(|e| list_row(this, e, ix, now, cx, req_gen))
                     })
                     .collect::<Vec<_>>()
@@ -146,14 +144,19 @@ pub fn render(ply: &Ply, window: &Window, cx: &mut Context<Ply>) -> impl IntoEle
                 // Recorded before borrowing the entries below.
                 this.last_viewport = range.start * cols..range.end * cols;
                 this.last_viewport_gen = req_gen;
-                let entries = this.visible();
+                this.last_viewport = range.start * cols..range.end * cols;
+                this.last_viewport_gen = req_gen;
+                let total = this.visible_len();
                 range
                     .map(|row_ix| {
-                        let rng = grid_row_range(row_ix, cols, entries.len());
+                        let rng = grid_row_range(row_ix, cols, total);
                         div()
                             .flex()
                             .gap(px(4.))
-                            .children(rng.map(|ix| grid_cell(this, &entries[ix], ix, cx, req_gen)))
+                            .children(
+                                rng.filter_map(|ix| this.entry_at_visible(ix).map(|e| (ix, e)))
+                                    .map(|(ix, e)| grid_cell(this, e, ix, cx, req_gen)),
+                            )
                             .into_any_element()
                     })
                     .collect::<Vec<_>>()
@@ -178,6 +181,23 @@ pub fn render(ply: &Ply, window: &Window, cx: &mut Context<Ply>) -> impl IntoEle
         )
         .when(list_view, |el| el.child(list_headers(ply)))
         .child(body)
+}
+
+/// Fires icon extraction for one entry, unless the call provably no-ops. A
+/// non-directory with no extension falls through every tier of
+/// `ensure_entry_icons` (no path icon, not a link, no content thumbnail) into
+/// `class_icon`, which returns before touching the cache when its extension
+/// string is empty — so the only work is the throwaway extension String, built
+/// here for nothing. Skip those and the warm-folder frame stops churning.
+fn prefetch_icons(ply: &Ply, entry: &Entry, cx: &mut Context<Ply>, request_gen: u64) {
+    if !entry.is_directory()
+        && Path::new(&entry.name)
+            .extension()
+            .is_none_or(|e| e.is_empty())
+    {
+        return;
+    }
+    thumbs::ensure_entry_icons(ply, entry, cx, request_gen);
 }
 
 /// Fixed column widths shared by the header and every list row so cells line up.
@@ -389,7 +409,7 @@ fn list_row(
     let p = ply.palette();
     let selected = ply.is_selected(&entry.path);
     let renaming = ply.rename.as_ref().is_some_and(|r| r.path == entry.path);
-    let path = entry.path.clone();
+    let path: Arc<Path> = Arc::from(entry.path.as_path());
     let is_dir = entry.is_directory();
 
     div()
@@ -462,7 +482,9 @@ fn list_row(
         .when(!renaming, |el| {
             el.on_click(activate(ix, path.clone(), cx))
                 .on_mouse_down(MouseButton::Right, context_menu(path.clone(), cx))
-                .when(is_dir, |el| el.on_drag(PinDrag(path.clone()), drag_chip))
+                .when(is_dir, |el| {
+                    el.on_drag(PinDrag(path.to_path_buf()), drag_chip)
+                })
         })
         .into_any_element()
 }
@@ -477,7 +499,7 @@ fn grid_cell(
     let p = ply.palette();
     let selected = ply.is_selected(&entry.path);
     let renaming = ply.rename.as_ref().is_some_and(|r| r.path == entry.path);
-    let path = entry.path.clone();
+    let path: Arc<Path> = Arc::from(entry.path.as_path());
     let is_dir = entry.is_directory();
 
     div()
@@ -511,7 +533,9 @@ fn grid_cell(
         .when(!renaming, |el| {
             el.on_click(activate(ix, path.clone(), cx))
                 .on_mouse_down(MouseButton::Right, context_menu(path.clone(), cx))
-                .when(is_dir, |el| el.on_drag(PinDrag(path.clone()), drag_chip))
+                .when(is_dir, |el| {
+                    el.on_drag(PinDrag(path.to_path_buf()), drag_chip)
+                })
         })
         .into_any_element()
 }
@@ -519,7 +543,7 @@ fn grid_cell(
 /// Single click selects (honouring ctrl/shift); double click opens.
 fn activate(
     ix: usize,
-    path: PathBuf,
+    path: Arc<Path>,
     cx: &mut Context<Ply>,
 ) -> impl Fn(&ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static {
     cx.listener(move |this, ev: &ClickEvent, window, cx| {
@@ -534,12 +558,12 @@ fn activate(
 }
 
 fn context_menu(
-    path: PathBuf,
+    path: Arc<Path>,
     cx: &mut Context<Ply>,
 ) -> impl Fn(&MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static {
     cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
         cx.stop_propagation();
-        this.open_menu(ev.position, path.clone(), cx);
+        this.open_menu(ev.position, path.to_path_buf(), cx);
     })
 }
 
