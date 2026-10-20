@@ -104,6 +104,8 @@ mod tests {
         {
             Ok(out) => out,
             Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
                 eprintln!("RAM measure:            (measure failed)  SKIP");
                 return;
             }
