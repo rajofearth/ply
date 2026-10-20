@@ -7,9 +7,12 @@
 //! are out of scope.
 
 use std::path::{Path, PathBuf};
+#[cfg(not(target_os = "macos"))]
 use std::time::{Duration, UNIX_EPOCH};
 
-use crate::listing::{Entry, EntryKind};
+use crate::listing::Entry;
+#[cfg(not(target_os = "macos"))]
+use crate::listing::EntryKind;
 
 /// The synthetic root that stands in for the Recycle Bin. Not a real path; it
 /// is used as a lone `Location::Folder` so browsing works like any other folder.
@@ -29,6 +32,7 @@ pub fn display_name() -> &'static str {
 
 /// Flat, browse-only listing of everything in the Recycle Bin. Ordering is left
 /// to the caller's active sort, like any other folder.
+#[cfg(not(target_os = "macos"))]
 pub fn list() -> anyhow::Result<Vec<Entry>> {
     Ok(trash::os_limited::list()?
         .into_iter()
@@ -36,8 +40,17 @@ pub fn list() -> anyhow::Result<Vec<Entry>> {
         .collect())
 }
 
+/// `trash` does not expose its `os_limited` listing API on macOS. The Recycle
+/// Bin row is Windows-only, so this path is unreachable from the UI; fail
+/// clearly if it is reached anyway.
+#[cfg(target_os = "macos")]
+pub fn list() -> anyhow::Result<Vec<Entry>> {
+    anyhow::bail!("Recycle Bin browsing is not supported on macOS")
+}
+
 /// Each recycled item gets the shell parsing name as its path — the only stable
 /// key the shell exposes, and not a filesystem path that no longer exists.
+#[cfg(not(target_os = "macos"))]
 fn item_to_entry(item: trash::TrashItem) -> Entry {
     let name = item.name.to_string_lossy().into_owned();
     let modified = (item.time_deleted >= 0)
@@ -92,5 +105,11 @@ mod tests {
     fn root_constant_is_stable() {
         assert_eq!(ROOT_STR, r"\\RecycleBin");
         assert_eq!(root(), PathBuf::from(ROOT_STR));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn listing_is_unavailable_on_macos() {
+        assert!(list().is_err());
     }
 }
