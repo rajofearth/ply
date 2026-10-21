@@ -2390,9 +2390,6 @@ fn request_stock_icon_pixels(_stock: StockIcon) -> Option<(Vec<u8>, u32, u32)> {
 #[cfg(windows)]
 use backend::{request, request_class_icon, request_lnk, resolve_lnk_source};
 
-#[cfg(not(windows))]
-use {request, request_class_icon, request_lnk, resolve_lnk_source};
-
 /// Warm the shell icon worker once, at startup, off the hot path. The STA
 /// worker thread and its apartment spin up lazily on the first icon request;
 /// paying that plus a cold shell lookup at launch keeps the first listing's
