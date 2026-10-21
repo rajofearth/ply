@@ -42,6 +42,7 @@ mod tests {
         );
         eprintln!("idle CPU:               near-zero on Home");
         eprintln!("path checked:           {}", path.display());
+        measure_working_set_gate(&path);
 
         match std::fs::metadata(&path) {
             Ok(meta) => {
@@ -73,5 +74,64 @@ mod tests {
             }
         }
         eprintln!("-------------------------------");
+    }
+
+    /// Launches the release exe, samples its private commit as a conservative
+    /// non-GPU working-set proxy, and closes it. Print-only unless
+    /// `PLY_BUDGET_REQUIRE_RAM=1`, keeping CI and normal runs unaffected.
+    fn measure_working_set_gate(path: &std::path::Path) {
+        if !cfg!(windows) || std::env::var_os("PLY_BUDGET_MEASURE_EXE").is_none() {
+            return;
+        }
+        let Ok(mut child) = std::process::Command::new(path)
+            .env("PLY_BUDGET_MEASURE", "1")
+            .spawn()
+        else {
+            eprintln!("RAM measure:            (launch failed)  SKIP");
+            return;
+        };
+        let pid = child.id();
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        let out = match std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "(Get-Process -Id {pid} -ErrorAction SilentlyContinue).PrivateMemorySize64"
+                ),
+            ])
+            .output()
+        {
+            Ok(out) => out,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                eprintln!("RAM measure:            (measure failed)  SKIP");
+                return;
+            }
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        let text = String::from_utf8_lossy(&out.stdout);
+        let bytes: Option<u64> = text.trim().parse().ok();
+        match bytes {
+            Some(bytes) => {
+                let mib = bytes as f64 / (1024.0 * 1024.0);
+                let ok = bytes <= MAX_NON_GPU_WORKING_SET_BYTES;
+                eprintln!(
+                    "RAM proxy (commit):     {mib:>6.2} MiB  {}",
+                    if ok { "PASS" } else { "FAIL" }
+                );
+                if std::env::var_os("PLY_BUDGET_REQUIRE_RAM").is_some() {
+                    assert!(
+                        ok,
+                        "RAM proxy is {mib:.2} MiB ({bytes} bytes); budget is {} bytes (100 MiB). \
+                         Find what has grown or justify raising AGENTS.md / budget.rs together.",
+                        MAX_NON_GPU_WORKING_SET_BYTES
+                    );
+                }
+            }
+            None => eprintln!("RAM measure:            (unparsable)  SKIP"),
+        }
     }
 }

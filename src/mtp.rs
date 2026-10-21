@@ -114,6 +114,7 @@ pub fn fetch(_path: &Path) -> anyhow::Result<PathBuf> {
 mod windows_impl {
     use super::*;
 
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -617,24 +618,44 @@ mod windows_impl {
             std::fs::create_dir_all(&dir)?;
             let target = dir.join(&info.name);
 
+            // Stream into a private staging file and only replace `target` once
+            // the whole transfer succeeds. Opening the same object again must
+            // not truncate a copy an app already has open, and a failed retry
+            // must leave the previous copy intact.
+            static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
+            let seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
+            let staging = dir.join(format!(".ply-{}-{seq}.part", std::process::id()));
+
+            let mut file = std::fs::File::create(&staging)?;
             let mut buffer = vec![0u8; chunk.clamp(16 * 1024, 1024 * 1024) as usize];
-            let mut out = Vec::new();
             loop {
                 let mut read = 0u32;
-                stream
+                if let Err(e) = stream
                     .Read(
                         buffer.as_mut_ptr() as *mut _,
                         buffer.len() as u32,
                         Some(&mut read),
                     )
                     .ok()
-                    .map_err(|e| anyhow!("Transfer failed: {e}"))?;
+                {
+                    drop(file);
+                    let _ = std::fs::remove_file(&staging);
+                    return Err(anyhow!("Transfer failed: {e}"));
+                }
                 if read == 0 {
                     break;
                 }
-                out.extend_from_slice(&buffer[..read as usize]);
+                if let Err(e) = std::io::Write::write_all(&mut file, &buffer[..read as usize]) {
+                    drop(file);
+                    let _ = std::fs::remove_file(&staging);
+                    return Err(anyhow!("Could not write the copy: {e}"));
+                }
             }
-            std::fs::write(&target, &out)?;
+            drop(file);
+            if let Err(e) = std::fs::rename(&staging, &target) {
+                let _ = std::fs::remove_file(&staging);
+                return Err(anyhow!("Could not finish the copy: {e}"));
+            }
             Ok(target)
         }
     }

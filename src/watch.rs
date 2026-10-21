@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::{Mutex, mpsc};
+use std::sync::{Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 use notify::event::{EventKind, MetadataKind, ModifyKind};
@@ -24,8 +24,40 @@ fn is_substantive(kind: EventKind) -> bool {
     }
 }
 
+/// Where the persistent watcher's events currently belong: the folder it was
+/// pointed at most recently and the channel of the [`FolderWatch`] that owns
+/// it. The watcher callback reads this to attribute each delivery, and a
+/// folder switch writes it before re-pointing the OS watch, so anything still
+/// in flight from the previous folder is unmatched and never fires a reload
+/// into the new one. `generation` is bumped on every construction, so the
+/// outgoing instance's `Drop` can tell replacement (do nothing) from being
+/// the last owner (release the OS watch, e.g. navigating to Home).
+struct WatchTarget {
+    generation: u64,
+    path: Option<PathBuf>,
+    tx: Option<mpsc::Sender<WatchEvent>>,
+}
+
+/// The watcher itself, created once for the whole session and kept across
+/// navigations: a folder switch re-points it instead of paying a fresh
+/// watcher's half-second poll-cycle warmup (and its per-folder window of
+/// unheard events) on every navigation. Kept separate from [`TARGET`] so the
+/// event callback always takes a lock no folder switch holds across
+/// `watch`/`unwatch`.
+static WATCHER: OnceLock<Mutex<Option<RecommendedWatcher>>> = OnceLock::new();
+static TARGET: OnceLock<Mutex<WatchTarget>> = OnceLock::new();
+
+fn new_target() -> WatchTarget {
+    WatchTarget {
+        generation: 0,
+        path: None,
+        tx: None,
+    }
+}
+
 pub struct FolderWatch {
-    _watcher: RecommendedWatcher,
+    path: PathBuf,
+    generation: u64,
     rx: mpsc::Receiver<WatchEvent>,
     last_change: Mutex<Option<Instant>>,
 }
@@ -33,19 +65,59 @@ pub struct FolderWatch {
 impl FolderWatch {
     pub fn current_folder(path: PathBuf) -> anyhow::Result<Self> {
         let (tx, rx) = mpsc::channel();
-        let mut watcher = RecommendedWatcher::new(
-            move |res: Result<notify::Event, notify::Error>| {
-                if let Ok(event) = res
-                    && is_substantive(event.kind)
-                {
-                    let _ = tx.send(WatchEvent::Changed);
-                }
-            },
-            Config::default().with_poll_interval(Duration::from_millis(100)),
-        )?;
-        watcher.watch(&path, RecursiveMode::NonRecursive)?;
+        let slot = WATCHER.get_or_init(|| Mutex::new(None));
+        let mut watch = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if watch.is_none() {
+            *watch = Some(RecommendedWatcher::new(
+                move |res: Result<notify::Event, notify::Error>| {
+                    if let Ok(event) = res
+                        && is_substantive(event.kind)
+                        && let Some(target) = TARGET.get()
+                    {
+                        let target = target.lock().unwrap_or_else(|p| p.into_inner());
+                        if let (Some(current), Some(tx)) = (&target.path, &target.tx)
+                            && (event.paths.is_empty()
+                                || event.paths.iter().any(|p| p.starts_with(current)))
+                        {
+                            let _ = tx.send(WatchEvent::Changed);
+                        }
+                    }
+                },
+                Config::default().with_poll_interval(Duration::from_millis(100)),
+            )?);
+        }
+        let watch = watch.as_mut().expect("watcher was just ensured");
+        let target_cell = TARGET.get_or_init(|| Mutex::new(new_target()));
+        let (generation, old_path, old_tx) = {
+            let mut target = target_cell.lock().unwrap_or_else(|p| p.into_inner());
+            target.generation += 1;
+            (
+                target.generation,
+                target.path.replace(path.clone()),
+                target.tx.replace(tx),
+            )
+        };
+        let same = old_path
+            .as_ref()
+            .is_some_and(|p| p.as_path() == path.as_path());
+        if !same {
+            // Start watching the new folder before dropping the old watch, so
+            // a change arriving between the two is never lost.
+            let started = watch.watch(&path, RecursiveMode::NonRecursive);
+            if let Err(err) = started {
+                let mut target = target_cell.lock().unwrap_or_else(|p| p.into_inner());
+                target.generation = generation - 1;
+                target.path = old_path;
+                target.tx = old_tx;
+                return Err(err.into());
+            }
+            if let Some(old_path) = &old_path {
+                let _ = watch.unwatch(old_path);
+            }
+        }
         Ok(Self {
-            _watcher: watcher,
+            path,
+            generation,
             rx,
             last_change: Mutex::new(None),
         })
@@ -81,10 +153,37 @@ impl FolderWatch {
     }
 }
 
+impl Drop for FolderWatch {
+    fn drop(&mut self) {
+        let Some(target_cell) = TARGET.get() else {
+            return;
+        };
+        let mut target = target_cell.lock().unwrap_or_else(|p| p.into_inner());
+        // A replaced instance holds a stale identity: its folder was already
+        // handed to the next one. Only the still-current owner releases.
+        if target.generation != self.generation {
+            return;
+        }
+        target.path = None;
+        drop(target);
+        if let Some(slot) = WATCHER.get() {
+            let mut watch = slot.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(watch) = watch.as_mut() {
+                let _ = watch.unwatch(&self.path);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use notify::event::{AccessKind, CreateKind, DataChange};
+
+    /// The two live-folder tests ride the same session-global watcher, and
+    /// each one re-points it, so they must not overlap when the harness runs
+    /// test threads in parallel.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn access_events_are_ignored() {
@@ -149,6 +248,9 @@ mod tests {
 
     #[test]
     fn debounce_without_any_change_is_false() {
+        let _lock = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = unique_dir("quiet");
         let watch = FolderWatch::current_folder(dir.clone()).expect("watch must start");
         assert!(!watch.take_change_debounced(Duration::from_secs(10)));
@@ -158,6 +260,9 @@ mod tests {
 
     #[test]
     fn debounce_collapses_a_change_then_fires_once_quiet() {
+        let _lock = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = unique_dir("burst");
         let watch = FolderWatch::current_folder(dir.clone()).expect("watch must start");
         std::fs::write(dir.join("a.txt"), b"x").unwrap();

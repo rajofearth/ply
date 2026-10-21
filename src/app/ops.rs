@@ -133,7 +133,6 @@ impl Ply {
                     Err(err) => {
                         this.listing = LoadState::Failed(err.to_string().into());
                         this.visible_indices.clear();
-                        this.visible_entries.clear();
                     }
                 }
                 cx.notify();
@@ -196,9 +195,8 @@ impl Ply {
                     .await;
                 let paused = this
                     .update(cx, |this, _| {
-                        let lnks = this
-                            .visible()
-                            .iter()
+                        let lnks = (0..this.visible_len())
+                            .filter_map(|ix| this.entry_at_visible(ix))
                             .filter(|e| {
                                 Path::new(&e.name)
                                     .extension()
@@ -334,22 +332,19 @@ impl Ply {
         .detach();
     }
 
-    /// Rebuild [`Ply::visible_indices`] from the Ready listing and filter, and
-    /// mirror the result into the owned [`Ply::visible_entries`] cache so the
-    /// render path never allocates a fresh `Vec` per frame.
+    /// Rebuild [`Ply::visible_indices`] from the Ready listing and filter.
+    /// Entries themselves are never copied: [`Ply::entry_at_visible`] resolves
+    /// each index through the snapshot's `Arc<Vec<Entry>>`.
     pub(super) fn rebuild_visible(&mut self) {
-        // Reuse both allocations across keystrokes: `clear` keeps the
-        // capacity, `filter_indices_into` fills `visible_indices` in place,
-        // and the entry cache only tops up what it lacks.
+        // Reuse the allocation across keystrokes: `clear` keeps the capacity
+        // and `filter_indices_into` fills it in place.
         self.visible_indices.clear();
-        self.visible_entries.clear();
         let LoadState::Ready(snapshot) = &self.listing else {
             return;
         };
         if self.filter_text.is_empty() {
-            // Unfiltered: `visible()` serves the snapshot's own slice, so no
-            // clone cache is kept here; only the index set needs rebuilding.
-            self.visible_indices.extend(0..snapshot.entries.len());
+            // Unfiltered: `entry_at_visible` serves the snapshot's own slice,
+            // so no index set is kept — the common path allocates nothing.
             return;
         }
         crate::listing::filter_indices_into(
@@ -357,28 +352,29 @@ impl Ply {
             &self.filter_text,
             &mut self.visible_indices,
         );
-        clone_indices_into(
-            &snapshot.entries,
-            &self.visible_indices,
-            &mut self.visible_entries,
-        );
     }
 
-    /// Entries in the current folder that survive the filter box, as a slice in
-    /// `visible_indices` order. No per-call allocation: the unfiltered case
-    /// reborrows the snapshot's own entries, and the filtered case returns the
-    /// owned cache rebuilt by [`Self::rebuild_visible`].
-    pub fn visible(&self) -> &[Entry] {
-        match &self.listing {
-            LoadState::Ready(snapshot) if self.filter_text.is_empty() => &snapshot.entries,
-            LoadState::Ready(_) => &self.visible_entries,
-            _ => &[],
+    /// Entry at visible position `ix`. The unfiltered case indexes the Ready
+    /// snapshot's own slice directly; the filtered case resolves
+    /// `visible_indices[ix]` against it. No cloned listing, no per-call
+    /// allocation. `None` while not Ready or past the end.
+    pub fn entry_at_visible(&self, ix: usize) -> Option<&Entry> {
+        let LoadState::Ready(snapshot) = &self.listing else {
+            return None;
+        };
+        if self.filter_text.is_empty() {
+            return snapshot.entries.get(ix);
         }
+        snapshot.entries.get(*self.visible_indices.get(ix)?)
     }
 
-    /// Count of filtered entries, matching the slice `visible()` returns.
+    /// Count of filtered entries — the row count the browser paints.
     pub fn visible_len(&self) -> usize {
-        self.visible().len()
+        match &self.listing {
+            LoadState::Ready(snapshot) if self.filter_text.is_empty() => snapshot.entries.len(),
+            LoadState::Ready(_) => self.visible_indices.len(),
+            _ => 0,
+        }
     }
 
     /// Keep the filter's placeholder showing the folder's item count.
@@ -427,6 +423,21 @@ impl Ply {
         self.selection_set.clear();
     }
 
+    /// Visible position of `path`, or `None` when it is filtered out or not in
+    /// the listing. O(n) scan without cloning, same contract as the inline
+    /// scans of `visible()` it replaces.
+    fn visible_position(&self, path: &Path) -> Option<usize> {
+        let LoadState::Ready(snapshot) = &self.listing else {
+            return None;
+        };
+        if self.filter_text.is_empty() {
+            return snapshot.entries.iter().position(|e| e.path == path);
+        }
+        self.visible_indices
+            .iter()
+            .position(|&ix| snapshot.entries.get(ix).is_some_and(|e| e.path == path))
+    }
+
     fn replace_selection(&mut self, paths: Vec<PathBuf>) {
         self.selection_set = paths.iter().cloned().collect();
         self.selection = paths;
@@ -445,13 +456,17 @@ impl Ply {
             Single(PathBuf),
         }
         let click = {
-            let visible = self.visible();
-            let Some(target) = visible.get(ix).map(|e| e.path.clone()) else {
+            let Some(target) = self.entry_at_visible(ix).map(|e| e.path.clone()) else {
                 return;
             };
             if extend && let Some(anchor) = self.anchor {
-                let (lo, hi) = selection_span(anchor, ix, visible.len());
-                Click::Range(visible[lo..=hi].iter().map(|e| e.path.clone()).collect())
+                let (lo, hi) = selection_span(anchor, ix, self.visible_len());
+                Click::Range(
+                    (lo..=hi)
+                        .filter_map(|i| self.entry_at_visible(i))
+                        .map(|e| e.path.clone())
+                        .collect(),
+                )
             } else if toggle {
                 Click::Toggle(target)
             } else {
@@ -489,29 +504,32 @@ impl Ply {
         // scanning paths without cloning them, then only the target/range is
         // cloned.
         let (current, next, len) = {
-            let visible = self.visible();
-            if visible.is_empty() {
+            let len = self.visible_len();
+            if len == 0 {
                 return;
             }
             let current = self
                 .selection
                 .last()
-                .and_then(|last| visible.iter().position(|e| e.path == *last))
+                .and_then(|last| self.visible_position(last))
                 .unwrap_or(0) as isize;
-            let next = (current + delta).clamp(0, visible.len() as isize - 1) as usize;
-            (current as usize, next, visible.len())
+            let next = (current + delta).clamp(0, len as isize - 1) as usize;
+            (current as usize, next, len)
         };
         if extend {
             let anchor = self.anchor.unwrap_or(current);
             let (lo, hi) = selection_span(anchor, next, len);
-            let paths: Vec<PathBuf> = self.visible()[lo..=hi]
-                .iter()
+            let paths: Vec<PathBuf> = (lo..=hi)
+                .filter_map(|ix| self.entry_at_visible(ix))
                 .map(|e| e.path.clone())
                 .collect();
             self.replace_selection(paths);
             self.anchor = Some(anchor);
         } else {
-            let path = self.visible()[next].path.clone();
+            let Some(entry) = self.entry_at_visible(next) else {
+                return;
+            };
+            let path = entry.path.clone();
             self.replace_selection(vec![path]);
             self.anchor = Some(next);
         }
@@ -530,17 +548,14 @@ impl Ply {
         // Index-resolved like `click_row`: scan for the current position
         // without cloning, then clone only the target/range. The grid math
         // below is unchanged; only path sourcing changed.
-        let total = {
-            let visible = self.visible();
-            if visible.is_empty() || cols == 0 {
-                return;
-            }
-            visible.len()
-        };
+        let total = self.visible_len();
+        if total == 0 || cols == 0 {
+            return;
+        }
         let cur = self
             .selection
             .last()
-            .and_then(|last| self.visible().iter().position(|e| e.path == *last))
+            .and_then(|last| self.visible_position(last))
             .unwrap_or(0);
         let row = cur / cols;
         let col = cur % cols;
@@ -568,14 +583,17 @@ impl Ply {
         if extend {
             let anchor = self.anchor.unwrap_or(cur);
             let (lo, hi) = selection_span(anchor, next, total);
-            let paths: Vec<PathBuf> = self.visible()[lo..=hi]
-                .iter()
+            let paths: Vec<PathBuf> = (lo..=hi)
+                .filter_map(|ix| self.entry_at_visible(ix))
                 .map(|e| e.path.clone())
                 .collect();
             self.replace_selection(paths);
             self.anchor = Some(anchor);
         } else {
-            let path = self.visible()[next].path.clone();
+            let Some(entry) = self.entry_at_visible(next) else {
+                return;
+            };
+            let path = entry.path.clone();
             self.replace_selection(vec![path]);
             self.anchor = Some(next);
         }
@@ -2020,27 +2038,12 @@ fn selection_span(anchor: usize, target: usize, len: usize) -> (usize, usize) {
     (lo, hi)
 }
 
-/// Append clones of `entries[i]` for each `i` in `indices`, resetting `out`
-/// first so a keystroke reuses one allocation. Indices are expected to come
-/// from `entries`; an out-of-range index is skipped rather than panicking.
-/// Pure, so the `visible_entries` cache contract is unit-tested without a
-/// window.
-fn clone_indices_into(entries: &[Entry], indices: &[usize], out: &mut Vec<Entry>) {
-    out.clear();
-    out.reserve(indices.len());
-    for &i in indices {
-        if let Some(entry) = entries.get(i) {
-            out.push(entry.clone());
-        }
-    }
-}
-
 /// Indices into `entries` that survive the filter, in listing order. An empty
-/// filter keeps every index. Pure and ordered, so the owned `visible_entries`
-/// cache and the index set stay identical to the old `Vec<&Entry>` slice.
-/// Matching lives in `listing::filter_indices_into` (zero-alloc ASCII fast
-/// path). Test-only wrapper: the shipping path (`rebuild_visible`) fills its
-/// scratch vec in place instead of allocating per call.
+/// filter keeps every index. Pure and ordered, so `entry_at_visible` resolves
+/// the same subset in the same order. Matching lives in
+/// `listing::filter_indices_into` (zero-alloc ASCII fast path). Test-only
+/// wrapper: the shipping path (`rebuild_visible`) fills its scratch vec in
+/// place instead of allocating per call.
 #[cfg(test)]
 fn filter_indices(entries: &[Entry], filter: &str) -> Vec<usize> {
     let mut out = Vec::new();
@@ -2105,9 +2108,10 @@ mod tests {
     }
 
     #[test]
-    fn filtered_cache_is_in_display_when_resolved_by_index() {
-        // What `rebuild_visible` does: clone entries at the returned indices
-        // and serve them in the same order as the old index-mapped slice.
+    fn filtered_indices_resolve_to_display_order() {
+        // What `entry_at_visible` does at runtime: an index from the filter
+        // resolves to the entry at that snapshot position, so the display
+        // order is exactly the filtered listing order.
         let entries = vec![
             file("alpha.txt"),
             file("beta.mp4"),
@@ -2116,14 +2120,12 @@ mod tests {
         ];
         let idx = filter_indices(&entries, "al");
         assert_eq!(idx, [0, 2]);
-        let cached: Vec<Entry> = idx
+        let resolved: Vec<&str> = idx
             .iter()
             .filter_map(|&i| entries.get(i))
-            .cloned()
+            .map(|e| e.name.as_str())
             .collect();
-        assert_eq!(cached.len(), 2);
-        assert_eq!(cached[0].name, "alpha.txt");
-        assert_eq!(cached[1].name, "almanac.png");
+        assert_eq!(resolved, ["alpha.txt", "almanac.png"]);
     }
 
     #[test]
@@ -2144,36 +2146,6 @@ mod tests {
         assert_eq!(selection_span(99, 99, 4), (3, 3));
         // Single-entry listing and the no-op span.
         assert_eq!(selection_span(0, 0, 1), (0, 0));
-    }
-
-    #[test]
-    fn clone_indices_into_reuses_out_and_stays_correct() {
-        let entries = vec![
-            file("alpha.txt"),
-            file("beta.mp4"),
-            file("almanac.png"),
-            file("delta.log"),
-        ];
-        let mut out = Vec::new();
-        clone_indices_into(&entries, &[0, 2], &mut out);
-        assert_eq!(
-            out.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
-            ["alpha.txt", "almanac.png"]
-        );
-        let cap = out.capacity();
-        // A later rebuild must reset the contents and reuse the allocation,
-        // which is the point of the owned `visible_entries` cache.
-        clone_indices_into(&entries, &[3], &mut out);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].name, "delta.log");
-        assert!(
-            out.capacity() >= cap,
-            "out must reuse its allocation across rebuilds"
-        );
-        // An out-of-range index is skipped, never a panic.
-        clone_indices_into(&entries, &[1, 99], &mut out);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].name, "beta.mp4");
     }
 
     #[test]

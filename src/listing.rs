@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -154,52 +155,107 @@ fn lowered_name(name: &str) -> String {
     }
 }
 
+/// [`lowered_name`] for the sort scratch: refills a reused buffer so its
+/// String capacity survives calls instead of dropping one String per entry.
+/// ASCII folds in place; anything else hands back the full-casefold value
+/// (unchanged allocation behaviour on the rare path).
+fn lowered_name_into(name: &str, out: &mut String) {
+    if name.is_ascii() {
+        out.clear();
+        out.extend(name.chars().map(|c| c.to_ascii_lowercase()));
+    } else {
+        *out = lowered_name(name);
+    }
+}
+
 /// Sort with keys precomputed once, not once per comparison. Lowering (which
 /// allocates) inside the comparator costs O(n log n) allocations; this lowers
 /// each name once per reload/resort and reorders by moves only. A new
 /// generation always builds a new `Snapshot`, so precomputed keys can never
 /// go stale across reloads; `resort` recomputes them for the new key. Order
 /// is identical to `compare_entries` (locked by
-/// `precomputed_sort_matches_compare_entries`).
+/// `precomputed_sort_matches_compare_entries`). The prep/order/slot buffers
+/// live in a thread-local scratch and are cleared, not rebuilt, per call —
+/// same clear-on-reuse pattern as `thumbs.rs`' `WORKING_SET_SCRATCH` — so a
+/// reload/resort of a large folder stops churning one lowered String per
+/// entry, an index vec, and a slot vec. The comparator and permute write
+/// identical values either way, so sort output is bit-identical.
 fn sort_entries(entries: &mut Vec<Entry>, key: SortKey) {
     struct Prep {
         dir: bool,
         lower: String,
         kind: &'static str,
     }
-    let mut prep: Vec<Prep> = Vec::with_capacity(entries.len());
-    // `Modified` orders by timestamp alone, so it skips the text keys.
-    let need_text = !matches!(key, SortKey::Modified);
-    for entry in entries.iter() {
-        prep.push(Prep {
-            dir: entry.is_directory(),
-            lower: if need_text {
-                lowered_name(&entry.name)
-            } else {
-                String::new()
-            },
-            kind: if need_text { kind_label(entry) } else { "" },
+    struct SortScratch {
+        prep: Vec<Prep>,
+        order: Vec<usize>,
+        slots: Vec<Option<Entry>>,
+    }
+    thread_local! {
+        static SORT_SCRATCH: RefCell<SortScratch> = const {
+            RefCell::new(SortScratch {
+                prep: Vec::new(),
+                order: Vec::new(),
+                slots: Vec::new(),
+            })
+        };
+    }
+    SORT_SCRATCH.with_borrow_mut(|scratch| {
+        let SortScratch { prep, order, slots } = scratch;
+        let need_text = !matches!(key, SortKey::Modified);
+
+        // Shrink scratch for a smaller listing; reuse it in place otherwise.
+        // Only growth past the largest folder seen on this thread allocates,
+        // and a reused `lower` String keeps its capacity.
+        if prep.len() > entries.len() {
+            prep.truncate(entries.len());
+        }
+        for (i, entry) in entries.iter().enumerate() {
+            match prep.get_mut(i) {
+                Some(p) => {
+                    p.dir = entry.is_directory();
+                    p.kind = if need_text { kind_label(entry) } else { "" };
+                    if need_text {
+                        lowered_name_into(&entry.name, &mut p.lower);
+                    } else {
+                        p.lower.clear();
+                    }
+                }
+                None => {
+                    let mut lower = String::new();
+                    if need_text {
+                        lowered_name_into(&entry.name, &mut lower);
+                    }
+                    prep.push(Prep {
+                        dir: entry.is_directory(),
+                        lower,
+                        kind: if need_text { kind_label(entry) } else { "" },
+                    });
+                }
+            }
+        }
+        order.clear();
+        order.extend(0..entries.len());
+        order.sort_by(|&a, &b| {
+            let (pa, pb) = (&prep[a], &prep[b]);
+            pb.dir.cmp(&pa.dir).then_with(|| match key {
+                SortKey::Name => pa.lower.cmp(&pb.lower),
+                SortKey::Modified => entries[b].modified.cmp(&entries[a].modified),
+                SortKey::Kind => pa.kind.cmp(pb.kind).then_with(|| pa.lower.cmp(&pb.lower)),
+                SortKey::Size => entries[b]
+                    .size
+                    .cmp(&entries[a].size)
+                    .then_with(|| pa.lower.cmp(&pb.lower)),
+            })
         });
-    }
-    let mut order: Vec<usize> = (0..entries.len()).collect();
-    order.sort_by(|&a, &b| {
-        let (pa, pb) = (&prep[a], &prep[b]);
-        pb.dir.cmp(&pa.dir).then_with(|| match key {
-            SortKey::Name => pa.lower.cmp(&pb.lower),
-            SortKey::Modified => entries[b].modified.cmp(&entries[a].modified),
-            SortKey::Kind => pa.kind.cmp(pb.kind).then_with(|| pa.lower.cmp(&pb.lower)),
-            SortKey::Size => entries[b]
-                .size
-                .cmp(&entries[a].size)
-                .then_with(|| pa.lower.cmp(&pb.lower)),
-        })
+        // Permute by moves, keeping the existing allocation: each entry travels
+        // exactly once, nothing is cloned.
+        slots.clear();
+        slots.extend(entries.drain(..).map(Some));
+        for &i in order.iter() {
+            entries.push(slots[i].take().expect("sort order is a permutation"));
+        }
     });
-    // Permute by moves, keeping the existing allocation: each entry travels
-    // exactly once, nothing is cloned.
-    let mut slots: Vec<Option<Entry>> = entries.drain(..).map(Some).collect();
-    for i in order {
-        entries.push(slots[i].take().expect("sort order is a permutation"));
-    }
 }
 
 /// Indices into `entries` surviving `needle`, in listing order, written into
