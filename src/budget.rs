@@ -2,12 +2,20 @@
 //!
 //! `cargo test` always prints the report below. When a release binary exists,
 //! its size is gated at 10 MiB so agents see a hard fail, not a vibe.
+//!
+//! RAM is opt-in and report-only by default. `PLY_BUDGET_MEASURE_EXE=1` is the
+//! only trigger that launches the release exe. It samples **non-GPU working
+//! set**: process `WorkingSet64` minus the sum of that process's
+//! `GPU Process Memory(*)\Shared Usage` perf counters. `PrivateMemorySize64`
+//! is not used because it tracks GPU-shared allocations and false-fails the
+//! policy ceiling. Set `PLY_BUDGET_REQUIRE_RAM=1` to assert the sampled value.
 
 /// Soft ceiling for release `ply` on disk (ADR 0004 / AGENTS.md).
 #[allow(dead_code)]
 pub const MAX_RELEASE_BYTES: u64 = 10 * 1024 * 1024;
 
-/// Non-GPU working-set ceiling. GPU shared memory is ignored by product policy.
+/// Non-GPU working-set ceiling: working set minus GPU-shared bytes. GPU shared
+/// memory is ignored by product policy.
 #[allow(dead_code)]
 pub const MAX_NON_GPU_WORKING_SET_BYTES: u64 = 100 * 1024 * 1024;
 
@@ -76,11 +84,15 @@ mod tests {
         eprintln!("-------------------------------");
     }
 
-    /// Launches the release exe, samples its private commit as a conservative
-    /// non-GPU working-set proxy, and closes it. Print-only unless
-    /// `PLY_BUDGET_REQUIRE_RAM=1`, keeping CI and normal runs unaffected.
+    fn env_flag(name: &str) -> bool {
+        std::env::var(name).as_deref() == Ok("1")
+    }
+
+    /// Launches the release exe, reports its non-GPU working set, and closes it.
+    /// Print-only unless `PLY_BUDGET_REQUIRE_RAM=1`; only
+    /// `PLY_BUDGET_MEASURE_EXE=1` launches the exe, so normal tests and CI do not.
     fn measure_working_set_gate(path: &std::path::Path) {
-        if !cfg!(windows) || std::env::var_os("PLY_BUDGET_MEASURE_EXE").is_none() {
+        if !cfg!(windows) || !env_flag("PLY_BUDGET_MEASURE_EXE") {
             return;
         }
         let Ok(mut child) = std::process::Command::new(path)
@@ -92,14 +104,24 @@ mod tests {
         };
         let pid = child.id();
         std::thread::sleep(std::time::Duration::from_secs(10));
+        // Working set includes GPU-shared memory. The GPU perf counter splits
+        // that out; print-only if the driver does not expose the counter.
+        let script = r#"
+$procId = __PID__
+$p = Get-Process -Id $procId -ErrorAction Stop
+$shared = $null
+try {
+  $samples = (Get-Counter "\GPU Process Memory(pid_${procId}_*)\Shared Usage" -ErrorAction Stop).CounterSamples
+  if ($samples.Count -gt 0) {
+    $shared = [int64](($samples | Measure-Object -Property CookedValue -Sum).Sum)
+  }
+} catch {}
+if ($null -eq $shared) { Write-Output "$($p.WorkingSet64) NA" }
+else { Write-Output "$($p.WorkingSet64) $shared" }
+"#
+        .replace("__PID__", &pid.to_string());
         let out = match std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                &format!(
-                    "(Get-Process -Id {pid} -ErrorAction SilentlyContinue).PrivateMemorySize64"
-                ),
-            ])
+            .args(["-NoProfile", "-Command", &script])
             .output()
         {
             Ok(out) => out,
@@ -113,25 +135,58 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         let text = String::from_utf8_lossy(&out.stdout);
-        let bytes: Option<u64> = text.trim().parse().ok();
-        match bytes {
-            Some(bytes) => {
-                let mib = bytes as f64 / (1024.0 * 1024.0);
-                let ok = bytes <= MAX_NON_GPU_WORKING_SET_BYTES;
-                eprintln!(
-                    "RAM proxy (commit):     {mib:>6.2} MiB  {}",
-                    if ok { "PASS" } else { "FAIL" }
-                );
-                if std::env::var_os("PLY_BUDGET_REQUIRE_RAM").is_some() {
-                    assert!(
-                        ok,
-                        "RAM proxy is {mib:.2} MiB ({bytes} bytes); budget is {} bytes (100 MiB). \
-                         Find what has grown or justify raising AGENTS.md / budget.rs together.",
-                        MAX_NON_GPU_WORKING_SET_BYTES
-                    );
+        let mut fields = text.split_whitespace();
+        let Some(working_set) = fields.next().and_then(|word| word.parse::<u64>().ok()) else {
+            eprintln!("RAM measure:            (unparsable)  SKIP");
+            return;
+        };
+        let gpu_shared = match fields.next() {
+            Some("NA") => None,
+            Some(word) => match word.parse::<u64>() {
+                Ok(bytes) => Some(bytes),
+                Err(_) => {
+                    eprintln!("RAM measure:            (unparsable)  SKIP");
+                    return;
                 }
+            },
+            None => {
+                eprintln!("RAM measure:            (unparsable)  SKIP");
+                return;
             }
-            None => eprintln!("RAM measure:            (unparsable)  SKIP"),
+        };
+        let Some(gpu_shared) = gpu_shared else {
+            eprintln!("RAM non-GPU working set:   --   SKIP (GPU-shared counter unavailable)");
+            eprintln!(
+                "RAM working set (total):   {:>6.2} MiB  (includes GPU shared; not gated)",
+                working_set as f64 / (1024.0 * 1024.0)
+            );
+            if env_flag("PLY_BUDGET_REQUIRE_RAM") {
+                panic!("cannot evaluate the non-GPU working set without the GPU-shared counter");
+            }
+            return;
+        };
+        let non_gpu = working_set.saturating_sub(gpu_shared);
+        let mib = non_gpu as f64 / (1024.0 * 1024.0);
+        let ok = non_gpu <= MAX_NON_GPU_WORKING_SET_BYTES;
+        eprintln!(
+            "RAM working set (total):   {:>6.2} MiB",
+            working_set as f64 / (1024.0 * 1024.0)
+        );
+        eprintln!(
+            "RAM GPU shared (excluded): {:>6.2} MiB",
+            gpu_shared as f64 / (1024.0 * 1024.0)
+        );
+        eprintln!(
+            "RAM non-GPU working set:   {mib:>6.2} MiB  {}",
+            if ok { "PASS" } else { "FAIL" }
+        );
+        if env_flag("PLY_BUDGET_REQUIRE_RAM") {
+            assert!(
+                ok,
+                "non-GPU working set is {mib:.2} MiB ({non_gpu} bytes); budget is {} bytes \
+                 (100 MiB). Find what has grown or justify raising AGENTS.md / budget.rs together.",
+                MAX_NON_GPU_WORKING_SET_BYTES
+            );
         }
     }
 }

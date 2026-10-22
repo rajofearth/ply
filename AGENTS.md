@@ -25,7 +25,7 @@ subagents must ground themselves in the actual source/examples below before writ
   - `scrollable.rs`, `uniform_list.rs` — scrolling lists
   - `grid_layout.rs` — grid layouts
   - `input.rs` — text input handling
-- component library (higher-level, better docs): https://longbridge.github.io/gpui-component/llms.txt
+- component library (reference only, not a dependency): https://longbridge.github.io/gpui-component/llms.txt
   - getting started: https://longbridge.github.io/gpui-component/docs/getting-started.md
   - design guidelines: https://longbridge.github.io/gpui-component/docs/design-guides.md
   - coding guidelines: https://longbridge.github.io/gpui-component/docs/coding-guides.md
@@ -37,7 +37,7 @@ subagents must ground themselves in the actual source/examples below before writ
 **subagent instructions**
 
 - before writing any GPUI code, read the relevant example file(s) above, not just this summary.
-- prefer gpui-component over raw GPUI primitives unless the task specifically requires low-level control.
+- the shell is hand-rolled: prefer plain GPUI primitives and small local modules over component libraries (ADR 0003). `src/field.rs` owns text input; do not re-add gpui-component.
 - if an API doesn't match what's in the examples, trust the examples over memory.
 - subagents and you too are required to read `unslop` n `blast radius` skiils if not available then https://github.com/cursor/plugins/tree/main/pstack/skills/.
 

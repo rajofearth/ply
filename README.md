@@ -4,8 +4,8 @@ A GPUI file explorer: a Home of Volumes, a static sidebar, and one location at
 a time. Zero-hue neutral palette, sharp corners, lucide icons. Properties is a
 modal (no preview pane). MTP devices are supported but limited — browse and
 open where the OS allows; richer MTP work is deferred. Release builds use a
-size-minded profile (thin LTO, size opts, strip); GPUI still dominates binary
-size and RAM.
+size-minded profile (fat LTO, `opt-level = "z"`, strip); GPUI still dominates
+binary size and RAM.
 
 ## Commands
 
@@ -23,7 +23,9 @@ Nightly Rust is required (GPUI uses `std::hint::cold_path`).
 
 The budget test fails the suite when a release binary exists and exceeds the
 size ceiling; set `PLY_BUDGET_REQUIRE_RELEASE=1` to also fail when no release
-binary is built yet.
+binary is built yet. Set `PLY_BUDGET_MEASURE_EXE=1` to launch the release exe
+and report non-GPU working set — process working set minus GPU-shared memory.
+Set `PLY_BUDGET_REQUIRE_RAM=1` to make that measurement assert.
 
 ## Keys
 
