@@ -6,7 +6,8 @@ use std::time::SystemTime;
 
 use chrono::{DateTime, Datelike, Local};
 
-/// A file, directory, or symlink in the Current Folder.
+/// A file, directory, symlink, or entry whose provider could not report its
+/// kind in the Current Folder.
 #[derive(Clone, Debug)]
 pub struct Entry {
     pub path: PathBuf,
@@ -22,11 +23,16 @@ pub enum EntryKind {
     File,
     Directory,
     Symlink { target: PathBuf },
+    Unknown,
 }
 
 impl Entry {
     pub fn is_directory(&self) -> bool {
         matches!(self.kind, EntryKind::Directory)
+    }
+
+    pub fn has_known_size(&self) -> bool {
+        !matches!(self.kind, EntryKind::Directory | EntryKind::Unknown)
     }
 }
 
@@ -356,7 +362,9 @@ pub enum KindClass {
 pub fn kind_class(entry: &Entry) -> KindClass {
     match entry.kind {
         EntryKind::Directory => KindClass::Folder,
-        EntryKind::Symlink { .. } | EntryKind::File => classify_name(&entry.name).0,
+        EntryKind::Symlink { .. } | EntryKind::File | EntryKind::Unknown => {
+            classify_name(&entry.name).0
+        }
     }
 }
 
@@ -392,6 +400,7 @@ pub fn kind_label(entry: &Entry) -> &'static str {
         EntryKind::Directory => "Folder",
         EntryKind::Symlink { .. } => "Shortcut",
         EntryKind::File => classify_name(&entry.name).1,
+        EntryKind::Unknown => "Unknown",
     }
 }
 
@@ -619,6 +628,16 @@ mod tests {
         let mut dir = file("Pictures.jpg");
         dir.kind = EntryKind::Directory;
         assert_eq!(kind_label(&dir), "Folder");
+    }
+
+    #[test]
+    fn unknown_kind_has_no_fake_size() {
+        let mut entry = file("mystery.bin");
+        entry.kind = EntryKind::Unknown;
+        entry.size = 0;
+        assert_eq!(kind_label(&entry), "Unknown");
+        assert_eq!(kind_class(&entry), KindClass::File);
+        assert!(!entry.has_known_size());
     }
 
     #[test]

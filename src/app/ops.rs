@@ -1072,7 +1072,7 @@ impl Ply {
                     entry.name.clone().into(),
                     crate::listing::kind_label(entry).to_string(),
                     is_dir,
-                    (!is_dir).then_some(entry.size),
+                    entry.has_known_size().then_some(entry.size),
                     entry.modified,
                     created,
                     accessed,
@@ -1642,7 +1642,7 @@ fn build_item_menu(spec: &ItemMenuSpec) -> Vec<MenuRow> {
             Some(GLYPH_TERMINAL),
         ));
     }
-    if spec.is_dir && !spec.is_volume {
+    if spec.is_dir && !spec.is_volume && !spec.browse_only {
         rows.push(if spec.pinned {
             row(
                 "Remove from Quick Access",
@@ -2984,6 +2984,22 @@ mod tests {
                 MenuRow::Separator => true,
             }),
             "Recycle Bin items must not offer Open in Terminal"
+        );
+    }
+
+    #[test]
+    fn browse_only_directories_have_no_quick_access_row() {
+        let mut bin_dir = dir_spec();
+        bin_dir.browse_only = true;
+        assert!(
+            build_item_menu(&bin_dir).iter().all(|row| match row {
+                MenuRow::Item(item) => {
+                    item.label.as_ref() != "Add to Quick Access"
+                        && item.label.as_ref() != "Remove from Quick Access"
+                }
+                MenuRow::Separator => true,
+            }),
+            "Recycle Bin directories must remain read-only"
         );
     }
 
