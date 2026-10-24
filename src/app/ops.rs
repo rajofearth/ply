@@ -1029,6 +1029,10 @@ impl Ply {
     }
 
     pub fn show_properties(&mut self, path: &Path, cx: &mut Context<Self>) {
+        // Every open starts a new Properties generation. Async fills capture
+        // it and drop their result once this dialog closes, is replaced, or
+        // reopens for the same path.
+        self.props_generation += 1;
         let path_display: SharedString = path.to_string_lossy().into_owned().into();
         let location: SharedString = split_location(path).into();
         let now = chrono::Local::now();
@@ -1187,14 +1191,13 @@ impl Ply {
     }
 
     /// Total a directory off the UI thread, then fill Size / Contains. The
-    /// generation guard drops results from a dialog that has moved on, and
-    /// the same-path check drops results for a dialog that reopened
-    /// elsewhere. Mirrors the [`Self::fill_properties`] spawn pattern.
+    /// generation bump in [`Self::show_properties`] drops results from a
+    /// dialog that has moved on, and the path check drops a result that raced
+    /// a different target. Mirrors the [`Self::fill_properties`] guard.
     fn spawn_props_walk(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.props_walk_cancel.store(true, Ordering::Relaxed);
         let cancel = Arc::new(AtomicBool::new(false));
         self.props_walk_cancel = cancel.clone();
-        self.props_generation += 1;
         let generation = self.props_generation;
         cx.spawn(async move |this, cx| {
             let check = path.clone();
@@ -1205,14 +1208,13 @@ impl Ply {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                if this.props_generation != generation {
-                    return;
-                }
-                let still_open = this
-                    .properties
-                    .as_ref()
-                    .is_some_and(|p| Path::new(p.path.as_str()) == check.as_path());
-                if !still_open {
+                let open_path = this.properties.as_ref().map(|p| p.path.as_str());
+                if !props_completion_is_current(
+                    this.props_generation,
+                    generation,
+                    open_path,
+                    &check,
+                ) {
                     return;
                 }
                 if let Some(props) = this.properties.as_mut() {
@@ -1248,20 +1250,32 @@ impl Ply {
 
     /// Asynchronously enrich an open Properties dialog with shell-sourced
     /// facts (author, title, created, ...) read via `IPropertyStore` on the
-    /// STA worker, so the dialog never blocks on the shell.
+    /// STA worker, so the dialog never blocks on the shell. The generation and
+    /// path check keep a slow read for one dialog from filling another.
     pub fn fill_properties(&mut self, path: &Path, cx: &mut Context<Self>) {
         if crate::path_caps::is_portable(path) {
             return;
         }
-        let path = path.to_path_buf();
+        let generation = self.props_generation;
+        let target = path.to_path_buf();
+        let read_path = target.clone();
         cx.spawn(async move |this, cx| {
             let rows = cx
-                .background_spawn(async move { crate::thumbs::read_properties(&path) })
+                .background_spawn(async move { crate::thumbs::read_properties(&read_path) })
                 .await;
             if rows.is_empty() {
                 return;
             }
             let _ = this.update(cx, |this, cx| {
+                let open_path = this.properties.as_ref().map(|p| p.path.as_str());
+                if !props_completion_is_current(
+                    this.props_generation,
+                    generation,
+                    open_path,
+                    &target,
+                ) {
+                    return;
+                }
                 if let Some(props) = this.properties.as_mut() {
                     props.details = filtered_details(rows);
                     cx.notify();
@@ -1496,6 +1510,20 @@ fn filtered_details(rows: Vec<(String, String)>) -> Vec<(SharedString, SharedStr
         .filter(|(label, _)| !is_duplicate_detail(label))
         .map(|(k, v)| (k.into(), v.into()))
         .collect()
+}
+
+/// Whether an async Properties completion still belongs to the dialog on
+/// screen. Every dialog open bumps the generation, so a closed, replaced, or
+/// reopened dialog rejects older work; the path check rejects a completion
+/// that raced a different target. Pure, so the accept/reject matrix is unit
+/// tested without a GPUI context.
+fn props_completion_is_current(
+    now_generation: u64,
+    seen_generation: u64,
+    open_path: Option<&str>,
+    target: &Path,
+) -> bool {
+    now_generation == seen_generation && open_path.is_some_and(|open| Path::new(open) == target)
 }
 
 /// Whether `readonly`/`hidden` boxes differ from the opening bits. `None`
@@ -2687,6 +2715,19 @@ mod tests {
             missing.size_on_disk_detail.is_empty(),
             "unknown on-disk size carries no detail"
         );
+    }
+
+    #[test]
+    fn props_completion_guard_accepts_only_the_open_dialog() {
+        let a = Path::new(r"C:\a.txt");
+        // Same dialog and generation: the read belongs here.
+        assert!(props_completion_is_current(4, 4, Some(r"C:\a.txt"), a));
+        // A different dialog path.
+        assert!(!props_completion_is_current(4, 4, Some(r"C:\b.txt"), a));
+        // A newer dialog generation, even when the path matches again.
+        assert!(!props_completion_is_current(5, 4, Some(r"C:\a.txt"), a));
+        // The dialog closed before the read landed.
+        assert!(!props_completion_is_current(4, 4, None, a));
     }
 
     #[test]

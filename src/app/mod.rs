@@ -401,8 +401,8 @@ pub struct Ply {
 
     pub(crate) list_generation: u64,
     list_task: Option<Task<()>>,
-    /// Properties folder-walk generation: each directory dialog bumps it, and
-    /// stale walk completions are dropped. The matching cancel flag aborts
+    /// Properties generation: every dialog open bumps it, and stale shell-read
+    /// or folder-walk completions are dropped. The matching cancel flag aborts
     /// the previous walk's I/O early.
     props_generation: u64,
     props_walk_cancel: Arc<AtomicBool>,
