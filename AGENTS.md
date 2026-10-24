@@ -3,7 +3,7 @@
 if a task can be delegated to the subagent, whether it's research, exploration, or writing code, please use subagents. Use multiple if necessary.
 always talk without slop(`unslop`).
 
-read on the matching branch. names, avoids, and UI vocabulary live in `CONTEXT.md`. the listing model and why there's no worktree is in `docs/adr/0002-listing-not-worktree.md`. the hand-rolled shell and input-only gpui-component decision is in `docs/adr/0003-hand-rolled-explorer-shell.md`. 
+read on the matching branch. names, avoids, and UI vocabulary live in `CONTEXT.md`. the listing model and why there's no worktree is in `docs/adr/0002-listing-not-worktree.md`. the hand-rolled shell and text-field decision is in `docs/adr/0003-hand-rolled-explorer-shell.md`.
 settled base, PathCaps, and listing/UI/volume efficiency is in `docs/adr/0004-settled-base-and-efficiency.md`. build/test/run commands are in `README.md`. binary and RAM budgets plus the size gate are in `src/budget.rs`. why the size and efficiency rules exist, and the fx habits behind them, is in `docs/philosophy.md`.
 
 run `cargo test budgets_report -- --nocapture` and obey the printed gate.
@@ -25,7 +25,7 @@ subagents must ground themselves in the actual source/examples below before writ
   - `scrollable.rs`, `uniform_list.rs` — scrolling lists
   - `grid_layout.rs` — grid layouts
   - `input.rs` — text input handling
-- component library (higher-level, better docs): https://longbridge.github.io/gpui-component/llms.txt
+- component library (reference only, not a dependency): https://longbridge.github.io/gpui-component/llms.txt
   - getting started: https://longbridge.github.io/gpui-component/docs/getting-started.md
   - design guidelines: https://longbridge.github.io/gpui-component/docs/design-guides.md
   - coding guidelines: https://longbridge.github.io/gpui-component/docs/coding-guides.md
@@ -37,7 +37,7 @@ subagents must ground themselves in the actual source/examples below before writ
 **subagent instructions**
 
 - before writing any GPUI code, read the relevant example file(s) above, not just this summary.
-- prefer gpui-component over raw GPUI primitives unless the task specifically requires low-level control.
+- the shell is hand-rolled: prefer plain GPUI primitives and small local modules over component libraries (ADR 0003). `src/field.rs` owns text input; do not re-add gpui-component.
 - if an API doesn't match what's in the examples, trust the examples over memory.
 - subagents and you too are required to read `unslop` n `blast radius` skiils if not available then https://github.com/cursor/plugins/tree/main/pstack/skills/.
 

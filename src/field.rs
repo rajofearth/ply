@@ -1,26 +1,17 @@
-//! Hand-rolled single-line text field: state and input handling (spike A).
+//! Hand-rolled single-line text field: state, input, and painting.
 //!
-//! Decision D2 in docs/research/size-frontier.md replaces the gpui-component
-//! `Input` used by the filter and the rename row with this file, so the
-//! component crate can leave the link. This spike builds the state half only:
-//! the value, the selection, IME marked text, clipboard actions, and the
-//! commit and cancel events. Nothing imports it yet, so it cannot change app
-//! behavior. Painting (caret, selection, placeholder) and the caller swap
-//! come next.
+//! Decision D2 in docs/research/size-frontier.md replaced the gpui-component
+//! `Input` used by the filter and the rename row with this module, so the
+//! component crate could leave the dependency graph. It owns the value, the
+//! selection, IME marked text, clipboard actions, the commit and cancel
+//! events, and painting (caret, selection, placeholder). The filter box and
+//! inline rename both drive it.
 //!
 //! The shape follows the gpui input example where it matters (UTF-16 index
 //! conversion, marked-text handling, clipboard), and drops what a single-line
 //! explorer field never uses: grapheme movement is char movement because
 //! unicode-segmentation is not a direct dependency, and there is no
 //! multiline, no validation, and no prefix or suffix slots.
-//!
-//! Swap map for the next spike:
-//! - `InputState::new(window, cx)` becomes `FieldState::new(window, cx)`
-//! - `InputEvent::{Change, PressEnter, Blur, Focus}` becomes `FieldEvent`
-//! - `rename_event_action` becomes `field_event_action`
-//! - `rename_select_range` becomes `stem_select_range`
-//! - `input.base_state().update(cx, |b, cx| b.set_selected_range(r, cx))`
-//!   becomes `field.update(cx, |f, cx| f.set_selected_range(r, cx))`
 
 use std::ops::Range;
 
