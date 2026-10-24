@@ -3,7 +3,7 @@ name: size-delta
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [master]
 
 # Warn-only except the hard ceiling. The hard 10 MiB gate lives in
 # src/budget.rs and fails below. This workflow makes growth visible

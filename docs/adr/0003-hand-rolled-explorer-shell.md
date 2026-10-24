@@ -1,6 +1,6 @@
-# Hand-roll the explorer shell; keep gpui-component only for text input
+# Hand-roll the explorer shell and text field
 
-Supersedes most of [0001](0001-gpui-component.md).
+Supersedes [0001](0001-gpui-component.md).
 
 The UI is now specified by a reference design with exact tokens: a zero-hue
 OKLCH neutral scale, `radius: 0`, a native UI font stack, and lucide icons. Two
@@ -14,7 +14,7 @@ design. We vendor the lucide SVGs we use into `assets/icons/` and serve them
 from our own `AssetSource` only — no fallback into gpui-component's icon pack.
 A unit test loads every `Ico` variant, so a missing file fails the build rather
 than rendering an invisible glyph. Dropping that pack (and a size-minded
-release profile: thin LTO, `opt-level = "s"`, strip) keeps the binary leaner;
+release profile: fat LTO, `opt-level = "z"`, strip) keeps the binary leaner;
 GPUI still dominates size and RAM.
 
 **Colour.** GPUI has no OKLCH constructor. Tokens are converted to sRGB once, at
@@ -25,9 +25,11 @@ not a `gpui_component::Theme`, because the design's slots (`chartBar`,
 
 Rows, cards, the sidebar tree, the context menu, and the Properties dialog are
 plain `div()`s. They are mostly layout and hover state, so the widget library
-bought us little while constraining the styling. `Input` is the exception: a
-correct text field is genuinely hard, so the filter box and inline rename use
-`gpui_component::input::{Input, InputState}`.
+bought us little while constraining the styling. The library's `Input` was the
+last exception: a correct text field is genuinely hard, so the filter box and
+inline rename used it first. `src/field.rs` now owns that field — value,
+selection, IME marked text, clipboard, painting, and the commit/cancel events —
+and gpui-component is gone from the dependency graph.
 
 GPUI has no letter-spacing, so the design's `0.08em` section labels rely on
 uppercasing and size alone. GPUI's `grid_cols` takes a fixed column count, so

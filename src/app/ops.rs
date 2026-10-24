@@ -511,10 +511,10 @@ impl Ply {
             let current = self
                 .selection
                 .last()
-                .and_then(|last| self.visible_position(last))
-                .unwrap_or(0) as isize;
-            let next = (current + delta).clamp(0, len as isize - 1) as usize;
-            (current as usize, next, len)
+                .and_then(|last| self.visible_position(last));
+            let (current, next) =
+                list_move_target(current, self.selection.is_empty(), delta, len, extend);
+            (current, next, len)
         };
         if extend {
             let anchor = self.anchor.unwrap_or(current);
@@ -555,30 +555,16 @@ impl Ply {
         let cur = self
             .selection
             .last()
-            .and_then(|last| self.visible_position(last))
-            .unwrap_or(0);
-        let row = cur / cols;
-        let col = cur % cols;
-        let last_row_len = total.saturating_sub((total / cols) * cols);
-        let max_row = if last_row_len == 0 {
-            total / cols - 1
-        } else {
-            total / cols
-        };
-
-        // Horizontal first, then vertical.
-        let new_col = (col as isize + right).clamp(0, cols as isize - 1) as usize;
-        let new_row = (row as isize + down).clamp(0, max_row as isize) as usize;
-
-        // Clamp to actual row length (last row may be partial).
-        let row_len = if new_row == max_row {
-            let r = total - new_row * cols;
-            if r == 0 { cols } else { r }
-        } else {
-            cols
-        };
-        let new_col = new_col.min(row_len - 1);
-        let next = new_row * cols + new_col;
+            .and_then(|last| self.visible_position(last));
+        let (cur, next) = grid_move_target(
+            cur,
+            self.selection.is_empty(),
+            cols,
+            right,
+            down,
+            total,
+            extend,
+        );
 
         if extend {
             let anchor = self.anchor.unwrap_or(cur);
@@ -1029,6 +1015,10 @@ impl Ply {
     }
 
     pub fn show_properties(&mut self, path: &Path, cx: &mut Context<Self>) {
+        // Every open starts a new Properties generation. Async fills capture
+        // it and drop their result once this dialog closes, is replaced, or
+        // reopens for the same path.
+        self.props_generation += 1;
         let path_display: SharedString = path.to_string_lossy().into_owned().into();
         let location: SharedString = split_location(path).into();
         let now = chrono::Local::now();
@@ -1187,14 +1177,13 @@ impl Ply {
     }
 
     /// Total a directory off the UI thread, then fill Size / Contains. The
-    /// generation guard drops results from a dialog that has moved on, and
-    /// the same-path check drops results for a dialog that reopened
-    /// elsewhere. Mirrors the [`Self::fill_properties`] spawn pattern.
+    /// generation bump in [`Self::show_properties`] drops results from a
+    /// dialog that has moved on, and the path check drops a result that raced
+    /// a different target. Mirrors the [`Self::fill_properties`] guard.
     fn spawn_props_walk(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.props_walk_cancel.store(true, Ordering::Relaxed);
         let cancel = Arc::new(AtomicBool::new(false));
         self.props_walk_cancel = cancel.clone();
-        self.props_generation += 1;
         let generation = self.props_generation;
         cx.spawn(async move |this, cx| {
             let check = path.clone();
@@ -1205,14 +1194,13 @@ impl Ply {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                if this.props_generation != generation {
-                    return;
-                }
-                let still_open = this
-                    .properties
-                    .as_ref()
-                    .is_some_and(|p| Path::new(p.path.as_str()) == check.as_path());
-                if !still_open {
+                let open_path = this.properties.as_ref().map(|p| p.path.as_str());
+                if !props_completion_is_current(
+                    this.props_generation,
+                    generation,
+                    open_path,
+                    &check,
+                ) {
                     return;
                 }
                 if let Some(props) = this.properties.as_mut() {
@@ -1248,20 +1236,32 @@ impl Ply {
 
     /// Asynchronously enrich an open Properties dialog with shell-sourced
     /// facts (author, title, created, ...) read via `IPropertyStore` on the
-    /// STA worker, so the dialog never blocks on the shell.
+    /// STA worker, so the dialog never blocks on the shell. The generation and
+    /// path check keep a slow read for one dialog from filling another.
     pub fn fill_properties(&mut self, path: &Path, cx: &mut Context<Self>) {
         if crate::path_caps::is_portable(path) {
             return;
         }
-        let path = path.to_path_buf();
+        let generation = self.props_generation;
+        let target = path.to_path_buf();
+        let read_path = target.clone();
         cx.spawn(async move |this, cx| {
             let rows = cx
-                .background_spawn(async move { crate::thumbs::read_properties(&path) })
+                .background_spawn(async move { crate::thumbs::read_properties(&read_path) })
                 .await;
             if rows.is_empty() {
                 return;
             }
             let _ = this.update(cx, |this, cx| {
+                let open_path = this.properties.as_ref().map(|p| p.path.as_str());
+                if !props_completion_is_current(
+                    this.props_generation,
+                    generation,
+                    open_path,
+                    &target,
+                ) {
+                    return;
+                }
                 if let Some(props) = this.properties.as_mut() {
                     props.details = filtered_details(rows);
                     cx.notify();
@@ -1496,6 +1496,20 @@ fn filtered_details(rows: Vec<(String, String)>) -> Vec<(SharedString, SharedStr
         .filter(|(label, _)| !is_duplicate_detail(label))
         .map(|(k, v)| (k.into(), v.into()))
         .collect()
+}
+
+/// Whether an async Properties completion still belongs to the dialog on
+/// screen. Every dialog open bumps the generation, so a closed, replaced, or
+/// reopened dialog rejects older work; the path check rejects a completion
+/// that raced a different target. Pure, so the accept/reject matrix is unit
+/// tested without a GPUI context.
+fn props_completion_is_current(
+    now_generation: u64,
+    seen_generation: u64,
+    open_path: Option<&str>,
+    target: &Path,
+) -> bool {
+    now_generation == seen_generation && open_path.is_some_and(|open| Path::new(open) == target)
 }
 
 /// Whether `readonly`/`hidden` boxes differ from the opening bits. `None`
@@ -2020,6 +2034,65 @@ fn app_minimized() -> bool {
     false
 }
 
+/// Return the current and next visible positions for list navigation. Plain
+/// movement from an empty selection starts at the nearest boundary: Down at
+/// the first entry and Up at the last. Shift-extension keeps its old origin at
+/// position zero, and a stale selected path keeps the old zero fallback.
+fn list_move_target(
+    current: Option<usize>,
+    selection_empty: bool,
+    delta: isize,
+    len: usize,
+    extend: bool,
+) -> (usize, usize) {
+    let current = current.unwrap_or(0);
+    let next = if selection_empty && !extend {
+        if delta < 0 { len - 1 } else { 0 }
+    } else {
+        (current as isize + delta).clamp(0, len as isize - 1) as usize
+    };
+    (current, next)
+}
+
+/// Return the current and next visible positions for grid navigation. The
+/// flat positions match the packed rows painted by the browser. Plain vertical
+/// movement from an empty selection starts at the first or last visible entry;
+/// all other movement keeps the existing row and column clamping.
+fn grid_move_target(
+    current: Option<usize>,
+    selection_empty: bool,
+    cols: usize,
+    right: isize,
+    down: isize,
+    total: usize,
+    extend: bool,
+) -> (usize, usize) {
+    let cur = current.unwrap_or(0);
+    if selection_empty && !extend && right == 0 && down != 0 {
+        return (cur, if down < 0 { total - 1 } else { 0 });
+    }
+
+    let row = cur / cols;
+    let col = cur % cols;
+    let last_row_len = total.saturating_sub((total / cols) * cols);
+    let max_row = if last_row_len == 0 {
+        total / cols - 1
+    } else {
+        total / cols
+    };
+
+    let new_col = (col as isize + right).clamp(0, cols as isize - 1) as usize;
+    let new_row = (row as isize + down).clamp(0, max_row as isize) as usize;
+    let row_len = if new_row == max_row {
+        let r = total - new_row * cols;
+        if r == 0 { cols } else { r }
+    } else {
+        cols
+    };
+    let new_col = new_col.min(row_len - 1);
+    (cur, new_row * cols + new_col)
+}
+
 /// Inclusive index span for a shift-extend selection, clamped to a listing of
 /// `len` entries. `anchor` (where the extend started) and `target` (the newly
 /// reached row) can both be stale: the listing may have shrunk under a stored
@@ -2126,6 +2199,57 @@ mod tests {
             .map(|e| e.name.as_str())
             .collect();
         assert_eq!(resolved, ["alpha.txt", "almanac.png"]);
+    }
+
+    #[test]
+    fn list_movement_starts_empty_selection_at_directional_boundary() {
+        assert_eq!(list_move_target(None, true, 1, 3, false), (0, 0));
+        assert_eq!(list_move_target(None, true, -1, 3, false), (0, 2));
+        // Shift movement keeps the existing empty-selection origin and still
+        // produces a valid span for the caller to apply.
+        assert_eq!(list_move_target(None, true, 1, 3, true), (0, 1));
+        assert_eq!(selection_span(0, 1, 3), (0, 1));
+    }
+
+    #[test]
+    fn list_movement_preserves_clamping_and_stale_selection_fallback() {
+        assert_eq!(list_move_target(Some(0), false, -1, 3, false), (0, 0));
+        assert_eq!(list_move_target(Some(2), false, 1, 3, false), (2, 2));
+        assert_eq!(list_move_target(None, false, 1, 3, false), (0, 1));
+    }
+
+    #[test]
+    fn filtered_list_movement_uses_visible_positions() {
+        let entries = vec![file("alpha.txt"), file("beta.txt"), file("almanac.txt")];
+        let visible = filter_indices(&entries, "al");
+        assert_eq!(visible, [0, 2]);
+        assert_eq!(
+            list_move_target(None, true, 1, visible.len(), false),
+            (0, 0)
+        );
+        assert_eq!(
+            list_move_target(None, true, -1, visible.len(), false),
+            (0, 1)
+        );
+    }
+
+    #[test]
+    fn grid_movement_starts_empty_selection_at_directional_boundary() {
+        assert_eq!(grid_move_target(None, true, 3, 0, 1, 5, false), (0, 0));
+        assert_eq!(grid_move_target(None, true, 3, 0, -1, 5, false), (0, 4));
+        // Shift movement preserves the old origin at cell 0, which gives a
+        // valid range even when the first Down moves into the second row.
+        assert_eq!(grid_move_target(None, true, 3, 0, 1, 5, true), (0, 3));
+        assert_eq!(selection_span(0, 3, 5), (0, 3));
+    }
+
+    #[test]
+    fn grid_movement_preserves_horizontal_and_edge_clamping() {
+        assert_eq!(grid_move_target(None, true, 3, 1, 0, 5, false), (0, 1));
+        assert_eq!(grid_move_target(None, true, 3, -1, 0, 5, false), (0, 0));
+        assert_eq!(grid_move_target(Some(0), false, 3, 0, -1, 5, false), (0, 0));
+        assert_eq!(grid_move_target(Some(4), false, 3, 0, 1, 5, false), (4, 4));
+        assert_eq!(grid_move_target(Some(2), false, 3, 0, 1, 5, false), (2, 4));
     }
 
     #[test]
@@ -2687,6 +2811,19 @@ mod tests {
             missing.size_on_disk_detail.is_empty(),
             "unknown on-disk size carries no detail"
         );
+    }
+
+    #[test]
+    fn props_completion_guard_accepts_only_the_open_dialog() {
+        let a = Path::new(r"C:\a.txt");
+        // Same dialog and generation: the read belongs here.
+        assert!(props_completion_is_current(4, 4, Some(r"C:\a.txt"), a));
+        // A different dialog path.
+        assert!(!props_completion_is_current(4, 4, Some(r"C:\b.txt"), a));
+        // A newer dialog generation, even when the path matches again.
+        assert!(!props_completion_is_current(5, 4, Some(r"C:\a.txt"), a));
+        // The dialog closed before the read landed.
+        assert!(!props_completion_is_current(4, 4, None, a));
     }
 
     #[test]
