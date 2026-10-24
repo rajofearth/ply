@@ -464,7 +464,7 @@ fn list_row(
                 .text_right()
                 .text_size(px(12.))
                 .text_color(p.muted_foreground)
-                .child(if is_dir {
+                .child(if is_dir || !entry.has_known_size() {
                     "—".to_string()
                 } else {
                     format_size(entry.size)

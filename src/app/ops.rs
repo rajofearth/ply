@@ -1072,7 +1072,7 @@ impl Ply {
                     entry.name.clone().into(),
                     crate::listing::kind_label(entry).to_string(),
                     is_dir,
-                    (!is_dir).then_some(entry.size),
+                    entry.has_known_size().then_some(entry.size),
                     entry.modified,
                     created,
                     accessed,
