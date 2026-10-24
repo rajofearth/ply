@@ -114,7 +114,6 @@ pub fn fetch(_path: &Path) -> anyhow::Result<PathBuf> {
 mod windows_impl {
     use super::*;
 
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -576,6 +575,90 @@ mod windows_impl {
         }
     }
 
+    /// Name used when the device supplies nothing that survives sanitizing.
+    const FALLBACK_FILE_NAME: &str = "portable-file";
+
+    /// DOS device names Windows resolves even when an extension follows.
+    const RESERVED_NAMES: [&str; 30] = [
+        "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "COM1", "COM2", "COM3", "COM4", "COM5",
+        "COM6", "COM7", "COM8", "COM9", "COM¹", "COM²", "COM³", "LPT1", "LPT2", "LPT3", "LPT4",
+        "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "LPT¹", "LPT²", "LPT³",
+    ];
+
+    /// Reduce an untrusted device name to one safe component under the temp
+    /// directory.
+    ///
+    /// The last path segment wins, so traversal, drive, and UNC names lose
+    /// their prefix instead of escaping. Characters Windows rejects become `_`,
+    /// trailing dots and spaces are trimmed, and reserved device names get a
+    /// `_` prefix. Input that leaves nothing becomes [`FALLBACK_FILE_NAME`].
+    pub(super) fn safe_file_name(raw: &str) -> String {
+        let leaf = raw
+            .rsplit(['\\', '/'])
+            .find(|part| !part.is_empty())
+            .unwrap_or_default();
+        let mut name = String::with_capacity(leaf.len());
+        for ch in leaf.chars() {
+            if ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*') {
+                name.push('_');
+            } else {
+                name.push(ch);
+            }
+        }
+        let end = name.trim_end_matches(['.', ' ']).len();
+        name.truncate(end);
+        if name.is_empty() {
+            return FALLBACK_FILE_NAME.to_string();
+        }
+        // The reserved stem applies with any extension: NUL.txt is NUL.
+        // Ignore spaces before the dot too, as strict Win32 name checks do.
+        let stem = name
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches(' ');
+        if RESERVED_NAMES
+            .iter()
+            .any(|reserved| stem.eq_ignore_ascii_case(reserved))
+        {
+            name.insert(0, '_');
+        }
+        name
+    }
+
+    /// Reserve a fresh final path without replacing a copy from an earlier
+    /// fetch. The returned file is the destination for the transfer, so the
+    /// reservation remains held by the file itself.
+    pub(super) fn allocate_temp_target(dir: &Path, name: &str) -> Result<(PathBuf, std::fs::File)> {
+        for suffix in 0..u64::MAX {
+            let candidate = if suffix == 0 {
+                name.to_string()
+            } else {
+                let path = Path::new(name);
+                let stem = path
+                    .file_stem()
+                    .and_then(|part| part.to_str())
+                    .unwrap_or(name);
+                let extension = path.extension().and_then(|part| part.to_str());
+                match extension {
+                    Some(extension) => format!("{stem} ({suffix}).{extension}"),
+                    None => format!("{name} ({suffix})"),
+                }
+            };
+            let target = dir.join(candidate);
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target)
+            {
+                Ok(file) => return Ok((target, file)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        unreachable!("u64 suffix range is non-empty")
+    }
+
     unsafe fn copy_to_temp(cache: &mut HashMap<String, Opened>, path: &Path) -> Result<PathBuf> {
         let (key, object) = parse(path).ok_or_else(|| anyhow!("Not a portable device path."))?;
         // SAFETY: worker-thread handles; the stream is read to completion here.
@@ -616,17 +699,13 @@ mod windows_impl {
 
             let dir = std::env::temp_dir().join("ply-portable");
             std::fs::create_dir_all(&dir)?;
-            let target = dir.join(&info.name);
+            let safe_name = safe_file_name(&info.name);
+            let (target, mut file) = allocate_temp_target(&dir, &safe_name)?;
 
-            // Stream into a private staging file and only replace `target` once
-            // the whole transfer succeeds. Opening the same object again must
-            // not truncate a copy an app already has open, and a failed retry
-            // must leave the previous copy intact.
-            static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
-            let seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
-            let staging = dir.join(format!(".ply-{}-{seq}.part", std::process::id()));
-
-            let mut file = std::fs::File::create(&staging)?;
+            // `create_new` reserves the final path. Opening the same object
+            // again therefore gets a new name instead of replacing a copy an
+            // app already has open, and a failed transfer removes only its
+            // own incomplete destination.
             let mut buffer = vec![0u8; chunk.clamp(16 * 1024, 1024 * 1024) as usize];
             loop {
                 let mut read = 0u32;
@@ -639,7 +718,7 @@ mod windows_impl {
                     .ok()
                 {
                     drop(file);
-                    let _ = std::fs::remove_file(&staging);
+                    let _ = std::fs::remove_file(&target);
                     return Err(anyhow!("Transfer failed: {e}"));
                 }
                 if read == 0 {
@@ -647,14 +726,9 @@ mod windows_impl {
                 }
                 if let Err(e) = std::io::Write::write_all(&mut file, &buffer[..read as usize]) {
                     drop(file);
-                    let _ = std::fs::remove_file(&staging);
+                    let _ = std::fs::remove_file(&target);
                     return Err(anyhow!("Could not write the copy: {e}"));
                 }
-            }
-            drop(file);
-            if let Err(e) = std::fs::rename(&staging, &target) {
-                let _ = std::fs::remove_file(&staging);
-                return Err(anyhow!("Could not finish the copy: {e}"));
             }
             Ok(target)
         }
@@ -790,5 +864,101 @@ mod tests {
             parse(&root_of("abc").join("s1").join("o1").join("o2")),
             Some(("abc".to_string(), "o2".to_string()))
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn safe_file_name_keeps_targets_under_the_temp_directory() {
+        let dir = std::env::temp_dir().join("ply-portable");
+        let cases = [
+            (r"..\..\escape.txt", "escape.txt"),
+            (r"C:\Windows\System32\evil.dll", "evil.dll"),
+            (r"\\server\share\file.txt", "file.txt"),
+            ("/etc/passwd", "passwd"),
+            ("con", "_con"),
+            ("NUL.txt", "_NUL.txt"),
+            ("COM1.log", "_COM1.log"),
+            ("", "portable-file"),
+            ("   ", "portable-file"),
+            ("...", "portable-file"),
+            (".", "portable-file"),
+            ("..", "portable-file"),
+            ("Résumé – 写真.png", "Résumé – 写真.png"),
+            ("report.pdf.", "report.pdf"),
+            ("report.pdf   ", "report.pdf"),
+        ];
+        for (raw, expected) in cases {
+            let name = windows_impl::safe_file_name(raw);
+            assert_eq!(name, expected, "raw: {raw:?}");
+            assert!(!name.is_empty(), "raw: {raw:?}");
+            assert!(
+                !name.contains(['\\', '/', ':']),
+                "separator or ADS colon in {name:?} from {raw:?}"
+            );
+            assert!(
+                !name.chars().any(char::is_control),
+                "control character in {name:?} from {raw:?}"
+            );
+            let target = dir.join(&name);
+            assert_eq!(target.parent(), Some(dir.as_path()), "raw: {raw:?}");
+            assert_eq!(
+                target.file_name().and_then(|part| part.to_str()),
+                Some(name.as_str()),
+                "raw: {raw:?}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn safe_file_name_strips_ads_and_control_characters() {
+        let safe = windows_impl::safe_file_name;
+        assert_eq!(safe("evil.txt:stream"), "evil.txt_stream");
+        assert_eq!(safe("bad\u{7}name.txt"), "bad_name.txt");
+        assert_eq!(safe("..\\evil.txt"), "evil.txt");
+        assert_eq!(safe("C:evil.txt"), "C_evil.txt");
+        assert_eq!(safe("NUL.tar.gz"), "_NUL.tar.gz");
+        assert_eq!(safe("NUL .txt"), "_NUL .txt");
+        assert_eq!(safe("COM1 .log"), "_COM1 .log");
+        assert_eq!(safe("LPT1 .txt"), "_LPT1 .txt");
+        assert_eq!(safe("COM10.txt"), "COM10.txt", "only COM1-9 are reserved");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn allocate_temp_target_never_replaces_a_previous_copy() {
+        let dir = std::env::temp_dir().join(format!(
+            "ply-mtp-target-test-{}-{}",
+            std::process::id(),
+            key_for("allocation-test")
+        ));
+        std::fs::create_dir_all(&dir).expect("create test directory");
+
+        let first_name = windows_impl::safe_file_name("a:b.txt");
+        let second_name = windows_impl::safe_file_name("a?b.txt");
+        assert_eq!(first_name, second_name);
+
+        let (first_path, mut first) =
+            windows_impl::allocate_temp_target(&dir, &first_name).expect("allocate first target");
+        std::io::Write::write_all(&mut first, b"first").expect("write first target");
+        first.sync_all().expect("flush first target");
+        drop(first);
+
+        let (second_path, mut second) =
+            windows_impl::allocate_temp_target(&dir, &second_name).expect("allocate second target");
+        std::io::Write::write_all(&mut second, b"second").expect("write second target");
+        second.sync_all().expect("flush second target");
+        drop(second);
+
+        assert_ne!(first_path, second_path);
+        assert_eq!(
+            std::fs::read(&first_path).expect("read first target"),
+            b"first"
+        );
+        assert_eq!(
+            std::fs::read(&second_path).expect("read second target"),
+            b"second"
+        );
+        std::fs::remove_dir_all(&dir).expect("remove test directory");
     }
 }
