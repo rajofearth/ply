@@ -511,10 +511,10 @@ impl Ply {
             let current = self
                 .selection
                 .last()
-                .and_then(|last| self.visible_position(last))
-                .unwrap_or(0) as isize;
-            let next = (current + delta).clamp(0, len as isize - 1) as usize;
-            (current as usize, next, len)
+                .and_then(|last| self.visible_position(last));
+            let (current, next) =
+                list_move_target(current, self.selection.is_empty(), delta, len, extend);
+            (current, next, len)
         };
         if extend {
             let anchor = self.anchor.unwrap_or(current);
@@ -555,30 +555,16 @@ impl Ply {
         let cur = self
             .selection
             .last()
-            .and_then(|last| self.visible_position(last))
-            .unwrap_or(0);
-        let row = cur / cols;
-        let col = cur % cols;
-        let last_row_len = total.saturating_sub((total / cols) * cols);
-        let max_row = if last_row_len == 0 {
-            total / cols - 1
-        } else {
-            total / cols
-        };
-
-        // Horizontal first, then vertical.
-        let new_col = (col as isize + right).clamp(0, cols as isize - 1) as usize;
-        let new_row = (row as isize + down).clamp(0, max_row as isize) as usize;
-
-        // Clamp to actual row length (last row may be partial).
-        let row_len = if new_row == max_row {
-            let r = total - new_row * cols;
-            if r == 0 { cols } else { r }
-        } else {
-            cols
-        };
-        let new_col = new_col.min(row_len - 1);
-        let next = new_row * cols + new_col;
+            .and_then(|last| self.visible_position(last));
+        let (cur, next) = grid_move_target(
+            cur,
+            self.selection.is_empty(),
+            cols,
+            right,
+            down,
+            total,
+            extend,
+        );
 
         if extend {
             let anchor = self.anchor.unwrap_or(cur);
@@ -2048,6 +2034,65 @@ fn app_minimized() -> bool {
     false
 }
 
+/// Return the current and next visible positions for list navigation. Plain
+/// movement from an empty selection starts at the nearest boundary: Down at
+/// the first entry and Up at the last. Shift-extension keeps its old origin at
+/// position zero, and a stale selected path keeps the old zero fallback.
+fn list_move_target(
+    current: Option<usize>,
+    selection_empty: bool,
+    delta: isize,
+    len: usize,
+    extend: bool,
+) -> (usize, usize) {
+    let current = current.unwrap_or(0);
+    let next = if selection_empty && !extend {
+        if delta < 0 { len - 1 } else { 0 }
+    } else {
+        (current as isize + delta).clamp(0, len as isize - 1) as usize
+    };
+    (current, next)
+}
+
+/// Return the current and next visible positions for grid navigation. The
+/// flat positions match the packed rows painted by the browser. Plain vertical
+/// movement from an empty selection starts at the first or last visible entry;
+/// all other movement keeps the existing row and column clamping.
+fn grid_move_target(
+    current: Option<usize>,
+    selection_empty: bool,
+    cols: usize,
+    right: isize,
+    down: isize,
+    total: usize,
+    extend: bool,
+) -> (usize, usize) {
+    let cur = current.unwrap_or(0);
+    if selection_empty && !extend && right == 0 && down != 0 {
+        return (cur, if down < 0 { total - 1 } else { 0 });
+    }
+
+    let row = cur / cols;
+    let col = cur % cols;
+    let last_row_len = total.saturating_sub((total / cols) * cols);
+    let max_row = if last_row_len == 0 {
+        total / cols - 1
+    } else {
+        total / cols
+    };
+
+    let new_col = (col as isize + right).clamp(0, cols as isize - 1) as usize;
+    let new_row = (row as isize + down).clamp(0, max_row as isize) as usize;
+    let row_len = if new_row == max_row {
+        let r = total - new_row * cols;
+        if r == 0 { cols } else { r }
+    } else {
+        cols
+    };
+    let new_col = new_col.min(row_len - 1);
+    (cur, new_row * cols + new_col)
+}
+
 /// Inclusive index span for a shift-extend selection, clamped to a listing of
 /// `len` entries. `anchor` (where the extend started) and `target` (the newly
 /// reached row) can both be stale: the listing may have shrunk under a stored
@@ -2154,6 +2199,57 @@ mod tests {
             .map(|e| e.name.as_str())
             .collect();
         assert_eq!(resolved, ["alpha.txt", "almanac.png"]);
+    }
+
+    #[test]
+    fn list_movement_starts_empty_selection_at_directional_boundary() {
+        assert_eq!(list_move_target(None, true, 1, 3, false), (0, 0));
+        assert_eq!(list_move_target(None, true, -1, 3, false), (0, 2));
+        // Shift movement keeps the existing empty-selection origin and still
+        // produces a valid span for the caller to apply.
+        assert_eq!(list_move_target(None, true, 1, 3, true), (0, 1));
+        assert_eq!(selection_span(0, 1, 3), (0, 1));
+    }
+
+    #[test]
+    fn list_movement_preserves_clamping_and_stale_selection_fallback() {
+        assert_eq!(list_move_target(Some(0), false, -1, 3, false), (0, 0));
+        assert_eq!(list_move_target(Some(2), false, 1, 3, false), (2, 2));
+        assert_eq!(list_move_target(None, false, 1, 3, false), (0, 1));
+    }
+
+    #[test]
+    fn filtered_list_movement_uses_visible_positions() {
+        let entries = vec![file("alpha.txt"), file("beta.txt"), file("almanac.txt")];
+        let visible = filter_indices(&entries, "al");
+        assert_eq!(visible, [0, 2]);
+        assert_eq!(
+            list_move_target(None, true, 1, visible.len(), false),
+            (0, 0)
+        );
+        assert_eq!(
+            list_move_target(None, true, -1, visible.len(), false),
+            (0, 1)
+        );
+    }
+
+    #[test]
+    fn grid_movement_starts_empty_selection_at_directional_boundary() {
+        assert_eq!(grid_move_target(None, true, 3, 0, 1, 5, false), (0, 0));
+        assert_eq!(grid_move_target(None, true, 3, 0, -1, 5, false), (0, 4));
+        // Shift movement preserves the old origin at cell 0, which gives a
+        // valid range even when the first Down moves into the second row.
+        assert_eq!(grid_move_target(None, true, 3, 0, 1, 5, true), (0, 3));
+        assert_eq!(selection_span(0, 3, 5), (0, 3));
+    }
+
+    #[test]
+    fn grid_movement_preserves_horizontal_and_edge_clamping() {
+        assert_eq!(grid_move_target(None, true, 3, 1, 0, 5, false), (0, 1));
+        assert_eq!(grid_move_target(None, true, 3, -1, 0, 5, false), (0, 0));
+        assert_eq!(grid_move_target(Some(0), false, 3, 0, -1, 5, false), (0, 0));
+        assert_eq!(grid_move_target(Some(4), false, 3, 0, 1, 5, false), (4, 4));
+        assert_eq!(grid_move_target(Some(2), false, 3, 0, 1, 5, false), (2, 4));
     }
 
     #[test]
