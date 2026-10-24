@@ -88,18 +88,37 @@ mod tests {
         std::env::var(name).as_deref() == Ok("1")
     }
 
+    fn report_measurement_failure(required: bool, reason: &str) {
+        eprintln!(
+            "RAM measure:            ({reason}) {}",
+            if required { "FAIL" } else { "SKIP" }
+        );
+        assert!(!required, "required RAM measurement failed: {reason}");
+    }
+
+    fn non_gpu_working_set(working_set: u64, gpu_shared: u64) -> Option<u64> {
+        working_set.checked_sub(gpu_shared)
+    }
+
     /// Launches the release exe, reports its non-GPU working set, and closes it.
     /// Print-only unless `PLY_BUDGET_REQUIRE_RAM=1`; only
     /// `PLY_BUDGET_MEASURE_EXE=1` launches the exe, so normal tests and CI do not.
     fn measure_working_set_gate(path: &std::path::Path) {
-        if !cfg!(windows) || !env_flag("PLY_BUDGET_MEASURE_EXE") {
+        let required = env_flag("PLY_BUDGET_REQUIRE_RAM");
+        if !cfg!(windows) {
+            return;
+        }
+        if !env_flag("PLY_BUDGET_MEASURE_EXE") {
+            if required {
+                report_measurement_failure(required, "PLY_BUDGET_MEASURE_EXE is not set");
+            }
             return;
         }
         let Ok(mut child) = std::process::Command::new(path)
             .env("PLY_BUDGET_MEASURE", "1")
             .spawn()
         else {
-            eprintln!("RAM measure:            (launch failed)  SKIP");
+            report_measurement_failure(required, "release exe launch failed");
             return;
         };
         let pid = child.id();
@@ -128,16 +147,20 @@ else { Write-Output "$($p.WorkingSet64) $shared" }
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                eprintln!("RAM measure:            (measure failed)  SKIP");
+                report_measurement_failure(required, "PowerShell could not be started");
                 return;
             }
         };
         let _ = child.kill();
         let _ = child.wait();
+        if !out.status.success() {
+            report_measurement_failure(required, "PowerShell measurement failed");
+            return;
+        }
         let text = String::from_utf8_lossy(&out.stdout);
         let mut fields = text.split_whitespace();
         let Some(working_set) = fields.next().and_then(|word| word.parse::<u64>().ok()) else {
-            eprintln!("RAM measure:            (unparsable)  SKIP");
+            report_measurement_failure(required, "PowerShell output was not parseable");
             return;
         };
         let gpu_shared = match fields.next() {
@@ -145,27 +168,31 @@ else { Write-Output "$($p.WorkingSet64) $shared" }
             Some(word) => match word.parse::<u64>() {
                 Ok(bytes) => Some(bytes),
                 Err(_) => {
-                    eprintln!("RAM measure:            (unparsable)  SKIP");
+                    report_measurement_failure(required, "PowerShell output was not parseable");
                     return;
                 }
             },
             None => {
-                eprintln!("RAM measure:            (unparsable)  SKIP");
+                report_measurement_failure(required, "PowerShell output was not parseable");
                 return;
             }
         };
         let Some(gpu_shared) = gpu_shared else {
-            eprintln!("RAM non-GPU working set:   --   SKIP (GPU-shared counter unavailable)");
+            eprintln!("RAM non-GPU working set:   --");
             eprintln!(
                 "RAM working set (total):   {:>6.2} MiB  (includes GPU shared; not gated)",
                 working_set as f64 / (1024.0 * 1024.0)
             );
-            if env_flag("PLY_BUDGET_REQUIRE_RAM") {
-                panic!("cannot evaluate the non-GPU working set without the GPU-shared counter");
-            }
+            report_measurement_failure(required, "GPU-shared counter unavailable");
             return;
         };
-        let non_gpu = working_set.saturating_sub(gpu_shared);
+        let Some(non_gpu) = non_gpu_working_set(working_set, gpu_shared) else {
+            report_measurement_failure(
+                required,
+                "GPU-shared memory exceeded the total working set",
+            );
+            return;
+        };
         let mib = non_gpu as f64 / (1024.0 * 1024.0);
         let ok = non_gpu <= MAX_NON_GPU_WORKING_SET_BYTES;
         eprintln!(
@@ -180,7 +207,7 @@ else { Write-Output "$($p.WorkingSet64) $shared" }
             "RAM non-GPU working set:   {mib:>6.2} MiB  {}",
             if ok { "PASS" } else { "FAIL" }
         );
-        if env_flag("PLY_BUDGET_REQUIRE_RAM") {
+        if required {
             assert!(
                 ok,
                 "non-GPU working set is {mib:.2} MiB ({non_gpu} bytes); budget is {} bytes \
@@ -188,5 +215,16 @@ else { Write-Output "$($p.WorkingSet64) $shared" }
                 MAX_NON_GPU_WORKING_SET_BYTES
             );
         }
+    }
+
+    #[test]
+    fn impossible_ram_measurement_is_rejected() {
+        assert_eq!(non_gpu_working_set(100, 101), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "required RAM measurement failed")]
+    fn required_ram_measurement_failure_panics() {
+        report_measurement_failure(true, "test failure");
     }
 }

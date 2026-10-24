@@ -3,7 +3,7 @@
 if a task can be delegated to the subagent, whether it's research, exploration, or writing code, please use subagents. Use multiple if necessary.
 always talk without slop(`unslop`).
 
-read on the matching branch. names, avoids, and UI vocabulary live in `CONTEXT.md`. the listing model and why there's no worktree is in `docs/adr/0002-listing-not-worktree.md`. the hand-rolled shell and input-only gpui-component decision is in `docs/adr/0003-hand-rolled-explorer-shell.md`. 
+read on the matching branch. names, avoids, and UI vocabulary live in `CONTEXT.md`. the listing model and why there's no worktree is in `docs/adr/0002-listing-not-worktree.md`. the hand-rolled shell and text-field decision is in `docs/adr/0003-hand-rolled-explorer-shell.md`.
 settled base, PathCaps, and listing/UI/volume efficiency is in `docs/adr/0004-settled-base-and-efficiency.md`. build/test/run commands are in `README.md`. binary and RAM budgets plus the size gate are in `src/budget.rs`. why the size and efficiency rules exist, and the fx habits behind them, is in `docs/philosophy.md`.
 
 run `cargo test budgets_report -- --nocapture` and obey the printed gate.
