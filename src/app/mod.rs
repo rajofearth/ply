@@ -49,6 +49,27 @@ pub struct Menu {
     /// Keyboard-selected row, driven by the UI via [`Menu::move_selection`].
     /// `None` means nothing is highlighted yet.
     pub selected: Option<usize>,
+    /// Monotonic identity for this menu instance. Async Open-with results
+    /// must never populate a later menu, even when the target path repeats.
+    pub token: u64,
+    /// The file target captured when this menu was built. The association
+    /// worker never infers its target from mutable selection state.
+    pub open_with_target: Option<PathBuf>,
+    /// Centralized app-owned state for the lazy Open-with flyout.
+    pub open_with: Option<OpenWithState>,
+    /// Request generation for the current target. A second open attempt or a
+    /// rebuilt menu invalidates the earlier completion.
+    pub open_with_generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OpenWithState {
+    /// The menu was painted, but the flyout has not opened yet.
+    Pending,
+    /// The flyout is open and association enumeration is in flight.
+    Loading,
+    /// Owned handler records returned by the shell worker.
+    Ready(Vec<crate::fs_ops::OpenWithApp>),
 }
 
 impl Menu {
@@ -384,6 +405,8 @@ pub struct Ply {
     visible_indices: Vec<usize>,
 
     pub menu: Option<Menu>,
+    /// Source of unique menu tokens used by lazy Open-with completions.
+    next_menu_token: u64,
     pub properties: Option<Properties>,
     pub confirm: Option<ConfirmDialog>,
     pub rename: Option<Rename>,
@@ -513,6 +536,7 @@ impl Ply {
             placeholder_for: None,
             visible_indices: Vec::new(),
             menu: None,
+            next_menu_token: 0,
             properties: None,
             confirm: None,
             rename: None,
@@ -960,6 +984,10 @@ mod tests {
             rows,
             flyout: None,
             selected: None,
+            token: 0,
+            open_with_target: None,
+            open_with: None,
+            open_with_generation: 0,
         }
     }
 

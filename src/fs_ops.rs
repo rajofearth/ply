@@ -292,10 +292,26 @@ pub fn choose_another(path: &Path) -> Result<()> {
     refuse_mtp(path)?;
     #[cfg(windows)]
     {
-        std::process::Command::new("rundll32")
-            .arg("shell32.dll,OpenAs_RunDLL")
-            .arg(path)
-            .spawn()?;
+        use std::os::windows::ffi::OsStrExt;
+
+        use windows::Win32::UI::Shell::{OAIF_EXEC, OPENASINFO, SHOpenWithDialog};
+        use windows::core::PCWSTR;
+
+        // SHOpenWithDialog borrows the path only for the duration of the
+        // synchronous native picker. Keep the temporary buffer alive until
+        // the call returns and pass a null owner: Ply's client window handle
+        // is not part of the filesystem layer's contract.
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let info = OPENASINFO {
+            pcszFile: PCWSTR(wide.as_ptr()),
+            pcszClass: PCWSTR::null(),
+            oaifInFlags: OAIF_EXEC,
+        };
+        unsafe { SHOpenWithDialog(None, &info)? };
         Ok(())
     }
     #[cfg(not(windows))]
@@ -305,13 +321,94 @@ pub fn choose_another(path: &Path) -> Result<()> {
     }
 }
 
-/// Recommended Open-with handlers for a file, as display names for the
-/// flyout. Sync registry reads via `SHAssocEnumHandlers` + `IAssocHandler`;
-/// capped at [`OPEN_WITH_CAP`] and never blocking menu open: any failure
-/// (including MTP) returns empty so the caller falls back to the single
-/// Choose-app child. `Invoke` is deferred, so clicking a row currently opens
-/// the picker.
+/// Recommended Open-with handlers for a file, as owned display names and
+/// optional icon paths for the flyout. The Windows association call is
+/// dispatched to the existing STA shell worker; this public function blocks
+/// only its caller while that worker owns all COM interfaces.
 pub const OPEN_WITH_CAP: usize = 6;
+
+/// Recommended Open-with app: the handler display name plus its shell icon
+/// source. `icon` is the handler's `GetIconLocation` path when it resolves
+/// to a real file on disk, else empty.
+///
+/// The app renders `icon` via the existing `path_icon_probe` path
+/// (`thumbs.rs:1201`), which resolves a real file's own shell icon through
+/// `path_icon` (`thumbs.rs:2396`) and `path_icon_index` (`thumbs.rs:1999`);
+/// no worker change is needed. Note that probe takes no dll icon index
+/// (`GetIconLocation` also returns one); the exe/dll path is returned anyway
+/// because the file's own icon is the right art in nearly all cases.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenWithApp {
+    pub name: String,
+    pub icon: PathBuf,
+}
+
+/// Recommended Open-with apps for a file, as display names plus icon sources
+/// for the flyout. Same enumeration as [`list_open_with_apps`] (capped
+/// at [`OPEN_WITH_CAP`], MTP/Recycle Bin refused, empty on any failure), but
+/// per handler also reads `IAssocHandler::GetIconLocation`; the icon path is
+/// kept only when it resolves to a real file on disk, else empty.
+pub fn list_open_with_apps(path: &Path) -> Vec<OpenWithApp> {
+    if crate::mtp::is_mtp(path) || crate::recycle_bin::is_recycle_bin(path) {
+        return Vec::new();
+    }
+    #[cfg(windows)]
+    {
+        crate::thumbs::request_open_with_apps(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Vec::new()
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn enumerate_open_with_apps_on_sta(path: &Path) -> Vec<OpenWithApp> {
+    use windows::Win32::UI::Shell::{ASSOC_FILTER_RECOMMENDED, IAssocHandler, SHAssocEnumHandlers};
+    use windows::core::PCWSTR;
+
+    let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
+        return Vec::new();
+    };
+    if ext.is_empty() {
+        return Vec::new();
+    }
+    let assoc = format!(".{ext}");
+    let wide: Vec<u16> = assoc.encode_utf16().chain(Some(0)).collect();
+    let Some(enum_handlers) =
+        (unsafe { SHAssocEnumHandlers(PCWSTR(wide.as_ptr()), ASSOC_FILTER_RECOMMENDED).ok() })
+    else {
+        return Vec::new();
+    };
+    let mut out: Vec<OpenWithApp> = Vec::new();
+    for _ in 0..OPEN_WITH_CAP {
+        let mut fetched = 0u32;
+        let mut handler: [Option<IAssocHandler>; 1] = [None];
+        if unsafe {
+            enum_handlers
+                .Next(&mut handler, Some(&mut fetched))
+                .is_err()
+        } || fetched == 0
+        {
+            break;
+        }
+        let Some(h) = handler[0].take() else {
+            break;
+        };
+        let name = assoc_handler_display_name(&h).unwrap_or_default();
+        let name = name.trim().to_string();
+        if name.is_empty() || out.iter().any(|a| a.name == name) {
+            continue;
+        }
+        let icon = assoc_handler_icon_path(&h).unwrap_or_default();
+        out.push(OpenWithApp { name, icon });
+        if out.len() >= OPEN_WITH_CAP {
+            break;
+        }
+    }
+    out
+}
 
 #[cfg(windows)]
 fn assoc_handler_display_name(
@@ -340,84 +437,6 @@ fn assoc_handler_display_name(
         CoTaskMemFree(Some(raw as *const std::ffi::c_void));
     }
     if s.is_empty() { None } else { Some(s) }
-}
-
-/// Recommended Open-with app: the handler display name plus its shell icon
-/// source. `icon` is the handler's `GetIconLocation` path when it resolves
-/// to a real file on disk, else empty.
-///
-/// The app renders `icon` via the existing `path_icon_probe` path
-/// (`thumbs.rs:1201`), which resolves a real file's own shell icon through
-/// `path_icon` (`thumbs.rs:2396`) and `path_icon_index` (`thumbs.rs:1999`);
-/// no worker change is needed. Note that probe takes no dll icon index
-/// (`GetIconLocation` also returns one); the exe/dll path is returned anyway
-/// because the file's own icon is the right art in nearly all cases.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OpenWithApp {
-    pub name: String,
-    pub icon: PathBuf,
-}
-
-/// Recommended Open-with apps for a file, as display names plus icon sources
-/// for the flyout. Same enumeration as [`list_open_with_handlers`] (capped
-/// at [`OPEN_WITH_CAP`], MTP/Recycle Bin refused, empty on any failure), but
-/// per handler also reads `IAssocHandler::GetIconLocation`; the icon path is
-/// kept only when it resolves to a real file on disk, else empty.
-pub fn list_open_with_apps(path: &Path) -> Vec<OpenWithApp> {
-    if crate::mtp::is_mtp(path) || crate::recycle_bin::is_recycle_bin(path) {
-        return Vec::new();
-    }
-    #[cfg(windows)]
-    {
-        list_open_with_apps_windows(path).unwrap_or_default()
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = path;
-        Vec::new()
-    }
-}
-
-#[cfg(windows)]
-fn list_open_with_apps_windows(path: &Path) -> Option<Vec<OpenWithApp>> {
-    use windows::Win32::UI::Shell::{ASSOC_FILTER_RECOMMENDED, IAssocHandler, SHAssocEnumHandlers};
-    use windows::core::PCWSTR;
-
-    let ext = path.extension()?.to_str()?;
-    if ext.is_empty() {
-        return Some(Vec::new());
-    }
-    let assoc = format!(".{ext}");
-    let wide: Vec<u16> = assoc.encode_utf16().chain(Some(0)).collect();
-    let enum_handlers =
-        unsafe { SHAssocEnumHandlers(PCWSTR(wide.as_ptr()), ASSOC_FILTER_RECOMMENDED).ok()? };
-    let mut out: Vec<OpenWithApp> = Vec::new();
-    for _ in 0..OPEN_WITH_CAP {
-        let mut fetched = 0u32;
-        let mut handler: [Option<IAssocHandler>; 1] = [None];
-        if unsafe {
-            enum_handlers
-                .Next(&mut handler, Some(&mut fetched))
-                .is_err()
-        } || fetched == 0
-        {
-            break;
-        }
-        let Some(h) = handler[0].take() else {
-            break;
-        };
-        let name = assoc_handler_display_name(&h).unwrap_or_default();
-        let name = name.trim().to_string();
-        if name.is_empty() || out.iter().any(|a| a.name == name) {
-            continue;
-        }
-        let icon = assoc_handler_icon_path(&h).unwrap_or_default();
-        out.push(OpenWithApp { name, icon });
-        if out.len() >= OPEN_WITH_CAP {
-            break;
-        }
-    }
-    Some(out)
 }
 
 /// The handler's `GetIconLocation` path when it is absolute and a real file

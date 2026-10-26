@@ -332,18 +332,21 @@ fn menu_row(
                     return;
                 }
                 let mut changed = false;
+                let mut open_flyout = false;
                 if let Some(menu) = this.menu.as_mut() {
                     if menu.selected != Some(ix) {
                         menu.selected = Some(ix);
                         changed = true;
                     }
                     if has_kids && menu.flyout != Some(ix) {
-                        menu.flyout = Some(ix);
-                        changed = true;
+                        open_flyout = true;
                     }
                 }
                 if changed {
                     cx.notify();
+                }
+                if open_flyout {
+                    this.show_flyout(Some(ix), cx);
                 }
             }))
             .when(has_kids, |el| {

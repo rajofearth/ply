@@ -16,7 +16,7 @@ use crate::volumes;
 
 use super::{
     ConfirmAction, ConfirmDialog, LoadState, Menu, MenuAction, MenuIconSource, MenuItem, MenuRow,
-    MenuStock, Ply, PropsFields, Rename, ViewMode, props_from_fields,
+    MenuStock, OpenWithState, Ply, PropsFields, Rename, ViewMode, props_from_fields,
 };
 
 /// Facts gathered for a Properties dialog before the async fills land:
@@ -677,16 +677,11 @@ impl Ply {
         // Every row lives in the list. Clipboard rows are intentionally
         // visible but disabled until the Windows clipboard engine exists.
 
-        // `None` means Open-with is not offered (not a file);
-        // `Some` (possibly empty) drives the collapse in `build_item_menu`.
-        // Every file is offered Open-with, writable or not; locals resolve
-        // handlers while portable paths fall back to the Choose-app row.
-        let open_with = is_file.then(|| {
-            fs_ops::list_open_with_apps(&path)
-                .into_iter()
-                .take(fs_ops::OPEN_WITH_CAP)
-                .collect::<Vec<_>>()
-        });
+        // Association enumeration is lazy: the menu paints immediately with
+        // a flyout placeholder, then the first flyout open queues the Shell
+        // lookup on the dedicated STA worker.
+        let open_with = open_with_state_for(&path, is_file, browse_only);
+        let open_with_target = open_with.as_ref().map(|_| path.clone());
         let rows = build_item_menu(&ItemMenuSpec {
             path: path.clone(),
             targets,
@@ -702,7 +697,7 @@ impl Ply {
             open_with,
         });
 
-        self.show_menu(at, rows, cx);
+        self.show_menu(at, rows, open_with_target, cx);
     }
 
     pub fn open_empty_menu(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
@@ -714,7 +709,7 @@ impl Ply {
         let sort = self.sort;
 
         let rows = build_empty_menu(view, sort, writable, folder);
-        self.show_menu(at, rows, cx);
+        self.show_menu(at, rows, None, cx);
     }
 
     /// Open the right-click menu for a sidebar row. Unlike [`Ply::open_menu`]
@@ -732,15 +727,28 @@ impl Ply {
         if rows.is_empty() {
             return;
         }
-        self.show_menu(at, rows, cx);
+        self.show_menu(at, rows, None, cx);
     }
 
-    fn show_menu(&mut self, at: Point<Pixels>, rows: Vec<MenuRow>, cx: &mut Context<Self>) {
+    fn show_menu(
+        &mut self,
+        at: Point<Pixels>,
+        rows: Vec<MenuRow>,
+        open_with_target: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        self.next_menu_token = self.next_menu_token.wrapping_add(1);
+        let token = self.next_menu_token;
+        let open_with = open_with_target.as_ref().map(|_| OpenWithState::Pending);
         self.menu = Some(Menu {
             at,
             rows,
             flyout: None,
             selected: None,
+            token,
+            open_with_target,
+            open_with,
+            open_with_generation: 0,
         });
         cx.notify();
     }
@@ -759,10 +767,87 @@ impl Ply {
     }
 
     pub fn set_flyout(&mut self, ix: Option<usize>, cx: &mut Context<Self>) {
-        if let Some(menu) = &mut self.menu {
-            menu.flyout = if menu.flyout == ix { None } else { ix };
-            cx.notify();
+        let opened = if let Some(menu) = &mut self.menu {
+            let next = if menu.flyout == ix { None } else { ix };
+            menu.flyout = next;
+            next.is_some()
+        } else {
+            false
+        };
+        cx.notify();
+        if opened {
+            self.start_open_with_load(cx);
         }
+    }
+
+    /// Select a flyout directly from hover. Unlike [`Self::set_flyout`], this
+    /// does not toggle an already-open row, so repeated hover events cannot
+    /// collapse the flyout while the pointer crosses its contents.
+    pub fn show_flyout(&mut self, ix: Option<usize>, cx: &mut Context<Self>) {
+        let opened = if let Some(menu) = &mut self.menu {
+            menu.flyout = ix;
+            ix.is_some()
+        } else {
+            false
+        };
+        cx.notify();
+        if opened {
+            self.start_open_with_load(cx);
+        }
+    }
+
+    fn start_open_with_load(&mut self, cx: &mut Context<Self>) {
+        let Some((token, generation, target)) = (|| {
+            let menu = self.menu.as_mut()?;
+            if menu.flyout.is_none() || !matches!(menu.open_with, Some(OpenWithState::Pending)) {
+                return None;
+            }
+            let target = menu.open_with_target.clone()?;
+            menu.open_with_generation = menu.open_with_generation.wrapping_add(1);
+            menu.open_with = Some(OpenWithState::Loading);
+            Some((menu.token, menu.open_with_generation, target))
+        })() else {
+            return;
+        };
+
+        cx.notify();
+        if crate::mtp::is_mtp(&target) || crate::recycle_bin::is_recycle_bin(&target) {
+            self.finish_open_with_load(token, generation, target, Vec::new(), cx);
+            return;
+        }
+
+        let worker_target = target.clone();
+        cx.spawn(async move |this, cx| {
+            let apps = cx
+                .background_spawn(async move { fs_ops::list_open_with_apps(&worker_target) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.finish_open_with_load(token, generation, target, apps, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn finish_open_with_load(
+        &mut self,
+        token: u64,
+        generation: u64,
+        target: PathBuf,
+        apps: Vec<fs_ops::OpenWithApp>,
+        cx: &mut Context<Self>,
+    ) {
+        if !open_with_completion_is_current(self.menu.as_ref(), token, generation, &target) {
+            return;
+        }
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        menu.open_with = Some(OpenWithState::Ready(apps.clone()));
+        if apps.is_empty() {
+            menu.flyout = None;
+        }
+        replace_open_with_rows(&mut menu.rows, &target, &apps);
+        cx.notify();
     }
 
     pub fn run(&mut self, action: MenuAction, window: &mut Window, cx: &mut Context<Self>) {
@@ -1504,6 +1589,32 @@ fn props_completion_is_current(
     now_generation == seen_generation && open_path.is_some_and(|open| Path::new(open) == target)
 }
 
+/// Whether an association completion still belongs to the loading flyout.
+/// Menu identity handles a closed/reopened menu, generation handles a newer
+/// request for the same menu, and the path check prevents a mutable selection
+/// from retargeting a result. Pure, so the stale matrix stays unit-tested.
+fn open_with_completion_is_current(
+    menu: Option<&Menu>,
+    token: u64,
+    generation: u64,
+    target: &Path,
+) -> bool {
+    let Some(menu) = menu else {
+        return false;
+    };
+    menu.token == token
+        && menu.open_with_generation == generation
+        && menu.open_with_target.as_deref() == Some(target)
+        && matches!(menu.open_with, Some(OpenWithState::Loading))
+}
+
+/// Open With is a local-file feature. MTP objects and Recycle Bin children
+/// may look file-like but do not accept normal filesystem association or
+/// picker operations; the latter are identified by the browse-only Location.
+fn open_with_state_for(path: &Path, is_file: bool, browse_only: bool) -> Option<OpenWithState> {
+    (is_file && !browse_only && !crate::mtp::is_mtp(path)).then_some(OpenWithState::Pending)
+}
+
 /// Whether `readonly`/`hidden` boxes differ from the opening bits. `None`
 /// boxes keep the opening bit. Pure.
 fn attrs_dirty(orig: Option<u32>, readonly: Option<bool>, hidden: Option<bool>) -> bool {
@@ -1526,8 +1637,8 @@ fn attrs_dirty(orig: Option<u32>, readonly: Option<bool>, hidden: Option<bool>) 
 /// Pure inputs for the item (right-click) menu. Grouping, separators, glyphs,
 /// the Pin row and the Open-with collapse live in [`build_item_menu`], which
 /// takes this spec so tests cover them without a GPUI context. Shell queries
-/// (`list_open_with_apps`, `terminal_exe_path`, caps) stay in
-/// [`Ply::open_menu`], which fills the spec.
+/// (`terminal_exe_path`, caps) stay in [`Ply::open_menu`], which fills the
+/// spec; association enumeration is lazy and starts from the flyout.
 struct ItemMenuSpec {
     path: PathBuf,
     targets: Vec<PathBuf>,
@@ -1540,9 +1651,94 @@ struct ItemMenuSpec {
     pinned: bool,
     reveal: bool,
     trash: bool,
-    /// `None` means Open-with is not offered (not a file);
-    /// `Some` apps (possibly empty) drive the collapse below.
-    open_with: Option<Vec<fs_ops::OpenWithApp>>,
+    /// `None` means Open-with is not offered (not a file). `Pending` and
+    /// `Loading` paint the immediate placeholder; `Ready` drives collapse or
+    /// the owned handler rows.
+    open_with: Option<OpenWithState>,
+}
+
+fn open_with_row(path: &Path, state: &OpenWithState) -> MenuRow {
+    match state {
+        OpenWithState::Pending | OpenWithState::Loading => {
+            let loading = MenuItem {
+                enabled: false,
+                ..MenuItem::new("Loading…", None, None)
+            };
+            flyout(
+                "Open with",
+                Ico::ExternalLink,
+                vec![
+                    loading.into(),
+                    MenuItem::new(
+                        "Choose another app…",
+                        None,
+                        Some(MenuAction::ChooseApp(path.to_path_buf())),
+                    )
+                    .with_glyph(GLYPH_OPEN_WITH)
+                    .into(),
+                ],
+                Some(GLYPH_OPEN_WITH),
+            )
+        }
+        OpenWithState::Ready(handlers) if handlers.is_empty() => MenuItem::new(
+            "Open with…",
+            Some(Ico::ExternalLink),
+            Some(MenuAction::ChooseApp(path.to_path_buf())),
+        )
+        .with_glyph(GLYPH_OPEN_WITH)
+        .into(),
+        OpenWithState::Ready(handlers) => {
+            let mut kids: Vec<MenuRow> = handlers
+                .iter()
+                .take(fs_ops::OPEN_WITH_CAP)
+                .map(|app| {
+                    let shell = (!app.icon.as_os_str().is_empty())
+                        .then(|| MenuIconSource::Path(app.icon.clone()));
+                    let item = MenuItem::new(
+                        app.name.clone(),
+                        None,
+                        Some(MenuAction::OpenWithHandler(
+                            path.to_path_buf(),
+                            app.name.clone(),
+                        )),
+                    );
+                    match shell {
+                        Some(source) => item.with_shell(source).into(),
+                        None => item.into(),
+                    }
+                })
+                .collect();
+            kids.push(
+                MenuItem::new(
+                    "Choose another app…",
+                    None,
+                    Some(MenuAction::ChooseApp(path.to_path_buf())),
+                )
+                .with_glyph(GLYPH_OPEN_WITH)
+                .into(),
+            );
+            flyout("Open with", Ico::ExternalLink, kids, Some(GLYPH_OPEN_WITH))
+        }
+    }
+}
+
+/// Replace only the Open-with row, preserving selection and all other menu
+/// groups while an association completion lands.
+fn replace_open_with_rows(rows: &mut [MenuRow], path: &Path, apps: &[fs_ops::OpenWithApp]) {
+    let state = OpenWithState::Ready(apps.to_vec());
+    if let Some(ix) = rows.iter().position(|row| match row {
+        MenuRow::Item(item) => {
+            item.label.as_ref() == "Open with"
+                || (item.label.as_ref() == "Open with…"
+                    && matches!(
+                        item.action.as_ref(),
+                        Some(MenuAction::ChooseApp(target)) if target == path
+                    ))
+        }
+        MenuRow::Separator => false,
+    }) {
+        rows[ix] = open_with_row(path, &state);
+    }
 }
 
 /// Build the item menu rows: `[Open, Open with, Cut, Copy, Paste] /
@@ -1564,52 +1760,8 @@ fn build_item_menu(spec: &ItemMenuSpec) -> Vec<MenuRow> {
         }
         .into(),
     ];
-    if let Some(handlers) = &spec.open_with {
-        if handlers.is_empty() {
-            // Single-child collapse: a direct row firing ChooseApp instead
-            // of a one-child flyout.
-            rows.push(
-                MenuItem::new(
-                    "Open with…",
-                    Some(Ico::ExternalLink),
-                    Some(MenuAction::ChooseApp(path.clone())),
-                )
-                .with_glyph(GLYPH_OPEN_WITH)
-                .into(),
-            );
-        } else {
-            let mut kids: Vec<MenuRow> = Vec::new();
-            for app in handlers.iter().take(fs_ops::OPEN_WITH_CAP) {
-                // Handler shell icon: the exe path when the shell resolved
-                // one, else the lucide fallback (`shell: None`).
-                let shell = (!app.icon.as_os_str().is_empty())
-                    .then(|| MenuIconSource::Path(app.icon.clone()));
-                let item = MenuItem::new(
-                    app.name.clone(),
-                    None,
-                    Some(MenuAction::OpenWithHandler(path.clone(), app.name.clone())),
-                );
-                kids.push(match shell {
-                    Some(source) => item.with_shell(source).into(),
-                    None => item.into(),
-                });
-            }
-            kids.push(
-                MenuItem::new(
-                    "Choose another app…",
-                    None,
-                    Some(MenuAction::ChooseApp(path.clone())),
-                )
-                .with_glyph(GLYPH_OPEN_WITH)
-                .into(),
-            );
-            rows.push(flyout(
-                "Open with",
-                Ico::ExternalLink,
-                kids,
-                Some(GLYPH_OPEN_WITH),
-            ));
-        }
+    if let Some(state) = &spec.open_with {
+        rows.push(open_with_row(path, state));
     }
     if !spec.is_volume && !spec.browse_only {
         rows.extend([
@@ -2118,7 +2270,7 @@ fn filter_indices(entries: &[Entry], filter: &str) -> Vec<usize> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::*;
     use crate::listing::EntryKind;
@@ -2314,7 +2466,7 @@ mod tests {
             pinned: false,
             reveal: true,
             trash: true,
-            open_with: Some(Vec::new()),
+            open_with: Some(OpenWithState::Ready(Vec::new())),
         }
     }
 
@@ -2546,6 +2698,65 @@ mod tests {
     }
 
     #[test]
+    fn open_with_placeholder_keeps_picker_until_lazy_result() {
+        let mut spec = file_spec();
+        spec.open_with = Some(OpenWithState::Pending);
+        let rows = build_item_menu(&spec);
+        let flyout = find_item(&rows, "Open with");
+        assert_eq!(flyout.children.len(), 2);
+        let MenuRow::Item(loading) = &flyout.children[0] else {
+            panic!("placeholder must be a row");
+        };
+        assert_eq!(loading.label.as_ref(), "Loading…");
+        assert!(!loading.enabled);
+        let MenuRow::Item(picker) = &flyout.children[1] else {
+            panic!("picker fallback must stay visible while loading");
+        };
+        assert!(matches!(picker.action, Some(MenuAction::ChooseApp(_))));
+    }
+
+    #[test]
+    fn open_with_is_omitted_for_virtual_file_targets() {
+        let local = Path::new(r"C:\a\notes.txt");
+        assert!(open_with_state_for(local, true, false).is_some());
+        assert!(open_with_state_for(local, true, true).is_none());
+        assert!(open_with_state_for(Path::new(r"\\MTP\DEVICE\o1"), true, false).is_none());
+
+        let mut recycle_entry = file_spec();
+        recycle_entry.browse_only = true;
+        recycle_entry.open_with = None;
+        assert!(build_item_menu(&recycle_entry).iter().all(|row| match row {
+            MenuRow::Item(item) => !item.label.as_ref().starts_with("Open with"),
+            MenuRow::Separator => true,
+        }));
+    }
+
+    #[test]
+    fn open_with_completion_guard_rejects_stale_menu_generation_or_target() {
+        let target = PathBuf::from(r"C:\a\notes.txt");
+        let menu = Menu {
+            at: gpui::Point::new(gpui::px(0.), gpui::px(0.)),
+            rows: Vec::new(),
+            flyout: Some(0),
+            selected: Some(0),
+            token: 7,
+            open_with_target: Some(target.clone()),
+            open_with: Some(OpenWithState::Loading),
+            open_with_generation: 3,
+        };
+        assert!(open_with_completion_is_current(Some(&menu), 7, 3, &target));
+        assert!(!open_with_completion_is_current(Some(&menu), 8, 3, &target));
+        assert!(!open_with_completion_is_current(Some(&menu), 7, 2, &target));
+        assert!(!open_with_completion_is_current(
+            Some(&menu),
+            7,
+            3,
+            Path::new(r"C:\b\other.txt")
+        ));
+        assert!(!open_with_completion_is_current(None, 7, 3, &target));
+    }
+
+    #[test]
     fn open_with_collapses_to_direct_row_when_no_handlers() {
         let rows = build_item_menu(&file_spec());
         let direct = find_item(&rows, "Open with…");
@@ -2565,7 +2776,7 @@ mod tests {
     #[test]
     fn open_with_flyout_lists_handlers_then_picker() {
         let mut spec = file_spec();
-        spec.open_with = Some(vec![
+        spec.open_with = Some(OpenWithState::Ready(vec![
             fs_ops::OpenWithApp {
                 name: "FooApp".to_string(),
                 icon: PathBuf::from(r"C:\Program Files\Foo\foo.exe"),
@@ -2574,7 +2785,7 @@ mod tests {
                 name: "NoIcon".to_string(),
                 icon: PathBuf::new(),
             },
-        ]);
+        ]));
         let rows = build_item_menu(&spec);
         let fly = find_item(&rows, "Open with");
         assert_eq!(fly.glyph, Some('\u{E7AC}'));

@@ -1530,6 +1530,13 @@ mod backend {
             path: PathBuf,
             reply: Sender<Vec<(String, String)>>,
         },
+        /// Resolve recommended Open-with handlers. The worker converts every
+        /// COM record to owned app data before the reply crosses the thread
+        /// boundary; no `IAssocHandler` leaves this STA.
+        ListOpenWith {
+            path: PathBuf,
+            reply: Sender<Vec<crate::fs_ops::OpenWithApp>>,
+        },
     }
 
     /// One STA thread for the fast shell-index work (type icons, lnk sources,
@@ -1565,6 +1572,9 @@ mod backend {
                     }
                     ShellJob::ReadProperties { path, reply } => {
                         let _ = reply.send(read_properties_impl(&path));
+                    }
+                    ShellJob::ListOpenWith { path, reply } => {
+                        let _ = reply.send(crate::fs_ops::enumerate_open_with_apps_on_sta(&path));
                     }
                 }
             }
@@ -1710,6 +1720,22 @@ mod backend {
         }
         let (tx, rx) = channel();
         if !shell_dispatch(ShellJob::ReadProperties {
+            path: path.to_path_buf(),
+            reply: tx,
+        }) {
+            return Vec::new();
+        }
+        rx.recv().unwrap_or_default()
+    }
+
+    /// Dispatch recommended association enumeration to this worker's STA.
+    /// The caller receives only owned display/icon data.
+    pub(super) fn request_open_with_apps(path: &Path) -> Vec<crate::fs_ops::OpenWithApp> {
+        if crate::mtp::is_mtp(path) || crate::recycle_bin::is_recycle_bin(path) {
+            return Vec::new();
+        }
+        let (tx, rx) = channel();
+        if !shell_dispatch(ShellJob::ListOpenWith {
             path: path.to_path_buf(),
             reply: tx,
         }) {
@@ -2476,6 +2502,21 @@ pub fn read_properties(path: &Path) -> Vec<(String, String)> {
     }
     #[cfg(not(windows))]
     {
+        Vec::new()
+    }
+}
+
+/// Resolve recommended Open-with handlers through the shared STA shell
+/// worker. The result contains only owned names and optional icon paths, so
+/// no COM interface is retained in app state.
+pub(crate) fn request_open_with_apps(path: &Path) -> Vec<crate::fs_ops::OpenWithApp> {
+    #[cfg(windows)]
+    {
+        backend::request_open_with_apps(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
         Vec::new()
     }
 }
