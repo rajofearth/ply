@@ -3944,6 +3944,7 @@ dependencies = [
  "notify",
  "open",
  "png 0.18.1",
+ "raw-window-handle",
  "trash",
  "windows 0.62.2",
 ]

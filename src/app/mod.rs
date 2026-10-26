@@ -222,17 +222,12 @@ pub enum MenuAction {
     OpenWithHandler(PathBuf, String),
     RunAsAdmin(PathBuf),
     OpenInTerminal(PathBuf),
-    // Clipboard rows are visible but disabled until the clipboard engine
-    // exists; `run` still keeps the future actions as explicit variants.
-    #[allow(dead_code)]
     Pin(PathBuf),
     #[allow(dead_code)]
     Unpin(PathBuf),
     CopyPath(PathBuf),
-    #[allow(dead_code)]
-    Cut,
-    #[allow(dead_code)]
-    Copy,
+    Cut(Vec<PathBuf>),
+    Copy(Vec<PathBuf>),
     #[allow(dead_code)]
     Paste,
     Rename(PathBuf),

@@ -673,9 +673,7 @@ impl Ply {
         let browse_only = self
             .current_folder()
             .is_some_and(crate::recycle_bin::is_recycle_bin);
-
-        // Every row lives in the list. Clipboard rows are intentionally
-        // visible but disabled until the Windows clipboard engine exists.
+        let clipboard_eligible = !browse_only && !is_volume && crate::clipboard::eligible(&targets);
 
         // Association enumeration is lazy: the menu paints immediately with
         // a flyout placeholder, then the first flyout open queues the Shell
@@ -691,6 +689,7 @@ impl Ply {
             admin,
             writable,
             browse_only,
+            clipboard_eligible,
             pinned: self.quick_access.contains(&path),
             reveal: caps.reveal,
             trash: caps.trash,
@@ -882,7 +881,13 @@ impl Ply {
                 ));
                 self.note("Path copied.", cx);
             }
-            MenuAction::Cut | MenuAction::Copy | MenuAction::Paste => {}
+            MenuAction::Cut(paths) => {
+                self.publish_clipboard(crate::clipboard::Operation::Cut, paths, window, cx)
+            }
+            MenuAction::Copy(paths) => {
+                self.publish_clipboard(crate::clipboard::Operation::Copy, paths, window, cx)
+            }
+            MenuAction::Paste => {}
             MenuAction::Rename(path) => self.begin_rename(path, window, cx),
             MenuAction::Delete(paths) => self.delete(paths, cx),
             MenuAction::Reveal(path) => self.try_fs(fs_ops::reveal(&path), "Reveal failed", cx),
@@ -898,6 +903,30 @@ impl Ply {
     fn try_fs(&mut self, result: anyhow::Result<()>, prefix: &str, cx: &mut Context<Self>) {
         if let Err(err) = result {
             self.fail(format!("{prefix}: {err}"), cx);
+        }
+    }
+
+    fn publish_clipboard(
+        &mut self,
+        operation: crate::clipboard::Operation,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let count = paths.len();
+        let verb = match operation {
+            crate::clipboard::Operation::Copy => "copy",
+            crate::clipboard::Operation::Cut => "cut",
+        };
+        match crate::clipboard::write(operation, paths, window) {
+            Ok(()) => self.note(
+                format!(
+                    "{verb} {count} entr{} to the clipboard.",
+                    if count == 1 { "y" } else { "ies" }
+                ),
+                cx,
+            ),
+            Err(err) => self.fail(format!("Could not {verb} to the clipboard: {err}"), cx),
         }
     }
 
@@ -1426,6 +1455,18 @@ fn inert_row(label: impl Into<SharedString>, icon: Ico, action: MenuAction) -> M
     })
 }
 
+fn clipboard_row(
+    label: impl Into<SharedString>,
+    icon: Ico,
+    action: MenuAction,
+    enabled: bool,
+) -> MenuRow {
+    MenuRow::Item(MenuItem {
+        enabled,
+        ..MenuItem::new(label, Some(icon), Some(action))
+    })
+}
+
 fn row_with_shell(
     label: impl Into<SharedString>,
     icon: Ico,
@@ -1648,6 +1689,7 @@ struct ItemMenuSpec {
     admin: bool,
     writable: bool,
     browse_only: bool,
+    clipboard_eligible: bool,
     pinned: bool,
     reveal: bool,
     trash: bool,
@@ -1743,8 +1785,8 @@ fn replace_open_with_rows(rows: &mut [MenuRow], path: &Path, apps: &[fs_ops::Ope
 
 /// Build the item menu rows: `[Open, Open with, Cut, Copy, Paste] /
 /// [Run as administrator, Open in Terminal, Pin, Rename, Copy as path, Reveal]
-/// / [Properties, Delete]` with exactly two separators. Clipboard rows are
-/// visible but inert until their implementation lands. Pure.
+/// / [Properties, Delete]` with exactly two separators. Cut and Copy carry the
+/// owned target snapshot and are enabled only for eligible local paths. Pure.
 fn build_item_menu(spec: &ItemMenuSpec) -> Vec<MenuRow> {
     let path = &spec.path;
     let mut rows = vec![
@@ -1765,8 +1807,18 @@ fn build_item_menu(spec: &ItemMenuSpec) -> Vec<MenuRow> {
     }
     if !spec.is_volume && !spec.browse_only {
         rows.extend([
-            inert_row("Cut", Ico::Scissors, MenuAction::Cut),
-            inert_row("Copy", Ico::Copy, MenuAction::Copy),
+            clipboard_row(
+                "Cut",
+                Ico::Scissors,
+                MenuAction::Cut(spec.targets.clone()),
+                spec.clipboard_eligible,
+            ),
+            clipboard_row(
+                "Copy",
+                Ico::Copy,
+                MenuAction::Copy(spec.targets.clone()),
+                spec.clipboard_eligible,
+            ),
             inert_row("Paste", Ico::ClipboardPaste, MenuAction::Paste),
         ]);
     }
@@ -2454,6 +2506,7 @@ mod tests {
 
     fn file_spec() -> ItemMenuSpec {
         let path = PathBuf::from(r"C:\a\notes.txt");
+        let clipboard_eligible = crate::clipboard::eligible(std::slice::from_ref(&path));
         ItemMenuSpec {
             targets: vec![path.clone()],
             path,
@@ -2463,6 +2516,7 @@ mod tests {
             admin: false,
             writable: true,
             browse_only: false,
+            clipboard_eligible,
             pinned: false,
             reveal: true,
             trash: true,
@@ -2472,6 +2526,7 @@ mod tests {
 
     fn dir_spec() -> ItemMenuSpec {
         let path = PathBuf::from(r"C:\pics");
+        let clipboard_eligible = crate::clipboard::eligible(std::slice::from_ref(&path));
         ItemMenuSpec {
             targets: vec![path.clone()],
             path,
@@ -2481,6 +2536,7 @@ mod tests {
             admin: false,
             writable: true,
             browse_only: false,
+            clipboard_eligible,
             pinned: false,
             reveal: true,
             trash: true,
@@ -2553,7 +2609,7 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_rows_are_visible_but_inert() {
+    fn clipboard_rows_are_enabled_only_for_eligible_targets() {
         for rows in [build_item_menu(&file_spec()), build_item_menu(&dir_spec())] {
             for (label, expected) in [
                 ("Cut", MenuActionKind::Cut),
@@ -2561,7 +2617,7 @@ mod tests {
                 ("Paste", MenuActionKind::Paste),
             ] {
                 let item = find_item(&rows, label);
-                assert!(!item.enabled, "{label} must remain inert");
+                assert_eq!(item.enabled, cfg!(windows) && label != "Paste");
                 assert_eq!(menu_action_kind(item.action.as_ref()), expected);
             }
         }
@@ -2573,7 +2629,7 @@ mod tests {
             PathBuf::from(r"C:\pics"),
         );
         let paste = find_item(&empty, "Paste");
-        assert!(!paste.enabled, "empty-space Paste must remain inert");
+        assert!(!paste.enabled, "empty-space Paste must remain disabled");
         assert_eq!(
             menu_action_kind(paste.action.as_ref()),
             MenuActionKind::Paste
@@ -2590,9 +2646,18 @@ mod tests {
             MenuRow::Item(item) => item.label.as_ref() != "Rename",
             MenuRow::Separator => true,
         }));
-        for label in ["Cut", "Copy", "Paste"] {
-            assert!(!find_item(&rows, label).enabled);
-        }
+        assert_eq!(find_item(&rows, "Cut").enabled, cfg!(windows));
+        assert_eq!(find_item(&rows, "Copy").enabled, cfg!(windows));
+        assert!(!find_item(&rows, "Paste").enabled);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn file_clipboard_rows_stay_disabled_off_windows() {
+        let rows = build_item_menu(&file_spec());
+        assert!(!find_item(&rows, "Cut").enabled);
+        assert!(!find_item(&rows, "Copy").enabled);
+        assert!(!find_item(&rows, "Paste").enabled);
     }
 
     #[test]
@@ -2638,8 +2703,8 @@ mod tests {
 
     fn menu_action_kind(action: Option<&MenuAction>) -> MenuActionKind {
         match action {
-            Some(MenuAction::Cut) => MenuActionKind::Cut,
-            Some(MenuAction::Copy) => MenuActionKind::Copy,
+            Some(MenuAction::Cut(_)) => MenuActionKind::Cut,
+            Some(MenuAction::Copy(_)) => MenuActionKind::Copy,
             Some(MenuAction::Paste) => MenuActionKind::Paste,
             Some(MenuAction::NewFolder) => MenuActionKind::NewFolder,
             _ => panic!("unexpected menu action"),

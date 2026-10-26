@@ -3,6 +3,7 @@
 mod app;
 mod budget;
 mod cache;
+mod clipboard;
 mod field;
 mod fs_ops;
 mod icons;
