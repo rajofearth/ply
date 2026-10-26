@@ -314,18 +314,6 @@ fn menu_row(
             }
         })
         .child(div().flex_1().child(item.label.clone()))
-        // Accelerator right column: muted hint at least 16px from the label
-        // on the same baseline row. The label flexes so hints right-align
-        // into a column; GPUI has no tabular figures, so size carries it.
-        .when(item.shortcut.is_some(), |el| {
-            el.child(
-                div()
-                    .ml(px(16.))
-                    .text_size(px(12.))
-                    .text_color(p.muted_foreground)
-                    .child(item.shortcut.clone().unwrap()),
-            )
-        })
         .when(show_chevron, |el| {
             el.child(icon(Ico::ChevronRight, px(12.), p.muted_foreground))
         })
@@ -1058,7 +1046,6 @@ mod tests {
             enabled: true,
             danger: false,
             strong: false,
-            shortcut: None,
             glyph: None,
         })
     }

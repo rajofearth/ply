@@ -34,7 +34,7 @@ type PropFacts = (
 
 /// Segoe MDL2 Symbols codepoints the overlay paints per menu row. This is the
 /// `MenuItem::glyph` contract `ui/overlay.rs` reads: rows without a mapped
-/// codepoint here (Run as admin, Pin rows, handler/sort children, List/Grid
+/// codepoint here (Run as administrator, Pin rows, handler/sort children, List/Grid
 /// checks) carry `None`.
 const GLYPH_OPEN: char = '\u{E8E5}';
 const GLYPH_OPEN_WITH: char = '\u{E7AC}';
@@ -674,9 +674,8 @@ impl Ply {
             .current_folder()
             .is_some_and(crate::recycle_bin::is_recycle_bin);
 
-        // Every row lives in the list, and rows that cannot fire are
-        // omitted instead of disabled. Cut/Copy/Paste stay out entirely
-        // until a clipboard engine exists.
+        // Every row lives in the list. Clipboard rows are intentionally
+        // visible but disabled until the Windows clipboard engine exists.
 
         // `None` means Open-with is not offered (not a file);
         // `Some` (possibly empty) drives the collapse in `build_item_menu`.
@@ -1335,18 +1334,11 @@ fn row(
     }
 }
 
-fn row_short(
-    label: impl Into<SharedString>,
-    icon: Ico,
-    action: MenuAction,
-    shortcut: &str,
-    glyph: Option<char>,
-) -> MenuRow {
-    let item = MenuItem::new(label, Some(icon), Some(action)).with_shortcut(shortcut);
-    match glyph {
-        Some(g) => item.with_glyph(g).into(),
-        None => item.into(),
-    }
+fn inert_row(label: impl Into<SharedString>, icon: Ico, action: MenuAction) -> MenuRow {
+    MenuRow::Item(MenuItem {
+        enabled: false,
+        ..MenuItem::new(label, Some(icon), Some(action))
+    })
 }
 
 fn row_with_shell(
@@ -1553,10 +1545,10 @@ struct ItemMenuSpec {
     open_with: Option<Vec<fs_ops::OpenWithApp>>,
 }
 
-/// Build the item menu rows: `[Open, Open with>] / [Open in Terminal, Pin,
-/// Rename, Copy as path, Reveal] / [Properties, Delete]` with exactly two
-/// separators. Shortcuts and shell sources are unchanged from the old inline
-/// build. Pure.
+/// Build the item menu rows: `[Open, Open with, Cut, Copy, Paste] /
+/// [Run as administrator, Open in Terminal, Pin, Rename, Copy as path, Reveal]
+/// / [Properties, Delete]` with exactly two separators. Clipboard rows are
+/// visible but inert until their implementation lands. Pure.
 fn build_item_menu(spec: &ItemMenuSpec) -> Vec<MenuRow> {
     let path = &spec.path;
     let mut rows = vec![
@@ -1568,7 +1560,6 @@ fn build_item_menu(spec: &ItemMenuSpec) -> Vec<MenuRow> {
                 Some(Ico::ExternalLink),
                 Some(MenuAction::Open(path.clone())),
             )
-            .with_shortcut("Enter")
             .with_glyph(GLYPH_OPEN)
         }
         .into(),
@@ -1620,9 +1611,16 @@ fn build_item_menu(spec: &ItemMenuSpec) -> Vec<MenuRow> {
             ));
         }
     }
+    if !spec.is_volume && !spec.browse_only {
+        rows.extend([
+            inert_row("Cut", Ico::Scissors, MenuAction::Cut),
+            inert_row("Copy", Ico::Copy, MenuAction::Copy),
+            inert_row("Paste", Ico::ClipboardPaste, MenuAction::Paste),
+        ]);
+    }
     if spec.admin {
         rows.push(row_with_shell(
-            "Run as admin",
+            "Run as administrator",
             Ico::Shield,
             MenuAction::RunAsAdmin(path.clone()),
             Some(MenuIconSource::Stock(MenuStock::Shield)),
@@ -1630,10 +1628,9 @@ fn build_item_menu(spec: &ItemMenuSpec) -> Vec<MenuRow> {
         ));
     }
     rows.push(MenuRow::Separator);
-    // Files open the terminal at their parent dir; `fs_ops::open_terminal`
-    // falls back to the parent for file paths, so both kinds share this row.
-    // The bin is browse-only, so its items keep no Terminal row, as before.
-    if !spec.multi && spec.writable && (spec.is_dir || !spec.is_volume) && !spec.browse_only {
+    // Terminal is a folder promotion. The bin is browse-only, so its items
+    // keep no Terminal row.
+    if !spec.multi && spec.writable && spec.is_dir && !spec.is_volume && !spec.browse_only {
         rows.push(row_with_shell(
             "Open in Terminal",
             Ico::Terminal,
@@ -1660,19 +1657,17 @@ fn build_item_menu(spec: &ItemMenuSpec) -> Vec<MenuRow> {
         });
     }
     if !spec.multi && spec.writable && !spec.is_volume && !spec.browse_only {
-        rows.push(row_short(
+        rows.push(row(
             "Rename",
             Ico::Pencil,
             MenuAction::Rename(path.clone()),
-            "F2",
             Some(GLYPH_RENAME),
         ));
     }
-    rows.push(row_short(
+    rows.push(row(
         "Copy as path",
         Ico::Copy,
         MenuAction::CopyPath(path.clone()),
-        "Ctrl+Shift+C",
         Some(GLYPH_COPY_PATH),
     ));
     if spec.reveal {
@@ -1687,11 +1682,10 @@ fn build_item_menu(spec: &ItemMenuSpec) -> Vec<MenuRow> {
     rows.push(MenuRow::Separator);
     // Glyph-only: no shell stock source, just the MDL2 codepoint plus the
     // lucide fallback.
-    rows.push(row_short(
+    rows.push(row(
         "Properties",
         Ico::Info,
         MenuAction::Properties(path.clone()),
-        "Alt+Enter",
         Some(GLYPH_PROPERTIES),
     ));
     if !spec.is_volume && !spec.browse_only && spec.trash {
@@ -1708,7 +1702,6 @@ fn build_item_menu(spec: &ItemMenuSpec) -> Vec<MenuRow> {
                 Some(MenuAction::Delete(spec.targets.clone())),
             )
             .danger()
-            .with_shortcut("Del")
             .with_glyph(GLYPH_DELETE)
             .into(),
         );
@@ -1717,7 +1710,7 @@ fn build_item_menu(spec: &ItemMenuSpec) -> Vec<MenuRow> {
 }
 
 /// Build the empty-space menu rows: `[View>, Sort by>, Refresh] /
-/// [New folder] / [Open in Terminal, Properties]`. List/Grid children keep
+/// [New > Folder, Paste] / [Terminal, Properties]`. List/Grid children keep
 /// their checks and carry no glyph. Pure.
 fn build_empty_menu(
     view: ViewMode,
@@ -1761,21 +1754,26 @@ fn build_empty_menu(
             Some(GLYPH_REFRESH),
         ),
     ];
-    // "New" was a flyout with a single child; a direct row says the same.
     if writable {
         rows.push(MenuRow::Separator);
-        rows.push(row_with_shell(
-            "New folder",
+        rows.push(flyout(
+            "New",
             Ico::FolderPlus,
-            MenuAction::NewFolder,
-            Some(MenuIconSource::Stock(MenuStock::Folder)),
+            vec![row_with_shell(
+                "Folder",
+                Ico::FolderPlus,
+                MenuAction::NewFolder,
+                Some(MenuIconSource::Stock(MenuStock::Folder)),
+                Some(GLYPH_NEW_FOLDER),
+            )],
             Some(GLYPH_NEW_FOLDER),
         ));
     }
+    rows.push(inert_row("Paste", Ico::ClipboardPaste, MenuAction::Paste));
     rows.push(MenuRow::Separator);
     if writable {
         rows.push(row_with_shell(
-            "Open in Terminal",
+            "Terminal",
             Ico::Terminal,
             MenuAction::OpenInTerminal(folder.clone()),
             Some(MenuIconSource::Path(fs_ops::terminal_exe_path())),
@@ -1859,7 +1857,6 @@ fn build_sidebar_menu(spec: &SidebarMenuSpec) -> Vec<MenuRow> {
                 Some(Ico::ExternalLink),
                 Some(MenuAction::Open(path.clone())),
             )
-            .with_shortcut("Enter")
             .with_glyph(GLYPH_OPEN)
         }
         .into(),
@@ -1895,11 +1892,10 @@ fn build_sidebar_menu(spec: &SidebarMenuSpec) -> Vec<MenuRow> {
                     )
                 });
             }
-            rows.push(row_short(
+            rows.push(row(
                 copy_label,
                 Ico::Copy,
                 MenuAction::CopyPath(path.clone()),
-                "Ctrl+Shift+C",
                 Some(GLYPH_COPY_PATH),
             ));
             rows.push(row_with_shell(
@@ -1910,11 +1906,10 @@ fn build_sidebar_menu(spec: &SidebarMenuSpec) -> Vec<MenuRow> {
                 Some(GLYPH_REVEAL),
             ));
             rows.push(MenuRow::Separator);
-            rows.push(row_short(
+            rows.push(row(
                 "Properties",
                 Ico::Info,
                 MenuAction::Properties(path.clone()),
-                "Alt+Enter",
                 Some(GLYPH_PROPERTIES),
             ));
             if spec.kind == SidebarKind::Folder {
@@ -1925,26 +1920,23 @@ fn build_sidebar_menu(spec: &SidebarMenuSpec) -> Vec<MenuRow> {
                         Some(MenuAction::Delete(vec![path.clone()])),
                     )
                     .danger()
-                    .with_shortcut("Del")
                     .with_glyph(GLYPH_DELETE)
                     .into(),
                 );
             }
         }
         SidebarKind::Device => {
-            rows.push(row_short(
+            rows.push(row(
                 copy_label,
                 Ico::Copy,
                 MenuAction::CopyPath(path.clone()),
-                "Ctrl+Shift+C",
                 Some(GLYPH_COPY_PATH),
             ));
             rows.push(MenuRow::Separator);
-            rows.push(row_short(
+            rows.push(row(
                 "Properties",
                 Ico::Info,
                 MenuAction::Properties(path.clone()),
-                "Alt+Enter",
                 Some(GLYPH_PROPERTIES),
             ));
         }
@@ -2371,8 +2363,10 @@ mod tests {
             [
                 "Open",
                 "Open with…",
+                "Cut",
+                "Copy",
+                "Paste",
                 "<sep>",
-                "Open in Terminal",
                 "Rename",
                 "Copy as path",
                 "Reveal in Explorer",
@@ -2390,6 +2384,9 @@ mod tests {
             row_labels(&rows),
             [
                 "Open",
+                "Cut",
+                "Copy",
+                "Paste",
                 "<sep>",
                 "Open in Terminal",
                 "Add to Quick Access",
@@ -2401,6 +2398,100 @@ mod tests {
                 "Delete",
             ]
         );
+    }
+
+    #[test]
+    fn clipboard_rows_are_visible_but_inert() {
+        for rows in [build_item_menu(&file_spec()), build_item_menu(&dir_spec())] {
+            for (label, expected) in [
+                ("Cut", MenuActionKind::Cut),
+                ("Copy", MenuActionKind::Copy),
+                ("Paste", MenuActionKind::Paste),
+            ] {
+                let item = find_item(&rows, label);
+                assert!(!item.enabled, "{label} must remain inert");
+                assert_eq!(menu_action_kind(item.action.as_ref()), expected);
+            }
+        }
+
+        let empty = build_empty_menu(
+            ViewMode::List,
+            SortKey::default(),
+            true,
+            PathBuf::from(r"C:\pics"),
+        );
+        let paste = find_item(&empty, "Paste");
+        assert!(!paste.enabled, "empty-space Paste must remain inert");
+        assert_eq!(
+            menu_action_kind(paste.action.as_ref()),
+            MenuActionKind::Paste
+        );
+    }
+
+    #[test]
+    fn multi_selection_drops_rename_but_keeps_clipboard_rows() {
+        let mut spec = file_spec();
+        spec.multi = true;
+        spec.targets = vec![PathBuf::from(r"C:\a.txt"), PathBuf::from(r"C:\b.txt")];
+        let rows = build_item_menu(&spec);
+        assert!(rows.iter().all(|row| match row {
+            MenuRow::Item(item) => item.label.as_ref() != "Rename",
+            MenuRow::Separator => true,
+        }));
+        for label in ["Cut", "Copy", "Paste"] {
+            assert!(!find_item(&rows, label).enabled);
+        }
+    }
+
+    #[test]
+    fn admin_and_new_promotions_use_locked_labels() {
+        let mut file = file_spec();
+        file.admin = true;
+        assert!(
+            find_item(&build_item_menu(&file), "Run as administrator")
+                .action
+                .is_some()
+        );
+
+        let empty = build_empty_menu(
+            ViewMode::List,
+            SortKey::default(),
+            true,
+            PathBuf::from(r"C:\pics"),
+        );
+        let new = find_item(&empty, "New");
+        assert_eq!(
+            new.children
+                .iter()
+                .filter_map(|row| match row {
+                    MenuRow::Item(item) => Some(item.label.as_ref()),
+                    MenuRow::Separator => None,
+                })
+                .collect::<Vec<_>>(),
+            ["Folder"]
+        );
+        assert_eq!(
+            menu_action_kind(find_item(&new.children, "Folder").action.as_ref()),
+            MenuActionKind::NewFolder
+        );
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum MenuActionKind {
+        Cut,
+        Copy,
+        Paste,
+        NewFolder,
+    }
+
+    fn menu_action_kind(action: Option<&MenuAction>) -> MenuActionKind {
+        match action {
+            Some(MenuAction::Cut) => MenuActionKind::Cut,
+            Some(MenuAction::Copy) => MenuActionKind::Copy,
+            Some(MenuAction::Paste) => MenuActionKind::Paste,
+            Some(MenuAction::NewFolder) => MenuActionKind::NewFolder,
+            _ => panic!("unexpected menu action"),
+        }
     }
 
     #[test]
@@ -2425,8 +2516,8 @@ mod tests {
         assert_eq!(glyph(&empty, "View"), Some('\u{E890}'));
         assert_eq!(glyph(&empty, "Sort by"), Some('\u{E8CB}'));
         assert_eq!(glyph(&empty, "Refresh"), Some('\u{E72C}'));
-        assert_eq!(glyph(&empty, "New folder"), Some('\u{E8F4}'));
-        assert_eq!(glyph(&empty, "Open in Terminal"), Some('\u{E756}'));
+        assert_eq!(glyph(&empty, "New"), Some('\u{E8F4}'));
+        assert_eq!(glyph(&empty, "Terminal"), Some('\u{E756}'));
         assert_eq!(glyph(&empty, "Properties"), Some('\u{E946}'));
     }
 
@@ -2445,9 +2536,10 @@ mod tests {
                 "Sort by",
                 "Refresh",
                 "<sep>",
-                "New folder",
+                "New",
+                "Paste",
                 "<sep>",
-                "Open in Terminal",
+                "Terminal",
                 "Properties",
             ]
         );
@@ -2934,14 +3026,12 @@ mod tests {
         assert!(delete.shell.is_none(), "Delete must not use a stock icon");
         assert_eq!(delete.glyph, Some('\u{E74D}'));
         assert!(delete.danger);
-        assert_eq!(delete.shortcut, Some(SharedString::from("Del")));
     }
 
     #[test]
-    fn copy_row_renamed_with_shortcut_unchanged() {
+    fn copy_row_keeps_the_new_label() {
         let rows = build_item_menu(&file_spec());
         let copy = find_item(&rows, "Copy as path");
-        assert_eq!(copy.shortcut, Some(SharedString::from("Ctrl+Shift+C")));
         assert_eq!(copy.glyph, Some('\u{E8C8}'));
         assert!(
             rows.iter().all(|row| match row {
@@ -2952,18 +3042,20 @@ mod tests {
         );
     }
     #[test]
-    fn terminal_row_covers_files_at_their_parent() {
-        // Files share the row; `fs_ops::open_terminal` falls back to the
-        // parent dir for file paths, so the action keeps the file path.
+    fn terminal_row_promotes_folders_only() {
         let file_rows = build_item_menu(&file_spec());
-        let term = find_item(&file_rows, "Open in Terminal");
         assert!(
-            matches!(term.action, Some(MenuAction::OpenInTerminal(_))),
-            "files must offer Open in Terminal"
+            file_rows.iter().all(|row| match row {
+                MenuRow::Item(item) => item.label.as_ref() != "Open in Terminal",
+                MenuRow::Separator => true,
+            }),
+            "files must not offer Open in Terminal"
         );
+        let dir_rows = build_item_menu(&dir_spec());
+        let term = find_item(&dir_rows, "Open in Terminal");
+        assert!(matches!(term.action, Some(MenuAction::OpenInTerminal(_))));
         assert_eq!(term.glyph, Some('\u{E756}'));
-        // Still a single-target row: multi-select hides it like before.
-        let mut multi_spec = file_spec();
+        let mut multi_spec = dir_spec();
         multi_spec.multi = true;
         multi_spec.targets = vec![PathBuf::from(r"C:\a.txt"), PathBuf::from(r"C:\b.txt")];
         assert!(
@@ -2973,10 +3065,7 @@ mod tests {
             }),
             "multi-select must not offer Open in Terminal"
         );
-        // Browse-only bin items keep no Terminal row, as before the files
-        // expansion: every bin entry is a file, so without this gate the
-        // expansion would add the row there.
-        let mut bin_spec = file_spec();
+        let mut bin_spec = dir_spec();
         bin_spec.browse_only = true;
         assert!(
             build_item_menu(&bin_spec).iter().all(|row| match row {
@@ -3132,7 +3221,6 @@ mod tests {
         let delete = find_item(&rows, "Delete");
         assert!(delete.danger);
         assert!(delete.shell.is_none(), "Delete stays glyph-only");
-        assert_eq!(delete.shortcut, Some(SharedString::from("Del")));
         let MenuAction::Delete(targets) = delete.action.clone().unwrap() else {
             panic!("Delete must carry its target");
         };

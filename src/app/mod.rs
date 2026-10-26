@@ -130,8 +130,6 @@ pub struct MenuItem {
     pub enabled: bool,
     pub danger: bool,
     pub strong: bool,
-    /// Right-aligned accelerator hint the overlay paints (`"Enter"`, `"Del"`).
-    pub shortcut: Option<SharedString>,
     /// Segoe MDL2 Symbols codepoint the overlay paints for this row
     /// (`'\u{E890}'` View, `'\u{E8CB}'` Sort by, `'\u{E8F4}'` New folder,
     /// `'\u{E7AC}'` Open with / Choose another app, `'\u{E8AC}'` Rename,
@@ -161,7 +159,6 @@ impl MenuItem {
             enabled: true,
             danger: false,
             strong: false,
-            shortcut: None,
             glyph: None,
         }
     }
@@ -176,13 +173,6 @@ impl MenuItem {
     pub(super) fn danger(self) -> Self {
         Self {
             danger: true,
-            ..self
-        }
-    }
-
-    pub(super) fn with_shortcut(self, shortcut: impl Into<SharedString>) -> Self {
-        Self {
-            shortcut: Some(shortcut.into()),
             ..self
         }
     }
@@ -211,8 +201,8 @@ pub enum MenuAction {
     OpenWithHandler(PathBuf, String),
     RunAsAdmin(PathBuf),
     OpenInTerminal(PathBuf),
-    // Kept for the clipboard/pin engine that does not exist yet: no menu
-    // builds these rows today, `run` still honours them when it returns.
+    // Clipboard rows are visible but disabled until the clipboard engine
+    // exists; `run` still keeps the future actions as explicit variants.
     #[allow(dead_code)]
     Pin(PathBuf),
     #[allow(dead_code)]
@@ -971,14 +961,6 @@ mod tests {
             flyout: None,
             selected: None,
         }
-    }
-
-    #[test]
-    fn menu_item_shortcut_defaults_none_and_builder_sets() {
-        let plain = super::MenuItem::new("Open", None, None);
-        assert!(plain.shortcut.is_none());
-        let with = super::MenuItem::new("Delete", None, None).with_shortcut("Del");
-        assert_eq!(with.shortcut, Some(gpui::SharedString::from("Del")));
     }
 
     #[test]
