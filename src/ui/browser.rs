@@ -548,13 +548,20 @@ fn activate(
 ) -> impl Fn(&ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static {
     cx.listener(move |this, ev: &ClickEvent, window, cx| {
         cx.stop_propagation();
-        if ev.click_count() >= 2 {
+        if is_double_click(ev.click_count()) {
             this.activate(&path, window, cx);
             return;
         }
         let m = ev.modifiers();
         this.click_row(ix, m.shift, m.secondary(), cx);
     })
+}
+
+/// Only the second click in a counted sequence opens an Entry. Windows can
+/// report a third or later click count when the user keeps clicking quickly;
+/// those clicks must not launch the default app again.
+fn is_double_click(click_count: usize) -> bool {
+    click_count == 2
 }
 
 fn context_menu(
@@ -704,5 +711,13 @@ mod tests {
         assert_eq!(end, 10, "should not exceed total");
         let start = 2usize.saturating_sub(PREFETCH_OVERSCAN);
         assert_eq!(start, 0, "should not underflow zero");
+    }
+
+    #[test]
+    fn only_the_second_click_opens_an_entry() {
+        assert!(!is_double_click(1));
+        assert!(is_double_click(2));
+        assert!(!is_double_click(3));
+        assert!(!is_double_click(0));
     }
 }
