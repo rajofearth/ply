@@ -10,6 +10,7 @@ mod icons;
 mod listing;
 mod mtp;
 mod path_caps;
+mod quicklook;
 mod recycle_bin;
 mod theme;
 mod thumbs;
@@ -23,7 +24,7 @@ use app::Ply;
 use ui::{
     Activate, BeginRename, CopySelectedPath, DeleteSelection, Dismiss, ExtendDown, ExtendLeft,
     ExtendRight, ExtendUp, FocusFilter, GoBack, GoForward, GoHome, GoUp, Refresh, SelectDown,
-    SelectLeft, SelectRight, SelectUp, ToggleTheme,
+    SelectLeft, SelectRight, SelectUp, ToggleQuickLook, ToggleTheme,
 };
 
 // Context-menu keyboard actions, driven by the overlay's selection model
@@ -51,6 +52,7 @@ fn main() {
                 KeyBinding::new("alt-home", GoHome, Some("Ply")),
                 KeyBinding::new("escape", Dismiss, Some("Ply")),
                 KeyBinding::new("enter", Activate, Some("Ply")),
+                KeyBinding::new("space", ToggleQuickLook, Some("Ply")),
                 KeyBinding::new("f2", BeginRename, Some("Ply")),
                 KeyBinding::new("delete", DeleteSelection, Some("Ply")),
                 KeyBinding::new("up", SelectUp, Some("Ply")),

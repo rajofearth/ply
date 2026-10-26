@@ -1,10 +1,13 @@
 use gpui::{
-    AnyElement, Context, FontWeight, InteractiveElement, IntoElement, ParentElement,
-    StatefulInteractiveElement, Styled, anchored, deferred, div, prelude::FluentBuilder, px,
+    AnyElement, Context, FontWeight, InteractiveElement, IntoElement, ObjectFit, ParentElement,
+    StatefulInteractiveElement, Styled, StyledImage, anchored, deferred, div, img,
+    prelude::FluentBuilder, px,
 };
 
 use super::{glyph_icon, icon, icon_slot, thumb_img};
-use crate::app::{LoadState, MenuAction, MenuIconSource, MenuItem, MenuRow, MenuStock, Ply};
+use crate::app::{
+    LoadState, MenuAction, MenuIconSource, MenuItem, MenuRow, MenuStock, Ply, QuickLookContent,
+};
 use crate::icons::Ico;
 
 /// The layers that float above the panes: context menu, then Properties.
@@ -13,6 +16,9 @@ pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> Vec<AnyElement> {
     if let Some(menu) = context_menu(ply, cx) {
         layers.push(menu);
     }
+    if let Some(look) = quick_look(ply, cx) {
+        layers.push(look);
+    }
     if let Some(dialog) = properties(ply, cx) {
         layers.push(dialog);
     }
@@ -20,6 +26,176 @@ pub fn render(ply: &Ply, cx: &mut Context<Ply>) -> Vec<AnyElement> {
         layers.push(dialog);
     }
     layers
+}
+
+fn quick_look(ply: &Ply, cx: &mut Context<Ply>) -> Option<AnyElement> {
+    let look = ply.quick_look.as_ref()?;
+    let p = ply.palette();
+    let path = look.path.clone();
+    let name = look.name.clone();
+    let content = match &look.content {
+        QuickLookContent::Loading => div()
+            .h(px(430.))
+            .w(px(760.))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(12.))
+            .text_color(p.muted_foreground)
+            .child(quick_look_artwork(ply, &path, cx))
+            .child("Loading…")
+            .into_any_element(),
+        QuickLookContent::Text { text, truncated } => div()
+            .id("quicklook-text")
+            .h(px(430.))
+            .w(px(760.))
+            .overflow_y_scroll()
+            .p(px(14.))
+            .text_size(px(12.))
+            .font(crate::theme::ui_font())
+            .child(text.clone())
+            .when(*truncated, |el| {
+                el.child(
+                    div()
+                        .pt(px(10.))
+                        .text_color(p.muted_foreground)
+                        .child("Preview is bounded; open the file for the complete contents."),
+                )
+            })
+            .into_any_element(),
+        QuickLookContent::Image(image) => div()
+            .h(px(430.))
+            .w(px(760.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                img(image.clone())
+                    .size_full()
+                    .object_fit(ObjectFit::Contain),
+            )
+            .into_any_element(),
+        QuickLookContent::Fallback => {
+            let entry = match &ply.listing {
+                LoadState::Ready(snapshot) => {
+                    snapshot.entries.iter().find(|entry| entry.path == path)
+                }
+                _ => None,
+            };
+            let kind = entry.map(crate::listing::kind_label).unwrap_or("File");
+            let size = entry
+                .map(|entry| crate::listing::format_size(entry.size))
+                .unwrap_or_else(|| "—".to_string());
+            let modified = entry
+                .map(|entry| crate::listing::format_mtime(entry.modified, chrono::Local::now()))
+                .unwrap_or_else(|| "—".to_string());
+            let open_path = path.clone();
+            div()
+                .h(px(430.))
+                .w(px(760.))
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(12.))
+                .child(quick_look_artwork(ply, &path, cx))
+                .child(
+                    div()
+                        .text_color(p.muted_foreground)
+                        .child("No Quick Look preview for this file."),
+                )
+                .child(
+                    div()
+                        .text_color(p.muted_foreground)
+                        .child(format!("Type: {kind}")),
+                )
+                .child(
+                    div()
+                        .text_color(p.muted_foreground)
+                        .child(format!("Size: {size}  ·  Modified: {modified}")),
+                )
+                .child(div().flex().gap(px(8.)).child(dialog_button(
+                    "quicklook-open",
+                    "Open".into(),
+                    DialogButtonVariant::Default,
+                    p,
+                    cx.listener(move |this, _, window, cx| {
+                        this.close_quick_look(cx);
+                        this.activate(&open_path, window, cx);
+                    }),
+                )))
+                .into_any_element()
+        }
+    };
+    Some(
+        deferred(
+            div()
+                .id("quicklook-scrim")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(p.overlay)
+                .on_click(cx.listener(|this, _, _, cx| this.close_quick_look(cx)))
+                .child(
+                    div()
+                        .occlude()
+                        .w(px(800.))
+                        .bg(p.card)
+                        .border_1()
+                        .border_color(p.border)
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .px(px(14.))
+                                .py(px(10.))
+                                .border_b_1()
+                                .border_color(p.border)
+                                .child(div().truncate().child(name))
+                                .child(
+                                    div()
+                                        .id("close-quicklook")
+                                        .cursor_default()
+                                        .child(icon(Ico::X, px(14.), p.muted_foreground))
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.close_quick_look(cx)),
+                                        ),
+                                ),
+                        )
+                        .child(content),
+                ),
+        )
+        .into_any_element(),
+    )
+}
+
+/// Keep the fallback artwork stable while a rich Quick Look request is in
+/// flight. A replaced link-like path never enters the shell probe.
+fn quick_look_artwork(ply: &Ply, path: &std::path::Path, cx: &mut Context<Ply>) -> AnyElement {
+    let kind = match &ply.listing {
+        LoadState::Ready(snapshot) => snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.path == path)
+            .map(crate::listing::kind_label)
+            .unwrap_or("File"),
+        _ => "File",
+    };
+    let fallback = properties_fallback(ply, path, kind);
+    if crate::quicklook::is_link_like(path) {
+        return icon(fallback, px(56.), ply.palette().muted_foreground).into_any_element();
+    }
+    match probe_shell_target(ply, path, cx) {
+        crate::thumbs::IconProbe::Ready(image) => thumb_img(&image, 56.).into_any_element(),
+        crate::thumbs::IconProbe::Loading => icon_slot(56.).into_any_element(),
+        crate::thumbs::IconProbe::Glyph => {
+            icon(fallback, px(56.), ply.palette().muted_foreground).into_any_element()
+        }
+    }
 }
 
 fn context_menu(ply: &Ply, cx: &mut Context<Ply>) -> Option<AnyElement> {

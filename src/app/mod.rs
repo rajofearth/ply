@@ -13,8 +13,8 @@ use crate::field::{
     FieldPaste, FieldSelectAll, FieldState,
 };
 use gpui::{
-    App, Context, Entity, FocusHandle, KeyBinding, Pixels, Point, SharedString, Task, Window,
-    prelude::*,
+    App, Context, Entity, FocusHandle, KeyBinding, Pixels, Point, RenderImage, SharedString, Task,
+    Window, prelude::*,
 };
 
 use crate::listing::{Snapshot, SortKey};
@@ -290,6 +290,22 @@ pub struct Properties {
     pub details: Vec<(SharedString, SharedString)>,
 }
 
+/// The separate, ephemeral Quick Look layer. It is intentionally not part of
+/// `ThumbCache`: one selected file owns one bounded request and no rich data is
+/// persisted.
+pub struct QuickLook {
+    pub path: PathBuf,
+    pub name: SharedString,
+    pub content: QuickLookContent,
+}
+
+pub enum QuickLookContent {
+    Loading,
+    Text { text: SharedString, truncated: bool },
+    Image(Arc<RenderImage>),
+    Fallback,
+}
+
 /// Arguments for [`props_from_fields`]: the facts the Properties dialog
 /// shows, gathered from a real Entry or Volume — never a stub.
 pub struct PropsFields {
@@ -403,6 +419,7 @@ pub struct Ply {
     /// Source of unique menu tokens used by lazy Open-with completions.
     next_menu_token: u64,
     pub properties: Option<Properties>,
+    pub quick_look: Option<QuickLook>,
     pub confirm: Option<ConfirmDialog>,
     pub rename: Option<Rename>,
     pub status: Option<SharedString>,
@@ -414,6 +431,9 @@ pub struct Ply {
     /// the previous walk's I/O early.
     props_generation: u64,
     props_walk_cancel: Arc<AtomicBool>,
+    quick_look_generation: u64,
+    quick_look_cancel: Arc<AtomicBool>,
+    quick_look_task: Option<Task<()>>,
     watch: Option<FolderWatch>,
     pub focus: FocusHandle,
 
@@ -533,6 +553,7 @@ impl Ply {
             menu: None,
             next_menu_token: 0,
             properties: None,
+            quick_look: None,
             confirm: None,
             rename: None,
             status: None,
@@ -540,6 +561,9 @@ impl Ply {
             list_task: None,
             props_generation: 0,
             props_walk_cancel: Arc::new(AtomicBool::new(false)),
+            quick_look_generation: 0,
+            quick_look_cancel: Arc::new(AtomicBool::new(false)),
+            quick_look_task: None,
             watch: None,
             focus: cx.focus_handle(),
             thumbs: cx.new(|_| crate::thumbs::ThumbCache::new()),
@@ -766,6 +790,8 @@ impl StormGate {
 pub fn dismiss_topmost(ply: &mut Ply, cx: &mut Context<Ply>) {
     if ply.confirm.is_some() {
         ply.cancel_confirm(cx);
+    } else if ply.quick_look.is_some() {
+        ply.close_quick_look(cx);
     } else if ply.properties.is_some() {
         ply.close_properties(cx);
     } else if ply.menu.is_some() {

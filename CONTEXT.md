@@ -72,8 +72,11 @@ _Avoid_: launch, execute, preview
 
 **Properties**:
 The modal showing one Entry's or Volume's type, size, mtime, and Path. Built
-from a real Entry or Volume — never a stub. It replaced the old preview pane;
-Ply never renders file contents.
+from a real Entry or Volume — never a stub. It replaced the old preview pane.
+Quick Look is the explicit exception: Space may open one bounded, read-only
+local-file overlay. The first slice handles bounded text and WIC images only;
+unsupported kinds use shell artwork plus metadata/Open fallbacks. Rich
+PDF/Office/media handlers remain deferred.
 _Avoid_: details pane, inspector, preview, Location (that word is navigation)
 
 **Hidden Entry**:

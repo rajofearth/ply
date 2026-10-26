@@ -33,6 +33,7 @@ Set `PLY_BUDGET_REQUIRE_RAM=1` to make that measurement assert.
 | --- | --- |
 | `d` | Toggle light / dark |
 | `Enter` | Open (folder → navigate, file → OS default app) |
+| `Space` | Quick Look one selected local file (bounded text / WIC image; otherwise metadata/Open fallback) |
 | `↑` / `↓` | Move selection |
 | `Shift+↑` / `Shift+↓` | Extend selection |
 | `Alt+←` / `Backspace` | Back |

@@ -419,6 +419,7 @@ impl Ply {
     // ---- selection --------------------------------------------------------
 
     pub(super) fn clear_selection_paths(&mut self) {
+        self.invalidate_quick_look();
         self.selection.clear();
         self.selection_set.clear();
     }
@@ -439,6 +440,7 @@ impl Ply {
     }
 
     fn replace_selection(&mut self, paths: Vec<PathBuf>) {
+        self.invalidate_quick_look();
         self.selection_set = paths.iter().cloned().collect();
         self.selection = paths;
     }
@@ -478,6 +480,7 @@ impl Ply {
                 self.replace_selection(paths);
             }
             Click::Toggle(path) => {
+                self.invalidate_quick_look();
                 match self.selection.iter().position(|p| *p == path) {
                     Some(at) => {
                         let removed = self.selection.remove(at);
@@ -592,6 +595,130 @@ impl Ply {
         cx.notify();
     }
 
+    /// Toggle the bounded Quick Look overlay for exactly one local regular file.
+    /// The old request is dropped before a new one is submitted, so there is no
+    /// application-level queue; the cancellation flag and generation protect
+    /// the short period before a background decoder observes cancellation.
+    pub fn toggle_quick_look(&mut self, cx: &mut Context<Self>) {
+        if self.quick_look.is_some() {
+            self.close_quick_look(cx);
+            return;
+        }
+        let Some(path) = self.selected_local_file() else {
+            return;
+        };
+        self.invalidate_quick_look();
+        self.quick_look_generation = self.quick_look_generation.wrapping_add(1);
+        let generation = self.quick_look_generation;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.quick_look_cancel = cancel.clone();
+        let name = self.display_name(&path);
+        let request_stamp = crate::quicklook::stamp(&path).ok();
+        self.quick_look = Some(super::QuickLook {
+            path: path.clone(),
+            name,
+            content: if request_stamp.is_some() {
+                super::QuickLookContent::Loading
+            } else {
+                // The listing still gives us safe metadata and the shell
+                // fallback can render without a fresh filesystem stamp.
+                super::QuickLookContent::Fallback
+            },
+        });
+
+        let Some(request_stamp) = request_stamp else {
+            cx.notify();
+            return;
+        };
+
+        let worker_path = path.clone();
+        let worker_cancel = cancel.clone();
+        self.quick_look_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(
+                    async move { crate::quicklook::load(&worker_path, &worker_cancel) },
+                )
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.quick_look_generation != generation
+                    || this
+                        .quick_look
+                        .as_ref()
+                        .is_none_or(|look| look.path != path)
+                {
+                    return;
+                }
+                if crate::quicklook::load_result_is_stale(&result, &request_stamp) {
+                    this.invalidate_quick_look();
+                    return;
+                }
+                this.quick_look_task = None;
+                let content = match result {
+                    Ok(loaded) => match loaded.data {
+                        crate::quicklook::PreviewData::Text { text, truncated } => {
+                            super::QuickLookContent::Text {
+                                text: text.into(),
+                                truncated,
+                            }
+                        }
+                        crate::quicklook::PreviewData::Image {
+                            pixels,
+                            width,
+                            height,
+                        } => crate::thumbs::to_render_image_rgba(pixels, width, height)
+                            .map(super::QuickLookContent::Image)
+                            .unwrap_or(super::QuickLookContent::Fallback),
+                        crate::quicklook::PreviewData::Fallback => {
+                            super::QuickLookContent::Fallback
+                        }
+                    },
+                    Err(crate::quicklook::LoadError::Io) => super::QuickLookContent::Fallback,
+                    Err(crate::quicklook::LoadError::Changed) => {
+                        unreachable!("changed Quick Look result was rejected above")
+                    }
+                };
+                if let Some(look) = this.quick_look.as_mut() {
+                    look.content = content;
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    pub fn close_quick_look(&mut self, cx: &mut Context<Self>) {
+        let was_open = self.quick_look.is_some();
+        self.invalidate_quick_look();
+        if was_open {
+            cx.notify();
+        }
+    }
+
+    fn invalidate_quick_look(&mut self) {
+        self.quick_look_generation = self.quick_look_generation.wrapping_add(1);
+        self.quick_look_cancel.store(true, Ordering::Relaxed);
+        self.quick_look_cancel = Arc::new(AtomicBool::new(false));
+        self.quick_look_task.take();
+        self.quick_look = None;
+    }
+
+    fn selected_local_file(&self) -> Option<PathBuf> {
+        if self.selection.len() != 1 {
+            return None;
+        }
+        let path = self.selection.last()?;
+        if crate::path_caps::is_portable(path)
+            || crate::recycle_bin::is_recycle_bin(path)
+            || crate::quicklook::is_link_like(path)
+            || self
+                .listing_entry(path)
+                .is_none_or(|entry| !crate::quicklook::entry_allows_preview(&entry.kind))
+        {
+            return None;
+        }
+        Some(path.clone())
+    }
+
     /// Open whatever is selected: folders navigate, files go to the OS.
     pub fn activate_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(path) = self.selection.last().cloned() else {
@@ -601,6 +728,9 @@ impl Ply {
     }
 
     pub fn activate(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quick_look.is_some() {
+            return;
+        }
         if self
             .current_folder()
             .is_some_and(crate::recycle_bin::is_recycle_bin)
@@ -649,6 +779,7 @@ impl Ply {
     // ---- menu, properties, file operations --------------------------------
 
     pub fn open_menu(&mut self, at: Point<Pixels>, path: PathBuf, cx: &mut Context<Self>) {
+        self.invalidate_quick_look();
         if !self.is_selected(&path) {
             self.replace_selection(vec![path.clone()]);
         }
@@ -700,6 +831,7 @@ impl Ply {
     }
 
     pub fn open_empty_menu(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        self.invalidate_quick_look();
         let Some(folder) = self.current_folder().map(Path::to_path_buf) else {
             return;
         };
@@ -719,6 +851,7 @@ impl Ply {
     // Allowed until the parent wires the rail to this entry point.
     #[allow(dead_code)]
     pub fn open_sidebar_menu(&mut self, at: Point<Pixels>, path: PathBuf, cx: &mut Context<Self>) {
+        self.invalidate_quick_look();
         let Some(spec) = classify_sidebar(&path, &self.volumes, &self.quick_access) else {
             return;
         };
@@ -850,6 +983,9 @@ impl Ply {
     }
 
     pub fn run(&mut self, action: MenuAction, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quick_look.is_some() {
+            return;
+        }
         self.menu = None;
         match action {
             MenuAction::Open(path) => self.activate(&path, window, cx),
@@ -945,6 +1081,9 @@ impl Ply {
     }
 
     pub fn begin_rename(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quick_look.is_some() {
+            return;
+        }
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -1009,6 +1148,9 @@ impl Ply {
     /// asks the user to confirm a permanent delete first, like Explorer.
     /// Drive/device/Recycle-Bin roots are refused outright.
     pub fn delete(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if self.quick_look.is_some() {
+            return;
+        }
         // Browsing the Recycle Bin is read-only: its items carry shell parsing IDs,
         // not trashable filesystem paths, so going through the normal delete would
         // mis-target them.
@@ -1128,6 +1270,7 @@ impl Ply {
     }
 
     pub fn show_properties(&mut self, path: &Path, cx: &mut Context<Self>) {
+        self.invalidate_quick_look();
         // Every open starts a new Properties generation. Async fills capture
         // it and drop their result once this dialog closes, is replaced, or
         // reopens for the same path.

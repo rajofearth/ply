@@ -1408,8 +1408,26 @@ fn fit_thumb_to(bytes: Vec<u8>, w: u32, h: u32, cap: u32) -> Option<(Vec<u8>, u3
 }
 
 /// Build a `RenderImage` from decoded RGBA, fitting to `cap` first.
-fn to_render_image_sized(bytes: Vec<u8>, w: u32, h: u32, cap: u32) -> Option<Arc<RenderImage>> {
+pub(crate) fn to_render_image_sized(
+    bytes: Vec<u8>,
+    w: u32,
+    h: u32,
+    cap: u32,
+) -> Option<Arc<RenderImage>> {
     let (bytes, w, h) = fit_thumb_to(bytes, w, h, cap)?;
+    let buf = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(w, h, bytes)?;
+    let frame = image::Frame::new(buf);
+    Some(Arc::new(RenderImage::new(vec![frame])))
+}
+
+/// Build a RenderImage from pixels that a background decoder has already
+/// bounded and fitted. Unlike `to_render_image_sized`, this helper never
+/// resizes or otherwise transforms the pixels.
+pub(crate) fn to_render_image_rgba(bytes: Vec<u8>, w: u32, h: u32) -> Option<Arc<RenderImage>> {
+    let expected = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
+    if w == 0 || h == 0 || bytes.len() != expected {
+        return None;
+    }
     let buf = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(w, h, bytes)?;
     let frame = image::Frame::new(buf);
     Some(Arc::new(RenderImage::new(vec![frame])))

@@ -45,6 +45,7 @@ actions!(
         Refresh,
         FocusFilter,
         CopySelectedPath,
+        ToggleQuickLook,
     ]
 );
 
@@ -189,10 +190,26 @@ impl Render for Ply {
                 }
                 this.toggle_mode(cx);
             }))
-            .on_action(cx.listener(|this, _: &GoBack, window, cx| this.go_back(window, cx)))
-            .on_action(cx.listener(|this, _: &GoForward, window, cx| this.go_forward(window, cx)))
-            .on_action(cx.listener(|this, _: &GoUp, window, cx| this.go_up(window, cx)))
-            .on_action(cx.listener(|this, _: &GoHome, window, cx| this.go_home(window, cx)))
+            .on_action(cx.listener(|this, _: &GoBack, window, cx| {
+                if this.quick_look.is_none() {
+                    this.go_back(window, cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &GoForward, window, cx| {
+                if this.quick_look.is_none() {
+                    this.go_forward(window, cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &GoUp, window, cx| {
+                if this.quick_look.is_none() {
+                    this.go_up(window, cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &GoHome, window, cx| {
+                if this.quick_look.is_none() {
+                    this.go_home(window, cx)
+                }
+            }))
             .on_action(cx.listener(|this, _: &Dismiss, _, cx| dismiss_topmost(this, cx)))
             .on_action(cx.listener(|this, _: &MenuUp, window, cx| {
                 if this.menu.is_none() || this.typing(window, cx) {
@@ -264,27 +281,45 @@ impl Render for Ply {
                     _ => {}
                 }
             }))
-            .on_action(cx.listener(|this, _: &Refresh, _, cx| this.reload(cx)))
+            .on_action(cx.listener(|this, _: &Refresh, _, cx| {
+                if this.quick_look.is_none() {
+                    this.reload(cx)
+                }
+            }))
             .on_action(cx.listener(|this, _: &Activate, window, cx| {
-                if this.menu.is_some() {
+                if this.menu.is_some() || this.quick_look.is_some() {
                     return;
                 }
                 if !this.typing(window, cx) {
                     this.activate_selection(window, cx);
                 }
             }))
+            .on_action(cx.listener(|this, _: &ToggleQuickLook, window, cx| {
+                if this.typing(window, cx)
+                    || this.menu.is_some()
+                    || this.properties.is_some()
+                    || this.confirm.is_some()
+                    || this.rename.is_some()
+                {
+                    return;
+                }
+                this.toggle_quick_look(cx);
+            }))
             .on_action(cx.listener(|this, _: &BeginRename, window, cx| {
+                if this.quick_look.is_some() {
+                    return;
+                }
                 if let Some(path) = this.selection.last().cloned() {
                     this.begin_rename(path, window, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &DeleteSelection, window, cx| {
-                if !this.typing(window, cx) {
+                if this.quick_look.is_none() && !this.typing(window, cx) {
                     this.delete_selection(cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &SelectUp, window, cx| {
-                if this.menu.is_some() {
+                if this.menu.is_some() || this.quick_look.is_some() {
                     return;
                 }
                 if !this.typing(window, cx) {
@@ -297,7 +332,7 @@ impl Render for Ply {
                 }
             }))
             .on_action(cx.listener(|this, _: &SelectDown, window, cx| {
-                if this.menu.is_some() {
+                if this.menu.is_some() || this.quick_look.is_some() {
                     return;
                 }
                 if !this.typing(window, cx) {
@@ -310,7 +345,7 @@ impl Render for Ply {
                 }
             }))
             .on_action(cx.listener(|this, _: &SelectLeft, window, cx| {
-                if this.menu.is_some() {
+                if this.menu.is_some() || this.quick_look.is_some() {
                     return;
                 }
                 if !this.typing(window, cx) && this.view == ViewMode::Grid {
@@ -319,7 +354,7 @@ impl Render for Ply {
                 }
             }))
             .on_action(cx.listener(|this, _: &SelectRight, window, cx| {
-                if this.menu.is_some() {
+                if this.menu.is_some() || this.quick_look.is_some() {
                     return;
                 }
                 if !this.typing(window, cx) && this.view == ViewMode::Grid {
@@ -328,7 +363,7 @@ impl Render for Ply {
                 }
             }))
             .on_action(cx.listener(|this, _: &ExtendUp, window, cx| {
-                if !this.typing(window, cx) {
+                if this.quick_look.is_none() && !this.typing(window, cx) {
                     if this.view == ViewMode::Grid {
                         let cols = grid_cols(window);
                         this.move_grid_selection(cols, 0, -1, true, cx);
@@ -338,7 +373,7 @@ impl Render for Ply {
                 }
             }))
             .on_action(cx.listener(|this, _: &ExtendDown, window, cx| {
-                if !this.typing(window, cx) {
+                if this.quick_look.is_none() && !this.typing(window, cx) {
                     if this.view == ViewMode::Grid {
                         let cols = grid_cols(window);
                         this.move_grid_selection(cols, 0, 1, true, cx);
@@ -348,25 +383,31 @@ impl Render for Ply {
                 }
             }))
             .on_action(cx.listener(|this, _: &ExtendLeft, window, cx| {
-                if !this.typing(window, cx) && this.view == ViewMode::Grid {
+                if this.quick_look.is_none()
+                    && !this.typing(window, cx)
+                    && this.view == ViewMode::Grid
+                {
                     let cols = grid_cols(window);
                     this.move_grid_selection(cols, -1, 0, true, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &ExtendRight, window, cx| {
-                if !this.typing(window, cx) && this.view == ViewMode::Grid {
+                if this.quick_look.is_none()
+                    && !this.typing(window, cx)
+                    && this.view == ViewMode::Grid
+                {
                     let cols = grid_cols(window);
                     this.move_grid_selection(cols, 1, 0, true, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &FocusFilter, window, cx| {
-                if !this.is_home() {
+                if this.quick_look.is_none() && !this.is_home() {
                     this.filter_field
                         .update(cx, |field, cx| field.focus(window, cx));
                 }
             }))
             .on_action(cx.listener(|this, _: &CopySelectedPath, window, cx| {
-                if this.typing(window, cx) {
+                if this.quick_look.is_some() || this.typing(window, cx) {
                     return;
                 }
                 if let Some(path) = this.selection.last().cloned() {

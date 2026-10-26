@@ -9,6 +9,9 @@ use super::{LoadState, Location, Ply};
 
 impl Ply {
     pub fn go(&mut self, location: Location, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quick_look.is_some() {
+            return;
+        }
         if location == self.location {
             return;
         }
