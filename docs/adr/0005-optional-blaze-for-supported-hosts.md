@@ -62,6 +62,27 @@ would add a large maintenance boundary to a file explorer and would still
 need Cargo for release validation. The measured speedup does not justify that
 scope today.
 
+The current Blaze source was audited at commit
+[`0804927`](https://github.com/indexable-inc/blaze/tree/0804927042b85ed21a354bd39726cd715bb0cd91).
+The port is not a target-gate change:
+
+- AArch64 code generation and the AAPCS64 lowering can be reused.
+- The Windows target path accepts x86-64 only.
+- ARM64 COFF relocations and ARM64 CodeView records are missing.
+- The existing SEH code emits x86-64 unwind metadata. Windows ARM64 uses
+  different `.pdata` and `.xdata` formats.
+- The PE splicer assumes an x86-64 machine, 12-byte function records, and
+  x86-64 jump/fixup instructions.
+- Live patching repeats those x86-64 assumptions.
+- Native ARM64 Windows CI, SDK/toolchain artifacts, and release assets are
+  also missing.
+
+A sensible upstream contribution would stage full-link support first, then
+disk splicing, then live edits, with native Windows ARM64 tests at each step.
+That is a medium-to-large upstream port. A temporary pinned Blaze fork would
+be reasonable for developing that contribution. A duplicated Ply-local module
+would not be a sound long-term boundary.
+
 ### Maintain a Ply fork or vendored Blaze module
 
 A pinned external binary is easy to replace and keeps the compiler separate. A
@@ -102,4 +123,7 @@ Reopen this decision if one of these becomes true:
 - [Blaze platform support](https://github.com/indexable-inc/blaze/blob/main/docs/support.md)
 - [Blaze platform implementation](https://github.com/indexable-inc/blaze/blob/main/docs/platforms.md)
 - [Blaze benchmarks](https://github.com/indexable-inc/blaze/blob/main/docs/benchmarks.md)
+- [Blaze target selection](https://github.com/indexable-inc/blaze/blob/0804927042b85ed21a354bd39726cd715bb0cd91/crates/hir-ty-codegen/target.rs)
+- [Blaze PE splicer](https://github.com/indexable-inc/blaze/blob/0804927042b85ed21a354bd39726cd715bb0cd91/crates/ra-jit/src/splice/pe.rs)
+- [Blaze Windows unwind implementation](https://github.com/indexable-inc/blaze/blob/0804927042b85ed21a354bd39726cd715bb0cd91/crates/hir-ty-codegen/unwind/seh.rs)
 - [Ply size and cross-platform workflow](../../.github/workflows/size-delta.yml)
